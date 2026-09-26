@@ -141,8 +141,19 @@ See [telemetry.md](telemetry.md) for maintenance notes and the expanded event in
 
 ## Limits
 
-- `path` is required and each core writes to an isolated subdirectory.
-- Retention size is divided across assigned pipeline cores.
+- `path` is required and each core writes to an isolated subdirectory,
+  `core_<id>`.
+- One process per `path`: the WAL takes no lock, so two processes must never
+  share a `path`, and with it a `core_<id>` directory. A `replace` rollout
+  still runs the old and the new generation of a core side by side.
+- Queued data does not move between cores. Before lowering the core count,
+  drain the buffer; data left in a `core_<id>` that no longer runs stays there
+  until a run with that core drains it.
+- `retention_size_cap` is divided across the assigned pipeline cores, while
+  `max_in_flight` applies in full to each core's buffer.
+- A connection with several destinations uses the default `one_of` dispatch
+  policy, so each durable buffer persists its share of the messages.
+  `broadcast` is rejected by pipeline validation on such a connection.
 - `max_age` is based on segment finalization time, not telemetry timestamps.
 - `convert_to_arrow` mode can increase CPU cost compared with `pass_through`.
 

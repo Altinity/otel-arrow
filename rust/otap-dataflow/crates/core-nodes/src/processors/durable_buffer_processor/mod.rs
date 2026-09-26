@@ -24,18 +24,13 @@
 //! with a separate WAL and segment store. Data is partitioned by core at runtime,
 //! with each core's data stored in `{path}/core_{core_id}/`.
 //!
-//! # Dispatch Strategy Considerations
+//! # Dispatch Policy
 //!
-//! **Important**: The dispatch strategy on the incoming edge affects behavior:
-//!
-//! | Strategy | Behavior | Recommendation |
-//! |----------|----------|----------------|
-//! | `RoundRobin` | Data distributed across cores, each persists its share | [x] **Recommended** |
-//! | `Random` | Similar to round-robin | [x] OK |
-//! | `LeastLoaded` | Similar to round-robin | [x] OK |
-//! | `Broadcast` | Same data persisted N times (once per core) | (!) **Avoid** - causes Nx storage and duplicates |
-//!
-//! For the outgoing edge (to exporters), any dispatch strategy is valid.
+//! A connection with several destinations, into or out of the buffer, uses the
+//! default `one_of` dispatch policy, which hands each message to one of them, so
+//! the buffers of such a connection each persist their share. `broadcast` is
+//! parsed, but pipeline validation rejects it on a connection with more than one
+//! destination.
 //!
 //! # Message Flow
 //!
