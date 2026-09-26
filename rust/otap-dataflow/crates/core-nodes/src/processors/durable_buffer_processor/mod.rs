@@ -1434,6 +1434,10 @@ impl DurableBuffer {
             }
             Err(e) => {
                 self.metrics.operational_metrics.read_errors.add(1);
+                self.metrics
+                    .bundles_for(BundleOutcome::ConversionFailed)
+                    .resolved
+                    .add(1);
                 otel_error!("durable_buffer.bundle.conversion_failed", error = %e);
                 // Reject the bundle since we can't process it
                 handle.reject();
@@ -2522,7 +2526,51 @@ mod tests {
         while let Ok(snapshot) = metrics_rx.try_recv() {
             outcomes[snapshot.bucket()] = snapshot.get_metrics()[0].to_u64_lossy();
         }
-        assert_eq!(outcomes, [10, 5, 3]);
+        assert_eq!(outcomes, [10, 5, 3, 0]);
+    }
+
+    /// Scenario: a WAL bundle whose OTLP slot holds no binary column fails
+    /// conversion on the drain path and is rejected.
+    /// Guarantees: the rejection is counted once in `resolved`, under
+    /// `outcome=conversion_failed`, so the outcome totals cover every bundle.
+    #[tokio::test]
+    async fn test_conversion_failure_counts_resolved_outcome() {
+        use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_runtime_services};
+
+        let (mut processor, engine, subscriber_id, _temp_dir) = setup_test_processor(None).await;
+        engine
+            .ingest(&make_simple_bundle(SlotId::new(60), 4))
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+        let handle = engine
+            .poll_next_bundle(&subscriber_id)
+            .expect("poll")
+            .expect("one bundle");
+
+        let (_metrics_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut effect_handler = EffectHandler::new(
+            test_node("durable-buffer-conversion"),
+            HashMap::new(),
+            None,
+            reporter,
+            test_pipeline_runtime_services(),
+        );
+        assert!(matches!(
+            processor.try_process_bundle_handle(handle, &mut effect_handler),
+            ProcessBundleResult::Skipped
+        ));
+
+        let (metrics_rx, mut reporter) =
+            MetricsReporter::create_new_and_receiver(BundleOutcome::CARDINALITY);
+        reporter
+            .report_measurement(&mut processor.metrics.bundle_metrics)
+            .unwrap();
+        let mut outcomes = [0u64; BundleOutcome::CARDINALITY];
+        while let Ok(snapshot) = metrics_rx.try_recv() {
+            outcomes[snapshot.bucket()] = snapshot.get_metrics()[0].to_u64_lossy();
+        }
+        assert_eq!(outcomes, [0, 0, 0, 1]);
     }
 
     /// Test that permanent NACKs decrement the `queued_*` gauges.

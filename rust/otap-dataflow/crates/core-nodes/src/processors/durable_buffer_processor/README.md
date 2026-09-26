@@ -107,7 +107,7 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | Scope | Instrument(s) | Dimensions |
 | --- | --- | --- |
 | `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `oldest_pending.age` | None |
-| `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected` |
+| `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected\|conversion_failed` |
 | `processor.durable_buffer.ingest` | `failures` | `failure=error\|backpressure` |
 | `processor.durable_buffer.items` | `rejected`, `consumed`, `produced`, `requeued`, `queued` | `signal=traces\|metrics\|logs` |
 | `processor.durable_buffer.reclaimed` | `segments`, `bytes` | `reason=drop_oldest\|expired` |

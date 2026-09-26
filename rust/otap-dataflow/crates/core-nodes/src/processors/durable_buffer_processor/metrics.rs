@@ -48,6 +48,7 @@ pub(super) enum BundleOutcome {
     Acked,
     Deferred,
     PermanentlyRejected,
+    ConversionFailed,
 }
 
 #[attribute_set(item, measurement)]

@@ -15,7 +15,7 @@ OpenTelemetry attributes rather than encoded in instrument names.
 | Scope | Instrument(s) | Datapoint attributes | Description |
 | --- | --- | --- | --- |
 | `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `oldest_pending.age` | None | Operational storage, retry, and flush health. `oldest_pending.age` is the age in seconds of the oldest bundle not yet acknowledged downstream, 0 when none is pending. It counts from the earliest ingestion time in the oldest unfinished segment, which the WAL records, so a bundle replayed after a restart keeps its age; it can read high while that segment's older bundles are already acknowledged. A segment already on disk at startup counts from its finalization instead, so until it drains the gauge can read low by up to `max_segment_open_duration`, or by the outage before the run that built it from replayed WAL entries. |
-| `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected` | Bundle resolution by downstream outcome. |
+| `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected\|conversion_failed` | Bundle resolution by downstream outcome; `conversion_failed` counts WAL bundles rejected because they could not be read back. |
 | `processor.durable_buffer.ingest` | `failures` | `failure=error\|backpressure` | Failed ingest attempts by failure kind. |
 | `processor.durable_buffer.items` | `rejected`, `consumed`, `produced`, `requeued`, `queued` | `signal=traces\|metrics\|logs` | Item operations and queued gauges by OpenTelemetry signal. |
 | `processor.durable_buffer.reclaimed` | `segments`, `bytes` | `reason=drop_oldest\|expired` | Physical segment files and persisted storage removed by retention. |
@@ -76,7 +76,7 @@ All events are emitted from
 | --- | --- | --- |
 | `durable_buffer.bundle.forwarded` | `debug` | Bundle successfully sent downstream; reports segment sequence, bundle index, and retry count. |
 | `durable_buffer.bundle.duplicate` | `warn` | `poll_next_bundle()` returned a bundle that is already tracked as in-flight (should not occur in normal operation). |
-| `durable_buffer.bundle.conversion_failed` | `error` | Failed to convert a reconstructed Quiver bundle to `OtapPdata`; bundle is rejected and counted as a read error. |
+| `durable_buffer.bundle.conversion_failed` | `error` | Failed to convert a reconstructed Quiver bundle to `OtapPdata`; bundle is rejected and counted as a read error and as `resolved{outcome=conversion_failed}`. |
 | `durable_buffer.bundle.acked` | `debug` | Bundle ACKed by downstream and cleaned up from the in-flight map. |
 | `durable_buffer.bundle.nacked` | `debug` | Bundle transiently NACKed by downstream; retry scheduled with exponential backoff. |
 | `durable_buffer.bundle.rejected_permanent` | `warn` | Bundle permanently NACKed by downstream; items are counted as rejected and the bundle is not retried. |
