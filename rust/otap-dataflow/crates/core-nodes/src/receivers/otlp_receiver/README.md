@@ -240,6 +240,10 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response has no retry hint.
   Exact retry guidance or non-retryable oversized classification is available
   only after the weighted admission point.
+- The conversion to OTAP records, wherever a pipeline runs it, takes at most
+  65,536 attributed log records, spans or metrics per request, and as many
+  scopes and resources; a larger request fails as a whole. Keep producer
+  batches within it, for example `send_batch_max_size: 65536`.
 - `wait_for_result` reflects the immediate downstream node, not necessarily the
   final exporter.
 

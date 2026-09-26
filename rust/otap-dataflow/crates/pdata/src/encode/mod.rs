@@ -56,9 +56,9 @@ where
     let mut event_attrs = AttributesRecordBatchBuilder::<u32>::new();
     let mut link_attrs = AttributesRecordBatchBuilder::<u32>::new();
 
-    let mut curr_resource_id: u16 = 0;
-    let mut curr_scope_id: u16 = 0;
-    let mut curr_span_id: u16 = 0;
+    // Counted in u32 so the last u16 id is usable; `u16_id` refuses the first id past it.
+    let mut next_scope_id: u32 = 0;
+    let mut next_span_id: u32 = 0;
     let mut curr_event_id: u32 = 0;
     let mut curr_link_id: u32 = 0;
 
@@ -70,8 +70,8 @@ where
 
     // First, we traverse the view collecting the trace data into our RecordBatch builders.
 
-    #[allow(clippy::explicit_counter_loop)]
-    for resource_spans in traces_view.resources() {
+    for (curr_resource_id, resource_spans) in traces_view.resources().enumerate() {
+        let curr_resource_id = u16_id(curr_resource_id)?;
         if let Some(resource) = resource_spans.resource() {
             for kv in resource.attributes() {
                 resource_attrs.append_parent_id(&curr_resource_id);
@@ -99,6 +99,7 @@ where
         }
 
         for scope_spans in resource_spans.scopes() {
+            let curr_scope_id = u16_id(next_scope_id)?;
             let span_count = scope_spans.spans().count();
             total_span_count += span_count;
             spans.append_schema_url_n(scope_spans.schema_url(), span_count);
@@ -110,6 +111,7 @@ where
             }
 
             for span in scope_spans.spans() {
+                let curr_span_id = u16_id(next_span_id)?;
                 // set the scope
                 spans.scope.append_id(Some(curr_scope_id));
                 if let Some(scope) = scope_spans.scope() {
@@ -195,17 +197,11 @@ where
                     curr_link_id = curr_link_id.checked_add(1).ok_or(Error::U32OverflowError)?;
                 }
 
-                curr_span_id = curr_span_id.checked_add(1).ok_or(Error::U16OverflowError)?;
+                next_span_id += 1;
             }
 
-            curr_scope_id = curr_scope_id
-                .checked_add(1)
-                .ok_or(Error::U16OverflowError)?;
+            next_scope_id += 1;
         }
-
-        curr_resource_id = curr_resource_id
-            .checked_add(1)
-            .ok_or(Error::U16OverflowError)?;
     }
 
     // If there are no spans, return empty batch (all None record batches).
@@ -236,6 +232,11 @@ where
     Ok(otap_batch)
 }
 
+/// Converts a zero-based position into a u16 id, refusing positions past `u16::MAX`.
+fn u16_id<T: TryInto<u16>>(position: T) -> Result<u16> {
+    position.try_into().map_err(|_| Error::U16OverflowError)
+}
+
 /// traverse the log structure within the LogDataView and produces an `OtapArrowRecords' for the log data
 pub fn encode_logs_otap_batch<T>(logs_view: &T) -> Result<OtapArrowRecords>
 where
@@ -243,17 +244,18 @@ where
 {
     let mut resource_attrs = AttributesRecordBatchBuilder::<u16>::new();
 
-    let mut curr_scope_id = 0;
     let mut scope_attrs = AttributesRecordBatchBuilder::<u16>::new();
 
-    let mut curr_log_id = 0;
+    // Counted in u32 so the last u16 id is usable; `u16_id` refuses the first id past it.
+    let mut next_scope_id: u32 = 0;
+    let mut next_log_id: u32 = 0;
     let mut logs = LogsRecordBatchBuilder::new();
     let mut log_attrs = AttributesRecordBatchBuilder::<u16>::new();
 
     let mut total_log_count = 0;
 
     for (curr_resource_id, resource_logs) in logs_view.resources().enumerate() {
-        let curr_resource_id = curr_resource_id as u16;
+        let curr_resource_id = u16_id(curr_resource_id)?;
 
         // keep reference to resource dropped attributes, which will be appended to log later
         let resource_dropped_attrs_count = if let Some(resource) = resource_logs.resource() {
@@ -272,6 +274,7 @@ where
         let mut resource_log_count = 0;
 
         for scope_logs in resource_logs.scopes() {
+            let curr_scope_id = u16_id(next_scope_id)?;
             let scope = scope_logs.scope();
 
             let (scope_name, scope_version, scope_dropped_attributes_count) =
@@ -458,14 +461,15 @@ where
                         .expect("LogRecord should not be None")
                         .attributes()
                     {
+                        let curr_log_id = u16_id(next_log_id)?;
                         log_attrs.append_parent_id(&curr_log_id);
                         log_attrs_count += 1;
                         append_attribute_value(&mut log_attrs, &kv)?;
                     }
 
                     if log_attrs_count > 0 {
-                        logs.append_id(Some(curr_log_id));
-                        curr_log_id += 1;
+                        logs.append_id(Some(u16_id(next_log_id)?));
+                        next_log_id += 1;
                     } else {
                         logs.append_id(None);
                     }
@@ -485,9 +489,7 @@ where
 
             resource_log_count += scope_log_count;
             total_log_count += scope_log_count;
-            curr_scope_id = curr_scope_id
-                .checked_add(1)
-                .ok_or(Error::U16OverflowError)?;
+            next_scope_id += 1;
         }
 
         logs.resource
@@ -714,11 +716,12 @@ where
     let mut ehdpe_attrs = AttributesRecordBatchBuilder::<u32>::new();
 
     let mut metrics = MetricsRecordBatchBuilder::new();
-    let mut curr_resource_id: u16 = 0;
-    let mut curr_scope_id: u16 = 0;
-    let mut curr_metric_id: u16 = 0;
+    // Counted in u32 so the last u16 id is usable; `u16_id` refuses the first id past it.
+    let mut next_scope_id: u32 = 0;
+    let mut next_metric_id: u32 = 0;
 
-    for resource_metric in metrics_view.resources() {
+    for (curr_resource_id, resource_metric) in metrics_view.resources().enumerate() {
+        let curr_resource_id = u16_id(curr_resource_id)?;
         let resource_schema_url = resource_metric.schema_url();
         let resource_dropped_attributes_count = if let Some(resource) = resource_metric.resource() {
             for kv in resource.attributes() {
@@ -732,6 +735,7 @@ where
         let mut resource_metric_count = 0usize;
 
         for scope_metric in resource_metric.scopes() {
+            let curr_scope_id = u16_id(next_scope_id)?;
             let scope_schema_url = scope_metric.schema_url();
             let scope = scope_metric.scope();
             let scope_name = scope.as_ref().and_then(|s| s.name());
@@ -749,6 +753,7 @@ where
             let mut scope_metric_count = 0usize;
 
             for metric in scope_metric.metrics() {
+                let curr_metric_id = u16_id(next_metric_id)?;
                 metrics.append_id(curr_metric_id);
                 let data_obj = metric.data();
                 let data = data_obj.as_ref();
@@ -928,9 +933,7 @@ where
                 }
 
                 scope_metric_count += 1;
-                curr_metric_id = curr_metric_id
-                    .checked_add(1)
-                    .ok_or(Error::U16OverflowError)?;
+                next_metric_id += 1;
             }
 
             // Builders are independent, so scope columns can be appended in bulk after the
@@ -947,9 +950,7 @@ where
             );
             resource_metric_count += scope_metric_count;
 
-            curr_scope_id = curr_scope_id
-                .checked_add(1)
-                .ok_or(Error::U16OverflowError)?;
+            next_scope_id += 1;
         }
 
         metrics
@@ -962,15 +963,11 @@ where
             resource_dropped_attributes_count,
             resource_metric_count,
         );
-
-        curr_resource_id = curr_resource_id
-            .checked_add(1)
-            .ok_or(Error::U16OverflowError)?;
     }
 
     // If there are no metrics, return empty batch (all None record batches).
     // See: https://github.com/open-telemetry/opentelemetry-proto/issues/598
-    if curr_metric_id == 0 {
+    if next_metric_id == 0 {
         return Ok(OtapArrowRecords::Metrics(Metrics::default()));
     }
 
@@ -5293,5 +5290,231 @@ mod test {
             metrics_checked > 0,
             "expected at least one metrics timestamp column"
         );
+    }
+
+    fn attributed_log_record() -> LogRecord {
+        LogRecord {
+            attributes: vec![KeyValue::new("k", AnyValue::new_string("v"))],
+            ..Default::default()
+        }
+    }
+
+    fn logs_with_attributed_records(count: usize) -> LogsData {
+        LogsData::new(vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: (0..count).map(|_| attributed_log_record()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }])
+    }
+
+    fn logs_with_attributed_resources(count: usize) -> LogsData {
+        LogsData::new(
+            (0..count)
+                .map(|_| ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![KeyValue::new("k", AnyValue::new_string("v"))],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Scenario: a logs request carries 65,536 log records with one attribute each.
+    /// Guarantees: every record gets its own u16 id 0..=65535 and the batch encodes.
+    #[test]
+    fn test_encode_logs_65536_attributed_records_fit_u16_ids() {
+        let batch = encode_logs_otap_batch(&logs_with_attributed_records(65_536))
+            .expect("65,536 attributed records fit the u16 id space");
+        let logs = batch.get(ArrowPayloadType::Logs).expect("logs batch");
+        let ids = logs
+            .column_by_name(consts::ID)
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("u16 ids");
+        assert_eq!(ids.len(), 65_536);
+        assert_eq!(ids.value(65_535), 65_535);
+    }
+
+    /// Scenario: a logs request carries 65,537 log records with one attribute each.
+    /// Guarantees: the encoder refuses it with U16OverflowError instead of wrapping ids.
+    #[test]
+    fn test_encode_logs_65537_attributed_records_overflow_u16_ids() {
+        let err = encode_logs_otap_batch(&logs_with_attributed_records(65_537))
+            .expect_err("the 65,537th attributed record has no u16 id");
+        assert!(matches!(err, Error::U16OverflowError), "{err:?}");
+    }
+
+    /// Scenario: a logs request carries 65,536 ResourceLogs, each with an attribute and no scopes.
+    /// Guarantees: every resource gets its own u16 id and the batch encodes.
+    #[test]
+    fn test_encode_logs_65536_resources_fit_u16_ids() {
+        let _ = encode_logs_otap_batch(&logs_with_attributed_resources(65_536))
+            .expect("65,536 resources fit the u16 id space");
+    }
+
+    /// Scenario: a logs request carries 65,537 ResourceLogs, each with an attribute.
+    /// Guarantees: the encoder refuses it with U16OverflowError instead of reusing resource id 0.
+    #[test]
+    fn test_encode_logs_65537_resources_overflow_u16_ids() {
+        let err = encode_logs_otap_batch(&logs_with_attributed_resources(65_537))
+            .expect_err("the 65,537th resource has no u16 id");
+        assert!(matches!(err, Error::U16OverflowError), "{err:?}");
+    }
+
+    fn logs_with_scopes(count: usize) -> LogsData {
+        LogsData::new(vec![ResourceLogs {
+            scope_logs: (0..count)
+                .map(|_| ScopeLogs {
+                    log_records: vec![LogRecord::default()],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }])
+    }
+
+    /// Scenario: a logs request carries 65,536 ScopeLogs with one record each.
+    /// Guarantees: the last scope gets u16 id 65535 and the batch encodes.
+    #[test]
+    fn test_encode_logs_65536_scopes_fit_u16_ids() {
+        let batch = encode_logs_otap_batch(&logs_with_scopes(65_536))
+            .expect("65,536 scopes fit the u16 id space");
+        let logs = batch.get(ArrowPayloadType::Logs).expect("logs batch");
+        let scope = logs
+            .column_by_name(consts::SCOPE)
+            .expect("scope column")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("scope struct");
+        let ids = scope
+            .column_by_name(consts::ID)
+            .expect("scope id column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("u16 scope ids");
+        assert_eq!(ids.value(65_535), 65_535);
+    }
+
+    /// Scenario: a logs request carries 65,537 ScopeLogs with one record each.
+    /// Guarantees: the encoder refuses it with U16OverflowError instead of wrapping scope ids.
+    #[test]
+    fn test_encode_logs_65537_scopes_overflow_u16_ids() {
+        let err = encode_logs_otap_batch(&logs_with_scopes(65_537))
+            .expect_err("the 65,537th scope has no u16 id");
+        assert!(matches!(err, Error::U16OverflowError), "{err:?}");
+    }
+
+    /// Traces with `resources` ResourceSpans, each of `scopes` ScopeSpans of
+    /// `spans` spans.
+    fn traces_of(resources: usize, scopes: usize, spans: usize) -> TracesData {
+        TracesData::new(
+            (0..resources)
+                .map(|_| ResourceSpans {
+                    scope_spans: (0..scopes)
+                        .map(|_| ScopeSpans {
+                            spans: (0..spans).map(|_| Span::default()).collect(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Scenario: traces requests with 65,536 spans, 65,536 ScopeSpans and
+    /// 65,536 ResourceSpans, and with 65,537 of each.
+    /// Guarantees: 65,536 fit the u16 ids 0..=65535 and encode, the last span
+    /// getting id 65535; one more is refused with U16OverflowError.
+    #[test]
+    fn test_encode_traces_u16_ids_end_at_65536() {
+        let batch = encode_spans_otap_batch(&traces_of(1, 1, 65_536)).expect("65,536 spans fit");
+        let ids = batch
+            .get(ArrowPayloadType::Spans)
+            .expect("spans batch")
+            .column_by_name(consts::ID)
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("u16 ids")
+            .clone();
+        assert_eq!(ids.value(65_535), 65_535);
+        for shape in [(1, 65_536, 1), (65_536, 1, 1)] {
+            let _ = encode_spans_otap_batch(&traces_of(shape.0, shape.1, shape.2))
+                .unwrap_or_else(|e| panic!("{shape:?}: {e:?}"));
+        }
+        for shape in [(1, 1, 65_537), (1, 65_537, 1), (65_537, 1, 1)] {
+            let err = encode_spans_otap_batch(&traces_of(shape.0, shape.1, shape.2))
+                .expect_err("one id past u16::MAX");
+            assert!(matches!(err, Error::U16OverflowError), "{shape:?}: {err:?}");
+        }
+    }
+
+    /// Metrics with `resources` ResourceMetrics, each of `scopes`
+    /// ScopeMetrics of `metrics` gauges.
+    fn metrics_of(
+        resources: usize,
+        scopes: usize,
+        metrics: usize,
+    ) -> crate::proto::opentelemetry::metrics::v1::MetricsData {
+        use crate::proto::opentelemetry::metrics::v1::{
+            Gauge, Metric, MetricsData, ResourceMetrics, ScopeMetrics, metric,
+        };
+        MetricsData::new(
+            (0..resources)
+                .map(|_| ResourceMetrics {
+                    scope_metrics: (0..scopes)
+                        .map(|_| ScopeMetrics {
+                            metrics: (0..metrics)
+                                .map(|_| Metric {
+                                    name: "m".into(),
+                                    data: Some(metric::Data::Gauge(Gauge::default())),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Scenario: metrics requests with 65,536 metrics, 65,536 ScopeMetrics and
+    /// 65,536 ResourceMetrics, with 65,537 of each, and with none.
+    /// Guarantees: 65,536 fit the u16 ids 0..=65535 and encode, the last
+    /// metric getting id 65535; one more is refused with U16OverflowError; a
+    /// request without metrics encodes as an empty batch.
+    #[test]
+    fn test_encode_metrics_u16_ids_end_at_65536() {
+        let batch =
+            encode_metrics_otap_batch(&metrics_of(1, 1, 65_536)).expect("65,536 metrics fit");
+        let ids = batch
+            .get(ArrowPayloadType::UnivariateMetrics)
+            .expect("metrics batch")
+            .column_by_name(consts::ID)
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("u16 ids")
+            .clone();
+        assert_eq!(ids.value(65_535), 65_535);
+        for shape in [(1, 65_536, 1), (65_536, 1, 1)] {
+            let _ = encode_metrics_otap_batch(&metrics_of(shape.0, shape.1, shape.2))
+                .unwrap_or_else(|e| panic!("{shape:?}: {e:?}"));
+        }
+        for shape in [(1, 1, 65_537), (1, 65_537, 1), (65_537, 1, 1)] {
+            let err = encode_metrics_otap_batch(&metrics_of(shape.0, shape.1, shape.2))
+                .expect_err("one id past u16::MAX");
+            assert!(matches!(err, Error::U16OverflowError), "{shape:?}: {err:?}");
+        }
+        let empty = encode_metrics_otap_batch(&metrics_of(2, 2, 0)).expect("no metrics");
+        assert!(empty.get(ArrowPayloadType::UnivariateMetrics).is_none());
     }
 }
