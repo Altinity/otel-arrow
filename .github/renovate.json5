@@ -182,6 +182,18 @@
       ]
     },
     {
+      // keep the series-lake golden generator source + lock updates together
+      "groupName": "series lake golden generator python dependencies",
+      "matchManagers": ["pip-compile"],
+      "matchFileNames": [
+        "rust/otap-dataflow/crates/series-lake/tools/requirements.lock.txt",
+        "rust/otap-dataflow/crates/series-lake/tools/requirements.txt"
+      ],
+      "schedule": [
+        "before 8am on Monday"
+      ]
+    },
+    {
       // prevent duplicate PRs from pip_requirements once pip-compile is enabled;
       // also disable on lock files so pip_requirements doesn't treat transitive
       // deps (e.g. pydantic-core) as direct and raise independent update PRs
@@ -190,7 +202,9 @@
         "tools/comparison_dashboard/requirements.txt",
         "tools/comparison_dashboard/requirements.lock.txt",
         "tools/pipeline_perf_test/**/requirements.txt",
-        "tools/pipeline_perf_test/**/requirements.lock.txt"
+        "tools/pipeline_perf_test/**/requirements.lock.txt",
+        "rust/otap-dataflow/crates/series-lake/tools/requirements.txt",
+        "rust/otap-dataflow/crates/series-lake/tools/requirements.lock.txt"
       ],
       "enabled": false
     },
@@ -208,7 +222,8 @@
   // activate pip-compile manager on generated output lock files
   "pip-compile": {
     "managerFilePatterns": [
-      "/(^|/)tools\\/(comparison_dashboard|pipeline_perf_test\\/.+)\\/requirements\\.lock\\.txt$/"
+      "/(^|/)tools\\/(comparison_dashboard|pipeline_perf_test\\/.+)\\/requirements\\.lock\\.txt$/",
+      "/(^|/)rust\\/otap-dataflow\\/crates\\/series-lake\\/tools\\/requirements\\.lock\\.txt$/"
     ]
   },
   "lockFileMaintenance": {

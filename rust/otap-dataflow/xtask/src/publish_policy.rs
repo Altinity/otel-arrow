@@ -29,6 +29,7 @@ pub(crate) const PUBLISH_PACKAGES: &[&str] = &[
     "otel-arrow-dfe-query-engine-languages",
     "otel-arrow-dfe-quiver",
     "otel-arrow-dfe-scraper",
+    "otel-arrow-dfe-series-lake",
     "otel-arrow-dfe-state",
     "otel-arrow-dfe-telemetry",
     "otel-arrow-dfe-telemetry-macros",

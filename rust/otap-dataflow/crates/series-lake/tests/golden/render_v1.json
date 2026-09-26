@@ -1,0 +1,302 @@
+{
+ "format": "render_v1",
+ "vectors": [
+  {
+   "name": "str_raw",
+   "value": {
+    "type": "str",
+    "value": "hello"
+   },
+   "map_value": "hello"
+  },
+  {
+   "name": "str_with_quote_is_raw",
+   "value": {
+    "type": "str",
+    "value": "a\"b"
+   },
+   "map_value": "a\"b"
+  },
+  {
+   "name": "null_is_sql_null",
+   "value": {
+    "type": "null"
+   },
+   "map_value": null
+  },
+  {
+   "name": "int_42",
+   "value": {
+    "type": "int",
+    "value": 42
+   },
+   "map_value": "42"
+  },
+  {
+   "name": "int_min",
+   "value": {
+    "type": "int",
+    "value": -9223372036854775808
+   },
+   "map_value": "-9223372036854775808"
+  },
+  {
+   "name": "double_finite",
+   "value": {
+    "type": "double",
+    "value": 1.5
+   },
+   "map_value": "1.5"
+  },
+  {
+   "name": "double_integral_keeps_fraction",
+   "value": {
+    "type": "double",
+    "value": 3.0
+   },
+   "map_value": "3.0"
+  },
+  {
+   "name": "double_large_scientific",
+   "value": {
+    "type": "double",
+    "value": 1e+16
+   },
+   "map_value": "1e+16"
+  },
+  {
+   "name": "double_large_negative_scientific",
+   "value": {
+    "type": "double",
+    "value": -1e+16
+   },
+   "map_value": "-1e+16"
+  },
+  {
+   "name": "double_large_fixed_limit",
+   "value": {
+    "type": "double",
+    "value": 1000000000000000.0
+   },
+   "map_value": "1000000000000000.0"
+  },
+  {
+   "name": "double_many_digits_scientific",
+   "value": {
+    "type": "double",
+    "value": 1.2345678901234568e+16
+   },
+   "map_value": "1.2345678901234568e+16"
+  },
+  {
+   "name": "double_max",
+   "value": {
+    "type": "double",
+    "value": 1.7976931348623157e+308
+   },
+   "map_value": "1.7976931348623157e+308"
+  },
+  {
+   "name": "double_small_scientific",
+   "value": {
+    "type": "double",
+    "value": 1e-07
+   },
+   "map_value": "1e-7"
+  },
+  {
+   "name": "double_small_digits_scientific",
+   "value": {
+    "type": "double",
+    "value": 1.23e-06
+   },
+   "map_value": "1.23e-6"
+  },
+  {
+   "name": "double_small_fixed_limit",
+   "value": {
+    "type": "double",
+    "value": 1e-05
+   },
+   "map_value": "0.00001"
+  },
+  {
+   "name": "double_small_digits_fixed",
+   "value": {
+    "type": "double",
+    "value": 1.23e-05
+   },
+   "map_value": "0.0000123"
+  },
+  {
+   "name": "double_min_subnormal",
+   "value": {
+    "type": "double",
+    "value": 5e-324
+   },
+   "map_value": "5e-324"
+  },
+  {
+   "name": "double_neg_zero",
+   "value": {
+    "type": "double",
+    "bits": 9223372036854775808
+   },
+   "map_value": "-0.0"
+  },
+  {
+   "name": "double_nan_quiet",
+   "value": {
+    "type": "double",
+    "bits": 9221120237041090560
+   },
+   "map_value": "\"NaN\""
+  },
+  {
+   "name": "double_nan_payload",
+   "value": {
+    "type": "double",
+    "bits": 9221120237041090561
+   },
+   "map_value": "\"NaN\""
+  },
+  {
+   "name": "double_pos_inf",
+   "value": {
+    "type": "double",
+    "bits": 9218868437227405312
+   },
+   "map_value": "\"Infinity\""
+  },
+  {
+   "name": "double_neg_inf",
+   "value": {
+    "type": "double",
+    "bits": 18442240474082181120
+   },
+   "map_value": "\"-Infinity\""
+  },
+  {
+   "name": "bool_true",
+   "value": {
+    "type": "bool",
+    "value": true
+   },
+   "map_value": "true"
+  },
+  {
+   "name": "bytes_empty",
+   "value": {
+    "type": "bytes",
+    "value": ""
+   },
+   "map_value": "\"\""
+  },
+  {
+   "name": "bytes_one_padded_twice",
+   "value": {
+    "type": "bytes",
+    "value": "ab"
+   },
+   "map_value": "\"qw==\""
+  },
+  {
+   "name": "bytes_two_padded_once",
+   "value": {
+    "type": "bytes",
+    "value": "ab12"
+   },
+   "map_value": "\"qxI=\""
+  },
+  {
+   "name": "bytes_three_unpadded",
+   "value": {
+    "type": "bytes",
+    "value": "00ff10"
+   },
+   "map_value": "\"AP8Q\""
+  },
+  {
+   "name": "bytes_standard_alphabet",
+   "value": {
+    "type": "bytes",
+    "value": "fbff"
+   },
+   "map_value": "\"+/8=\""
+  },
+  {
+   "name": "array_nested_spellings",
+   "value": {
+    "type": "array",
+    "items": [
+     {
+      "type": "double",
+      "bits": 9218868437227405312
+     },
+     {
+      "type": "double",
+      "bits": 18442240474082181120
+     },
+     {
+      "type": "double",
+      "bits": 9221120237041090560
+     },
+     {
+      "type": "bytes",
+      "value": "ff"
+     },
+     {
+      "type": "null"
+     },
+     {
+      "type": "str",
+      "value": "x\ny"
+     },
+     {
+      "type": "int",
+      "value": 1
+     }
+    ]
+   },
+   "map_value": "[\"Infinity\",\"-Infinity\",\"NaN\",\"/w==\",null,\"x\\ny\",1]"
+  },
+  {
+   "name": "kvlist_sorted_keys",
+   "value": {
+    "type": "kvlist",
+    "entries": [
+     {
+      "key": "b",
+      "value": {
+       "type": "bytes",
+       "value": "0102"
+      }
+     },
+     {
+      "key": "a",
+      "value": {
+       "type": "kvlist",
+       "entries": [
+        {
+         "key": "z",
+         "value": {
+          "type": "bool",
+          "value": false
+         }
+        }
+       ]
+      }
+     },
+     {
+      "key": "\u00e9",
+      "value": {
+       "type": "str",
+       "value": "\u4e2d"
+      }
+     }
+    ]
+   },
+   "map_value": "{\"a\":{\"z\":false},\"b\":\"AQI=\",\"\u00e9\":\"\u4e2d\"}"
+  }
+ ]
+}

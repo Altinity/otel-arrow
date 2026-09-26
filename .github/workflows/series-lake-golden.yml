@@ -1,0 +1,44 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+name: Series Lake golden vectors
+# Not a required check.
+on:
+  pull_request:
+    paths:
+      - "rust/otap-dataflow/crates/series-lake/**"
+      - ".github/workflows/series-lake-golden.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: rust/otap-dataflow/crates/series-lake
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The version requirements.lock.txt is compiled with.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install the generator's dependencies
+        run: |
+          python3 -m venv /tmp/series-lake-venv
+          /tmp/series-lake-venv/bin/pip install --require-hashes -r tools/requirements.lock.txt
+      # The independent Python generator must reproduce every checked-in
+      # golden file byte for byte.
+      - name: Golden vectors regenerate unchanged
+        run: |
+          out="$(mktemp -d)"
+          /tmp/series-lake-venv/bin/python3 tools/gen_golden.py "$out"
+          diff -ru tests/golden "$out"

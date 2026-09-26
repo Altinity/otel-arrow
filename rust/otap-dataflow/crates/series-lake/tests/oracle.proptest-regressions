@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 66b37dcb1858331acccca328658146742193361aed230290abbcf6c1dd22678e # shrinks to recs = [HistRec { host: 0, scope: 0, metric: 0, dp: 0, time: 0, count: 0 }], sizes = [1]
+cc bfcd9a71a897c19cc31b4ac34e0d33fe53bab405ad360ce3ec7eef30352445c0 # shrinks to recs = [HistRec { host: 0, scope: 0, metric: 0, dp: 0, time: 0, count: 0 }, HistRec { host: 0, scope: 0, metric: 0, dp: 0, time: 0, count: 1 }], sizes = [2]

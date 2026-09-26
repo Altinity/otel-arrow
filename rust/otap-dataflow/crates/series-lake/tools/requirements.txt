@@ -1,0 +1,6 @@
+# Direct dependencies of gen_golden.py, pinned. `requirements.lock.txt` pins
+# them with hashes; install with
+#   pip install --require-hashes -r requirements.lock.txt
+# and regenerate it after changing a pin with the pip-compile command at its
+# top.
+xxhash==3.8.1
