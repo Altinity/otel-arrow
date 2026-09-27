@@ -132,6 +132,9 @@ struct SegmentHandle {
     file_size_bytes: u64,
     /// Time when the segment was finalized (from file modification time).
     finalized_at: SystemTime,
+    /// Earliest ingestion time of its bundles when this process wrote it,
+    /// else `finalized_at`.
+    oldest_ingestion: SystemTime,
 }
 
 impl SegmentHandle {
@@ -176,6 +179,7 @@ impl SegmentHandle {
             total_byte_count,
             file_size_bytes,
             finalized_at,
+            oldest_ingestion: finalized_at,
         })
     }
 
@@ -358,9 +362,16 @@ impl SegmentStore {
     /// # Errors
     ///
     /// Returns an error if the segment file cannot be opened.
-    pub fn register_new_segment(&self, seq: SegmentSeq) -> Result<u32> {
+    pub fn register_new_segment(
+        &self,
+        seq: SegmentSeq,
+        oldest_ingestion: Option<SystemTime>,
+    ) -> Result<u32> {
         let path = self.segment_path(seq);
-        let handle = SegmentHandle::open(seq, path, self.read_mode)?;
+        let mut handle = SegmentHandle::open(seq, path, self.read_mode)?;
+        if let Some(oldest) = oldest_ingestion {
+            handle.oldest_ingestion = handle.oldest_ingestion.min(oldest);
+        }
         let bundle_count = handle.bundle_count;
 
         {
@@ -793,6 +804,17 @@ impl SegmentStore {
             .get(&segment_seq)
             .map(|handle| handle.file_size_bytes)
             .ok_or_else(|| SubscriberError::segment_not_found(segment_seq.raw()))
+    }
+
+    /// Returns the earliest ingestion time of a registered segment's
+    /// bundles: recorded when this process wrote the segment, else its
+    /// finalization time.
+    #[must_use]
+    pub(crate) fn segment_oldest_ingestion(&self, segment_seq: SegmentSeq) -> Option<SystemTime> {
+        self.segments
+            .read()
+            .get(&segment_seq)
+            .map(|handle| handle.oldest_ingestion)
     }
 
     /// Returns segments that were finalized more than `max_age` ago.

@@ -286,6 +286,16 @@ impl SubscriberState {
             .map(|(seq, _)| *seq)
     }
 
+    /// The first answer `probe` gives for the incomplete segments, oldest
+    /// first; a segment it has no answer for is skipped.
+    pub fn first_incomplete<T>(&self, probe: impl FnMut(SegmentSeq) -> Option<T>) -> Option<T> {
+        let mut probe = probe;
+        self.segments
+            .iter()
+            .filter(|(_, progress)| !progress.is_complete())
+            .find_map(|(seq, _)| probe(*seq))
+    }
+
     /// Returns the highest tracked segment sequence.
     ///
     /// This represents the high-water mark of segments this subscriber knows about.
@@ -652,6 +662,20 @@ mod tests {
         );
 
         assert_eq!(state.oldest_incomplete_segment(), None);
+    }
+
+    /// Scenario: two incomplete segments, and a probe with no answer for the
+    /// older one, as for a segment whose handle the store does not hold.
+    /// Guarantees: the older segment is skipped, not taken for the end of
+    /// the incomplete segments, so the younger one answers.
+    #[test]
+    fn subscriber_state_first_incomplete_skips_unanswered_segments() {
+        let mut state = make_state("test-sub");
+        state.add_segment(SegmentSeq::new(1), 1);
+        state.add_segment(SegmentSeq::new(2), 1);
+        let answer = state.first_incomplete(|seq| (seq == SegmentSeq::new(2)).then_some(seq));
+        assert_eq!(answer, Some(SegmentSeq::new(2)));
+        assert_eq!(state.first_incomplete(|_| None::<()>), None);
     }
 
     #[test]

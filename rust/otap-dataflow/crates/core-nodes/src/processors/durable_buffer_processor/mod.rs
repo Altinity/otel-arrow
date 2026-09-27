@@ -84,7 +84,7 @@ mod metrics;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -796,6 +796,15 @@ impl DurableBuffer {
                 None => {}
             }
         }
+
+        let oldest_pending_age = engine
+            .oldest_pending_since()
+            .and_then(|since| SystemTime::now().duration_since(since).ok())
+            .map_or(0.0, |age| age.as_secs_f64());
+        self.metrics
+            .operational_metrics
+            .oldest_pending_age
+            .set(oldest_pending_age);
 
         // Step 4: evict cache entries for segments no longer tracked.
         self.segment_cache
@@ -2638,6 +2647,37 @@ mod tests {
             0,
             "queued_spans should be 0"
         );
+    }
+
+    /// Scenario: an empty WAL, then one bundle ingested and finalized but
+    /// not acknowledged, then that bundle acked and its segment cleaned up.
+    /// Guarantees: `oldest_pending.age` is 0 while nothing is pending, above
+    /// 0 while the bundle waits, and back to 0 once it is acknowledged.
+    #[tokio::test]
+    async fn test_oldest_pending_age_rises_until_acked() {
+        let (mut processor, engine, subscriber_id, _temp_dir) = setup_test_processor(None).await;
+        let age = |p: &DurableBuffer| p.metrics.operational_metrics.oldest_pending_age.get();
+
+        processor.recompute_metrics(&engine, &subscriber_id);
+        assert_eq!(age(&processor), 0.0);
+
+        engine
+            .ingest(&make_simple_bundle(SlotId::new(30), 1))
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        processor.recompute_metrics(&engine, &subscriber_id);
+        assert!(age(&processor) > 0.0, "age {}", age(&processor));
+
+        engine
+            .poll_next_bundle(&subscriber_id)
+            .expect("poll")
+            .expect("one bundle")
+            .ack();
+        let _ = engine.cleanup_completed_segments().expect("cleanup");
+        processor.recompute_metrics(&engine, &subscriber_id);
+        assert_eq!(age(&processor), 0.0);
     }
 
     #[tokio::test]

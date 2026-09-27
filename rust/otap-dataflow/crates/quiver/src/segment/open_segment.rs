@@ -21,7 +21,7 @@
 //! [`SegmentWriter::write_segment`]: super::SegmentWriter::write_segment
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use arrow_schema::SchemaRef;
 
@@ -48,6 +48,9 @@ pub struct OpenSegment {
     finalized: bool,
     /// Timestamp when the first bundle was appended (None if empty).
     opened_at: Option<Instant>,
+    /// Earliest ingestion time recorded by the appended bundles, which a
+    /// bundle replayed from the WAL carries over from its first write.
+    oldest_ingestion: Option<SystemTime>,
 }
 
 impl OpenSegment {
@@ -60,6 +63,7 @@ impl OpenSegment {
             manifest: Vec::new(),
             finalized: false,
             opened_at: None,
+            oldest_ingestion: None,
         }
     }
 
@@ -93,6 +97,12 @@ impl OpenSegment {
     #[must_use]
     pub const fn opened_at(&self) -> Option<Instant> {
         self.opened_at
+    }
+
+    /// Returns the earliest ingestion time of the appended bundles, if any.
+    #[must_use]
+    pub const fn oldest_ingestion(&self) -> Option<SystemTime> {
+        self.oldest_ingestion
     }
 
     /// Subtracts `offset` from `opened_at`, making the segment appear
@@ -161,6 +171,8 @@ impl OpenSegment {
         if self.opened_at.is_none() {
             self.opened_at = Some(Instant::now());
         }
+        let ingested = bundle.ingestion_time();
+        self.oldest_ingestion = Some(self.oldest_ingestion.map_or(ingested, |t| t.min(ingested)));
 
         let bundle_index = self.manifest.len() as u32;
         let item_count = bundle.item_count_is_known().then(|| bundle.item_count());

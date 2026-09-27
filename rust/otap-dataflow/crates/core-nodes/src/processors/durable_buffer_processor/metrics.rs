@@ -37,6 +37,10 @@ pub(super) struct DurableBufferOperationalMetrics {
     /// Current storage utilization ratio.
     #[metric(unit = "{1}")]
     pub(super) storage_utilization: Gauge<f64>,
+    /// Age of the oldest bundle in the WAL not yet acknowledged downstream; 0
+    /// when none is pending.
+    #[metric(name = "oldest_pending.age", unit = "s")]
+    pub(super) oldest_pending_age: Gauge<f64>,
 }
 
 #[derive(Debug, Clone, Copy, AttributeEnum)]

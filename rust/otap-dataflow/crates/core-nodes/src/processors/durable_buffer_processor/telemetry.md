@@ -14,7 +14,7 @@ OpenTelemetry attributes rather than encoded in instrument names.
 
 | Scope | Instrument(s) | Datapoint attributes | Description |
 | --- | --- | --- | --- |
-| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization` | None | Operational storage, retry, and flush health. |
+| `processor.durable_buffer` | `read.errors`, `storage.bytes.used`, `storage.bytes.cap`, `retries.scheduled`, `in.flight`, `flush.failures`, `storage.utilization`, `oldest_pending.age` | None | Operational storage, retry, and flush health. `oldest_pending.age` is the age in seconds of the oldest bundle not yet acknowledged downstream, 0 when none is pending. It counts from the earliest ingestion time in the oldest unfinished segment, which the WAL records, so a bundle replayed after a restart keeps its age; it can read high while that segment's older bundles are already acknowledged. A segment already on disk at startup counts from its finalization instead, so until it drains the gauge can read low by up to `max_segment_open_duration`, or by the outage before the run that built it from replayed WAL entries. |
 | `processor.durable_buffer.bundles` | `resolved` | `outcome=acked\|deferred\|permanently_rejected` | Bundle resolution by downstream outcome. |
 | `processor.durable_buffer.ingest` | `failures` | `failure=error\|backpressure` | Failed ingest attempts by failure kind. |
 | `processor.durable_buffer.items` | `rejected`, `consumed`, `produced`, `requeued`, `queued` | `signal=traces\|metrics\|logs` | Item operations and queued gauges by OpenTelemetry signal. |
