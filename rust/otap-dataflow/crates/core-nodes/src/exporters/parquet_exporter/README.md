@@ -82,6 +82,11 @@ nodes:
           base_uri: https://account.blob.core.windows.net/container/prefix
 ```
 
+S3 storage takes an optional `unsigned_payload`. When true, requests are signed
+with SigV4 `UNSIGNED-PAYLOAD` instead of a SHA-256 of every uploaded byte, and
+only TLS protects the bytes in transit; unset, `AWS_UNSIGNED_PAYLOAD` decides,
+and without it every payload is signed.
+
 ## Examples
 
 Partition by schema metadata:
