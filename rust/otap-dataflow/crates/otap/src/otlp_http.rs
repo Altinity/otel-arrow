@@ -267,8 +267,9 @@ pub struct RpcStatus {
     /// Human-readable status message.
     #[prost(string, tag = "2")]
     pub message: String,
+    /// Typed error details, such as `google.rpc.RetryInfo`.
     #[prost(message, repeated, tag = "3")]
-    details: Vec<Any>,
+    pub details: Vec<Any>,
 }
 
 fn rpc_status_response(
