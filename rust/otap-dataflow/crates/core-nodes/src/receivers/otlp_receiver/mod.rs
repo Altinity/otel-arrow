@@ -232,7 +232,17 @@ pub static OTLP_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
                     error: error.to_string(),
                 },
             )?;
-        receiver.tune_max_concurrent_requests(receiver_config.output_pdata_channel.capacity);
+        for lowered in
+            receiver.tune_max_concurrent_requests(receiver_config.output_pdata_channel.capacity)
+        {
+            otel_warn!(
+                "otlp.receiver.max_concurrent_requests_lowered",
+                protocol = lowered.protocol,
+                configured = lowered.configured,
+                limit = lowered.limit,
+                message = "max_concurrent_requests is capped at the pipeline's pdata channel capacity; raise policies.channel_capacity.pdata to allow more requests in flight"
+            );
+        }
 
         Ok(ReceiverWrapper::shared(
             receiver,
@@ -245,6 +255,15 @@ pub static OTLP_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otel_arrow_dfe_config::validation::validate_typed_config::<Config>,
 };
+
+/// A user-set `max_concurrent_requests` the receiver lowered to its downstream
+/// channel capacity.
+#[derive(Debug, PartialEq, Eq)]
+struct LoweredLimit {
+    protocol: &'static str,
+    configured: usize,
+    limit: usize,
+}
 
 impl OTLPReceiver {
     /// Creates a new OTLPReceiver from a configuration object.
@@ -304,18 +323,35 @@ impl OTLPReceiver {
         })
     }
 
-    fn tune_max_concurrent_requests(&mut self, downstream_capacity: usize) {
+    /// Caps each protocol's `max_concurrent_requests` at the downstream
+    /// channel capacity and returns the user-set limits it lowered.
+    fn tune_max_concurrent_requests(&mut self, downstream_capacity: usize) -> Vec<LoweredLimit> {
         // Derive a receiver-wide ceiling from the downstream channel capacity.
         // This is used as a global cap when both protocols are enabled.
         self.global_max_concurrent_requests = Some(downstream_capacity.max(1));
 
+        let mut lowered = Vec::new();
+        let mut note = |protocol, configured: usize, limit: usize| {
+            if configured != 0 && limit < configured {
+                lowered.push(LoweredLimit {
+                    protocol,
+                    configured,
+                    limit,
+                });
+            }
+        };
         // Tune per-protocol limits relative to downstream capacity.
         if let Some(grpc) = self.config.protocols.grpc.as_mut() {
+            let configured = grpc.max_concurrent_requests;
             common::tune_max_concurrent_requests(grpc, downstream_capacity);
+            note("grpc", configured, grpc.max_concurrent_requests);
         }
         if let Some(http) = self.config.protocols.http.as_mut() {
+            let configured = http.max_concurrent_requests;
             otel_arrow_dfe_otap::otlp_http::tune_max_concurrent_requests(http, downstream_capacity);
+            note("http", configured, http.max_concurrent_requests);
         }
+        lowered
     }
 
     /// Builds signal services for gRPC and/or HTTP.
@@ -1258,7 +1294,7 @@ mod tests {
                 global_max_concurrent_requests: None,
                 authorizer: None,
             };
-            receiver.tune_max_concurrent_requests(16);
+            let _ = receiver.tune_max_concurrent_requests(16);
 
             let (runtime_ctrl_tx, mut runtime_ctrl_rx) = runtime_ctrl_msg_channel(16);
             let metrics_system = otel_arrow_dfe_telemetry::InternalTelemetrySystem::default();
@@ -1754,6 +1790,40 @@ mod tests {
         );
     }
 
+    /// Scenario: a gRPC `max_concurrent_requests` of 2048 and an unset HTTP limit, tuned to a
+    /// downstream capacity of 128.
+    /// Guarantees: the user-set gRPC limit is reported as lowered to 128 (the receiver warns about
+    /// it); the unset HTTP limit, which defaults to the capacity, is not.
+    #[test]
+    fn test_tune_reports_a_lowered_user_limit() {
+        use serde_json::json;
+
+        let controller_ctx = ControllerContext::new(TelemetryRegistryHandle::new());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let config = json!({
+            "protocols": {
+                "grpc": {
+                    "listening_addr": "127.0.0.1:4317",
+                    "max_concurrent_requests": 2048
+                },
+                "http": {
+                    "listening_addr": "127.0.0.1:4318"
+                }
+            }
+        });
+        let mut receiver = OTLPReceiver::from_config(pipeline_ctx, &config).unwrap();
+        let lowered = receiver.tune_max_concurrent_requests(128);
+        assert_eq!(
+            lowered,
+            [LoweredLimit {
+                protocol: "grpc",
+                configured: 2048,
+                limit: 128
+            }]
+        );
+    }
+
     #[test]
     fn test_tune_max_concurrent_requests() {
         use serde_json::json;
@@ -1773,7 +1843,7 @@ mod tests {
         });
         let mut receiver =
             OTLPReceiver::from_config(pipeline_ctx.clone(), &config_default).unwrap();
-        receiver.tune_max_concurrent_requests(128);
+        let _ = receiver.tune_max_concurrent_requests(128);
         assert_eq!(
             receiver
                 .config
@@ -1795,7 +1865,7 @@ mod tests {
             }
         });
         let mut receiver = OTLPReceiver::from_config(pipeline_ctx.clone(), &config_small).unwrap();
-        receiver.tune_max_concurrent_requests(128);
+        let _ = receiver.tune_max_concurrent_requests(128);
         assert_eq!(
             receiver
                 .config
@@ -1817,7 +1887,7 @@ mod tests {
             }
         });
         let mut receiver = OTLPReceiver::from_config(pipeline_ctx.clone(), &config_zero).unwrap();
-        receiver.tune_max_concurrent_requests(256);
+        let _ = receiver.tune_max_concurrent_requests(256);
         assert_eq!(
             receiver
                 .config
@@ -1839,7 +1909,7 @@ mod tests {
         });
         let mut receiver =
             OTLPReceiver::from_config(pipeline_ctx.clone(), &config_http_only).unwrap();
-        receiver.tune_max_concurrent_requests(64);
+        let _ = receiver.tune_max_concurrent_requests(64);
         assert_eq!(
             receiver
                 .config
@@ -1863,7 +1933,7 @@ mod tests {
             }
         });
         let mut receiver = OTLPReceiver::from_config(pipeline_ctx, &config_both).unwrap();
-        receiver.tune_max_concurrent_requests(100);
+        let _ = receiver.tune_max_concurrent_requests(100);
         assert_eq!(
             receiver
                 .config
