@@ -765,6 +765,40 @@ impl Context {
         (!self.authorized_identity.is_empty()).then_some(&self.authorized_identity)
     }
 
+    /// Keeps only what routing the request's Ack or Nack back needs: the
+    /// transport headers and the authorization-derived entries are dropped.
+    ///
+    /// For a node that parks a request across slow I/O and later acks or
+    /// nacks its context, so the request metadata is not held as long.
+    #[must_use]
+    pub fn into_completion_route(mut self) -> Self {
+        self.transport_headers = TransportHeaders::default();
+        self.authorized_identity = AuthorizedIdentityEntries::default();
+        self
+    }
+
+    /// Returns the bytes this context keeps resident in its routing frames,
+    /// including unused vector capacity.
+    ///
+    /// A node that parks a stripped context as a completion token holds the
+    /// frame vector and any spilled calldata for as long as the request is
+    /// undecided, so both are charged against that node's memory budget. The
+    /// inline calldata of an unspilled frame is already part of the frame, and
+    /// is not counted twice.
+    #[must_use]
+    pub fn retained_frame_bytes(&self) -> usize {
+        let spilled = self
+            .stack
+            .iter()
+            .filter(|frame| frame.route.calldata.spilled())
+            .map(|frame| {
+                frame.route.calldata.capacity()
+                    * size_of::<otel_arrow_dfe_engine::control::Context8u8>()
+            })
+            .sum::<usize>();
+        self.stack.capacity() * size_of::<Frame>() + spilled
+    }
+
     fn capture_authorized_identity(
         &mut self,
         policy: &AuthorizedIdentityPolicy,
@@ -3967,5 +4001,103 @@ mod test {
 
         let (_, payload) = create_test_pdata().into_parts();
         assert!(!payload.test_has_cached_item_count());
+    }
+
+    /// Scenario: a node that parks a request across slow I/O keeps only the
+    /// completion route of the context it retains, and then still routes an
+    /// ack on that context.
+    /// Guarantees: the route has neither the headers nor the claims captured,
+    /// while the ack/nack routing frames survive.
+    #[test]
+    fn the_completion_route_drops_headers_and_claims_but_keeps_routing_frames() {
+        let mut headers = TransportHeaders::new();
+        let name = ContextEntryName::try_from("tenant").expect("valid test context entry name");
+        headers.push(TransportHeader::captured(
+            name,
+            "x-tenant",
+            true,
+            ValueKind::Text,
+            "acme".as_bytes(),
+        ));
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(
+            serde_json::json!([{"claim": "sub", "store_as": "customer_id"}]),
+        )
+        .expect("valid authorized identity policy");
+        let identity = AuthorizedIdentity::new().with_subject("customer-42");
+
+        let (test_data, pdata) = create_test();
+        let mut pdata = pdata
+            .test_subscribe_to(Interests::ACKS | Interests::NACKS, test_data.into(), 101)
+            .with_transport_headers(headers.clone());
+        pdata.capture_authorized_identity(&policy, &identity);
+
+        let (context, _payload) = pdata.into_parts();
+        assert!(context.has_ack_or_nack_subscribers());
+        assert_eq!(context.transport_headers(), Some(&headers));
+        assert!(
+            context
+                .authorized_identity_entries()
+                .expect("claims were captured")
+                .get("customer_id")
+                .is_some()
+        );
+
+        let context = context.into_completion_route();
+        assert!(context.transport_headers().is_none());
+        assert!(context.authorized_identity_entries().is_none());
+        // The stripped context still routes the completion it was retained for.
+        assert!(context.has_ack_or_nack_subscribers());
+    }
+
+    /// Scenario: a retained completion context has excess frame capacity and
+    /// captured metadata.
+    /// Guarantees: claims and headers can be released without losing routing,
+    /// and the retained frame allocation is charged, including the unused
+    /// vector capacity a parked completion token keeps resident.
+    #[test]
+    fn completion_context_can_release_metadata_and_measure_frames() {
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(
+            serde_json::json!([{"claim": "sub", "store_as": "customer_id"}]),
+        )
+        .expect("valid authorized identity policy");
+        let mut context = Context::with_capacity(17);
+        context.set_source_node(42);
+        context.capture_authorized_identity(
+            &policy,
+            &AuthorizedIdentity::new().with_subject("customer-42"),
+        );
+        let mut headers = TransportHeaders::with_capacity(256);
+        headers.push(TransportHeader::captured(
+            ContextEntryName::try_from("tenant").expect("valid test context entry name"),
+            "x-tenant",
+            true,
+            ValueKind::Text,
+            "acme".as_bytes(),
+        ));
+        context.set_transport_headers(headers);
+
+        let mut context = context.into_completion_route();
+        assert!(context.transport_headers().is_none());
+        assert!(context.authorized_identity_entries().is_none());
+        assert_eq!(context.source_node(), Some(42));
+
+        // An unspilled frame keeps its calldata inline, so the frame vector is
+        // the whole charge.
+        assert!(!context.stack[0].route.calldata.spilled());
+        assert_eq!(context.stack.capacity(), 17);
+        assert_eq!(context.retained_frame_bytes(), 17 * size_of::<Frame>());
+
+        let frame = context.stack.first_mut().expect("source frame");
+        for n in 0_u64..32 {
+            frame.route.calldata.push(n.into());
+        }
+        assert!(context.stack[0].route.calldata.spilled());
+        let spilled = context.stack[0].route.calldata.capacity();
+        assert!(spilled >= 32);
+        assert_eq!(
+            context.retained_frame_bytes(),
+            17 * size_of::<Frame>()
+                + spilled * size_of::<otel_arrow_dfe_engine::control::Context8u8>()
+        );
     }
 }
