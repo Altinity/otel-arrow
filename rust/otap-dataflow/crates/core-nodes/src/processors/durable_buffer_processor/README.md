@@ -145,6 +145,8 @@ See [telemetry.md](telemetry.md) for maintenance notes and the expanded event in
 - Retention size is divided across assigned pipeline cores.
 - `max_age` is based on segment finalization time, not telemetry timestamps.
 - `convert_to_arrow` mode can increase CPU cost compared with `pass_through`.
+  A request it cannot convert (for example one with more than 65,536
+  resources, scopes or records) is nacked permanently.
 
 ## Related Docs
 
