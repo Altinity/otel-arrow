@@ -82,6 +82,13 @@ nodes:
           base_uri: https://account.blob.core.windows.net/container/prefix
 ```
 
+Azure storage also takes an optional `endpoint`, the blob service URL to use
+instead of the one the account in `base_uri` implies, for a private endpoint or
+a sovereign cloud. `base_uri` keeps the public-cloud form above, which names the
+account, container and prefix; another host fails at startup. Only HTTPS is
+used: an `http://` endpoint fails at startup, so the Azurite emulator works
+only when it serves HTTPS (`endpoint: https://127.0.0.1:10000/devstoreaccount1`).
+
 S3 storage takes an optional `unsigned_payload`. When true, requests are signed
 with SigV4 `UNSIGNED-PAYLOAD` instead of a SHA-256 of every uploaded byte, and
 only TLS protects the bytes in transit; unset, `AWS_UNSIGNED_PAYLOAD` decides,

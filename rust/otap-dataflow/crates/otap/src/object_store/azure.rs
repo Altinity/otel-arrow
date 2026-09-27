@@ -129,6 +129,7 @@ mod test {
         let storage = crate::object_store::StorageType::Azure {
             base_uri: "https://mystorageaccount.blob.core.windows.net/container/telemetry"
                 .to_string(),
+            endpoint: None,
         };
 
         let store = crate::object_store::from_storage_type_with_retry_and_token_provider(
@@ -153,6 +154,104 @@ mod test {
         assert!(
             store_with_retry.is_ok(),
             "expected a store, got {store_with_retry:?}"
+        );
+    }
+
+    /// Scenario: Azure storage names an explicit endpoint, as for Azurite or a
+    /// private endpoint, and a write is attempted where nothing listens.
+    /// Guarantees: The request goes to the configured endpoint, under the
+    /// account, container and prefix of `base_uri`, and never to the public
+    /// endpoint the account name would otherwise select.
+    #[tokio::test]
+    async fn azure_storage_sends_requests_to_the_configured_endpoint() {
+        crate::crypto::ensure_crypto_provider();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().expect("local address").port();
+        drop(listener);
+        let storage = crate::object_store::StorageType::Azure {
+            base_uri: "https://devstoreaccount1.blob.core.windows.net/container/telemetry"
+                .to_string(),
+            endpoint: Some(format!("https://127.0.0.1:{port}/devstoreaccount1")),
+        };
+        let retry = crate::object_store::RetryOptions {
+            max_retries: 0,
+            init_backoff: std::time::Duration::from_millis(10),
+            max_backoff: std::time::Duration::from_millis(10),
+            backoff_base: 2.0,
+            retry_timeout: std::time::Duration::from_secs(5),
+        };
+        let store = crate::object_store::from_storage_type_with_retry_and_token_provider(
+            &storage,
+            Some(&retry),
+            Some(Box::new(TestTokenProvider::new(vec!["token1".to_string()]))),
+        )
+        .expect("an Azure store with an endpoint builds");
+
+        let error = object_store::ObjectStoreExt::put(
+            &store,
+            &object_store::path::Path::from("object"),
+            "body".into(),
+        )
+        .await
+        .expect_err("nothing listens on the endpoint");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!(
+                "https://127.0.0.1:{port}/devstoreaccount1/container/telemetry/object"
+            )),
+            "the request did not go to the configured endpoint: {rendered}"
+        );
+        assert!(!rendered.contains("blob.core.windows.net"), "{rendered}");
+    }
+
+    /// Scenario: Azure storage names a plain `http://` endpoint, in any case.
+    /// Guarantees: building the store fails naming the endpoint, since the Azure client
+    /// refuses plain HTTP on every request.
+    #[test]
+    fn azure_storage_refuses_a_plain_http_endpoint() {
+        crate::crypto::ensure_crypto_provider();
+        for endpoint in [
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "HTTP://azurite:10000/devstoreaccount1",
+        ] {
+            let storage = crate::object_store::StorageType::Azure {
+                base_uri: "https://devstoreaccount1.blob.core.windows.net/container".to_string(),
+                endpoint: Some(endpoint.to_string()),
+            };
+            let error = crate::object_store::from_storage_type_with_retry_and_token_provider(
+                &storage,
+                None,
+                Some(Box::new(TestTokenProvider::new(vec!["token1".to_string()]))),
+            )
+            .expect_err("a plain HTTP endpoint is refused");
+            assert!(error.to_string().contains(endpoint), "{error}");
+        }
+    }
+
+    /// Scenario: Azure storage with an endpoint whose `base_uri` names a
+    /// sovereign-cloud host instead of the public-cloud form.
+    /// Guarantees: building the store fails naming `base_uri` and the form it
+    /// must take.
+    #[test]
+    fn azure_storage_explains_the_base_uri_it_needs() {
+        crate::crypto::ensure_crypto_provider();
+        let base_uri = "https://account.blob.core.chinacloudapi.cn/container";
+        let storage = crate::object_store::StorageType::Azure {
+            base_uri: base_uri.to_string(),
+            endpoint: Some("https://account.blob.core.chinacloudapi.cn".to_string()),
+        };
+        let error = crate::object_store::from_storage_type_with_retry_and_token_provider(
+            &storage,
+            None,
+            Some(Box::new(TestTokenProvider::new(vec!["token1".to_string()]))),
+        )
+        .expect_err("a base_uri object_store cannot parse is refused");
+        let rendered = error.to_string();
+        assert!(rendered.contains(base_uri), "{rendered}");
+        assert!(
+            rendered.contains("https://<account>.blob.core.windows.net/<container>"),
+            "{rendered}"
         );
     }
 

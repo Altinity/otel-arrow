@@ -171,6 +171,7 @@ pub enum StorageType {
 
     /// Azure storage
     #[cfg(feature = "azure")]
+    #[non_exhaustive]
     Azure {
         /// The base URI for the azure storage backend. Many are supported:
         ///
@@ -178,6 +179,18 @@ pub enum StorageType {
         /// - Fabric: `https://<account>.dfs.fabric.microsoft.com`
         /// - More: See [object_store::azure::MicrosoftAzureBuilder::with_url]
         base_uri: String,
+
+        /// Optional blob service endpoint that replaces the one derived from
+        /// the account in `base_uri`, for example a sovereign cloud or a
+        /// private endpoint. It must be `https://`: the Azure client refuses
+        /// plain HTTP, so the Azurite emulator works only when it serves TLS
+        /// (`https://127.0.0.1:10000/devstoreaccount1`). `base_uri` keeps
+        /// the public-cloud form above,
+        /// `https://<account>.blob.core.windows.net/<container>[/<prefix>]`,
+        /// which names the account, the container and any prefix; another
+        /// host in `base_uri` is refused.
+        #[serde(default)]
+        endpoint: Option<String>,
     },
 
     /// AWS S3 storage
@@ -439,7 +452,7 @@ fn build_store(
         }
 
         #[cfg(feature = "azure")]
-        StorageType::Azure { base_uri } => {
+        StorageType::Azure { base_uri, endpoint } => {
             use object_store::azure::MicrosoftAzureBuilder;
 
             let token_provider = token_provider.ok_or_else(|| object_store::Error::Generic {
@@ -451,11 +464,37 @@ fn build_store(
             let mut builder = MicrosoftAzureBuilder::new()
                 .with_url(base_uri)
                 .with_credentials(Arc::new(credential_provider));
+            if let Some(endpoint) = endpoint {
+                // The Azure client refuses plain HTTP on every request.
+                if endpoint
+                    .get(..7)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+                {
+                    return Err(object_store::Error::Generic {
+                        store: "Azure",
+                        source: format!(
+                            "endpoint {endpoint} must use https://; the Azure client refuses \
+                             plain HTTP, such as Azurite's default endpoint"
+                        )
+                        .into(),
+                    });
+                }
+                builder = builder.with_endpoint(endpoint.clone());
+            }
             if let Some(retry) = retry {
                 builder = builder.with_retry(retry.to_object_store_retry_config()?);
             }
 
-            let store = builder.build()?;
+            let store = builder.build().map_err(|e| object_store::Error::Generic {
+                store: "Azure",
+                source: format!(
+                    "cannot build the client for base_uri {base_uri}, which must name the \
+                     account and container as \
+                     https://<account>.blob.core.windows.net/<container>[/<prefix>], also \
+                     when an endpoint is set: {e}"
+                )
+                .into(),
+            })?;
             wrap_with_prefix(store, base_uri)
         }
 
@@ -882,6 +921,7 @@ mod test {
         {
             let azure = StorageType::Azure {
                 base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+                endpoint: None,
             };
             assert_eq!(azure.kind(), "azure");
         }
@@ -914,6 +954,7 @@ mod test {
         {
             let azure = StorageType::Azure {
                 base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+                endpoint: None,
             };
             assert!(azure.requires_bearer_token_provider());
         }
@@ -941,6 +982,7 @@ mod test {
         crate::crypto::ensure_crypto_provider();
         let storage = StorageType::Azure {
             base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+            endpoint: None,
         };
         assert!(from_storage_type(&storage).is_err());
     }
@@ -953,6 +995,7 @@ mod test {
         crate::crypto::ensure_crypto_provider();
         let storage = StorageType::Azure {
             base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+            endpoint: None,
         };
         let retry = valid_retry_options();
         assert!(from_storage_type_with_retry(&storage, Some(&retry)).is_err());
@@ -1028,6 +1071,28 @@ mod test {
 
         let expected = StorageType::Azure {
             base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+            endpoint: None,
+        };
+        test_deserialize(&json, expected);
+    }
+
+    /// Scenario: Azure storage config names an explicit blob service endpoint.
+    /// Guarantees: The endpoint is kept beside the base URI, so an emulator or
+    /// private endpoint can be addressed without changing the account naming.
+    #[test]
+    #[cfg(feature = "azure")]
+    fn test_azure_config_with_endpoint() {
+        let json = json!({
+            "azure": {
+                "base_uri": "https://devstoreaccount1.blob.core.windows.net/container/otel",
+                "endpoint": "https://127.0.0.1:10000/devstoreaccount1"
+            }
+        })
+        .to_string();
+
+        let expected = StorageType::Azure {
+            base_uri: "https://devstoreaccount1.blob.core.windows.net/container/otel".to_string(),
+            endpoint: Some("https://127.0.0.1:10000/devstoreaccount1".to_string()),
         };
         test_deserialize(&json, expected);
     }
