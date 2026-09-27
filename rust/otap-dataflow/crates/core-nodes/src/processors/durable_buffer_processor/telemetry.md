@@ -49,7 +49,7 @@ All events are emitted from
 | Event name | Level | Description |
 | --- | --- | --- |
 | `durable_buffer.ingest.backpressure` | `warn` | Storage soft cap exceeded; the upstream bundle is NACKed. Rate-limited to at most once per `WARN_RATE_LIMIT` interval. |
-| `durable_buffer.ingest.failed` | `error` | Non-backpressure ingest error; the upstream bundle is NACKed. |
+| `durable_buffer.ingest.failed` | `error` | Non-backpressure ingest error; the upstream bundle is NACKed. At most once per 10 s; `suppressed` counts the lines left out, and the metrics count every bundle. |
 | `durable_buffer.otlp.adapter_failed` | `error` | `OtlpBytesAdapter` creation failed in `PassThrough` mode; the upstream bundle is NACKed with the original bytes. |
 | `durable_buffer.otlp.conversion_failed` | `error` | OTLP->Arrow conversion failed in `ConvertToArrow` mode; the upstream bundle is NACKed with the original bytes. |
 
@@ -79,7 +79,7 @@ All events are emitted from
 | `durable_buffer.bundle.conversion_failed` | `error` | Failed to convert a reconstructed Quiver bundle to `OtapPdata`; bundle is rejected and counted as a read error and as `resolved{outcome=conversion_failed}`. |
 | `durable_buffer.bundle.acked` | `debug` | Bundle ACKed by downstream and cleaned up from the in-flight map. |
 | `durable_buffer.bundle.nacked` | `debug` | Bundle transiently NACKed by downstream; retry scheduled with exponential backoff. |
-| `durable_buffer.bundle.rejected_permanent` | `warn` | Bundle permanently NACKed by downstream; items are counted as rejected and the bundle is not retried. |
+| `durable_buffer.bundle.rejected_permanent` | `warn` | Bundle permanently NACKed by downstream; items are counted as rejected and the bundle is not retried. At most once per 10 s; `suppressed` counts the lines left out, and the metrics count every bundle. |
 | `durable_buffer.ack.unknown_bundle` | `warn` | ACK received for a bundle that is not in the in-flight map (unexpected). |
 | `durable_buffer.nack.unknown_bundle` | `warn` | NACK received for a bundle that is not in the in-flight map (unexpected). |
 

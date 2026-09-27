@@ -340,6 +340,14 @@ pub struct DurableBuffer {
 
     /// Last cumulative Quiver retention-loss totals used to compute segment/bundle deltas.
     last_loss_snapshot: RetentionLossSnapshot,
+
+    /// Last time an ingest error was logged, and the errors not logged since.
+    last_ingest_error_warn: Option<Instant>,
+    ingest_errors_suppressed: u64,
+
+    /// Last time a permanent rejection was logged, and those not logged since.
+    last_rejected_warn: Option<Instant>,
+    rejected_suppressed: u64,
 }
 
 impl DurableBuffer {
@@ -406,6 +414,10 @@ impl DurableBuffer {
             segment_cache_generation: 0,
             metadata_load_warned_segments: HashSet::new(),
             last_loss_snapshot: RetentionLossSnapshot::default(),
+            last_ingest_error_warn: None,
+            ingest_errors_suppressed: 0,
+            last_rejected_warn: None,
+            rejected_suppressed: 0,
         })
     }
 
@@ -1134,7 +1146,20 @@ impl DurableBuffer {
                         .ingest_for(IngestFailure::Error)
                         .failures
                         .add(1);
-                    otel_error!("durable_buffer.ingest.failed", error = %e);
+                    let now = Instant::now();
+                    if self
+                        .last_ingest_error_warn
+                        .is_none_or(|last| now.duration_since(last) >= WARN_RATE_LIMIT)
+                    {
+                        self.last_ingest_error_warn = Some(now);
+                        otel_error!(
+                            "durable_buffer.ingest.failed",
+                            error = %e,
+                            suppressed = std::mem::take(&mut self.ingest_errors_suppressed)
+                        );
+                    } else {
+                        self.ingest_errors_suppressed += 1;
+                    }
                 }
 
                 // Preserve original payload so upstream can retry
@@ -1521,12 +1546,22 @@ impl DurableBuffer {
                     .resolved
                     .add(1);
 
-                otel_warn!(
-                    "durable_buffer.bundle.rejected_permanent",
-                    segment_seq = bundle_ref.segment_seq.raw(),
-                    bundle_index = bundle_ref.bundle_index.raw(),
-                    reason = %nack.reason
-                );
+                let now = Instant::now();
+                if self
+                    .last_rejected_warn
+                    .is_none_or(|last| now.duration_since(last) >= WARN_RATE_LIMIT)
+                {
+                    self.last_rejected_warn = Some(now);
+                    otel_warn!(
+                        "durable_buffer.bundle.rejected_permanent",
+                        segment_seq = bundle_ref.segment_seq.raw(),
+                        bundle_index = bundle_ref.bundle_index.raw(),
+                        reason = %nack.reason,
+                        suppressed = std::mem::take(&mut self.rejected_suppressed)
+                    );
+                } else {
+                    self.rejected_suppressed += 1;
+                }
 
                 // Reject the bundle in Quiver (marks as permanently failed)
                 pending.handle.reject();
