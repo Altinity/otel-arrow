@@ -10,6 +10,7 @@ mod cbor;
 mod error;
 
 pub use error::{Error, Result};
+pub use record::array::count_utf8_repairs;
 
 use crate::{
     encode::record::{
