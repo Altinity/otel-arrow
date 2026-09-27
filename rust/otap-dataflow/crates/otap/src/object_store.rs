@@ -207,6 +207,20 @@ pub enum StorageType {
 }
 
 impl StorageType {
+    /// The backend's name, for logs: `file`, `azure` or `s3`.
+    ///
+    /// Never any of the variant's fields, which may name credentials.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "file",
+            #[cfg(feature = "azure")]
+            Self::Azure { .. } => "azure",
+            #[cfg(feature = "aws")]
+            Self::S3 { .. } => "s3",
+        }
+    }
+
     /// Whether this storage backend obtains credentials from a bearer token capability.
     #[must_use]
     pub const fn requires_bearer_token_provider(&self) -> bool {
@@ -307,8 +321,57 @@ pub fn from_storage_type_with_retry(
     from_storage_type_with_retry_and_token_provider(storage, retry, None)
 }
 
+/// The bearer token provider `storage` needs, taken from a node's bound
+/// capabilities, or `None` for a backend that obtains no bearer token.
+///
+/// Shared by every exporter that writes through an object store.
+pub fn required_token_provider(
+    storage: &StorageType,
+    capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<Option<Box<dyn BearerTokenProvider>>, otel_arrow_dfe_config::error::Error> {
+    if !storage.requires_bearer_token_provider() {
+        return Ok(None);
+    }
+    capabilities
+        .require_shared::<otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider>()
+        .map(Some)
+        .map_err(|e| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: e.to_string(),
+        })
+}
+
+/// Build the object store an exporter writes through, reported as that
+/// exporter's configuration error when it cannot be built.
+///
+/// Retry settings apply only to cloud backends; given for local file
+/// storage they are validated and otherwise ignored. Each exporter logs
+/// that under its own event name, as before this helper existed.
+pub fn exporter_store(
+    exporter: otel_arrow_dfe_engine::node::NodeId,
+    storage: &StorageType,
+    retry: Option<&RetryOptions>,
+    token_provider: Option<Box<dyn BearerTokenProvider>>,
+) -> Result<Arc<dyn ObjectStore>, otel_arrow_dfe_engine::error::Error> {
+    build_store(storage, retry, token_provider).map_err(|e| {
+        otel_arrow_dfe_engine::error::Error::ExporterError {
+            exporter,
+            kind: otel_arrow_dfe_engine::error::ExporterErrorKind::Configuration,
+            error: format!("error initializing object store {e}"),
+            source_detail: otel_arrow_dfe_engine::error::format_error_sources(&e),
+        }
+    })
+}
+
 /// Fetch an object store and use the supplied bearer token provider for Azure storage.
 pub fn from_storage_type_with_retry_and_token_provider(
+    storage: &StorageType,
+    retry: Option<&RetryOptions>,
+    token_provider: Option<Box<dyn BearerTokenProvider>>,
+) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
+    build_store(storage, retry, token_provider)
+}
+
+fn build_store(
     storage: &StorageType,
     retry: Option<&RetryOptions>,
     token_provider: Option<Box<dyn BearerTokenProvider>>,
@@ -406,6 +469,50 @@ mod test {
     use url::Url;
 
     use super::*;
+
+    /// Scenario: an exporter resolves the token provider for local file
+    /// storage with no capability bound, then builds its store once with a
+    /// usable root and once with a root that does not exist.
+    /// Guarantees: file storage needs no bearer token capability, a usable
+    /// store is returned, and a store that cannot be built is reported as
+    /// that exporter's configuration error naming the object store, which
+    /// is the one mapping every object-store exporter shares.
+    #[test]
+    fn exporter_store_wiring_is_shared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = StorageType::File {
+            base_uri: dir.path().to_string_lossy().into_owned(),
+        };
+        let capabilities = otel_arrow_dfe_engine::capability::registry::Capabilities::empty();
+        assert!(
+            required_token_provider(&storage, &capabilities)
+                .expect("file storage needs no capability")
+                .is_none()
+        );
+        let id = || otel_arrow_dfe_engine::node::NodeId {
+            index: 0,
+            name: "exporter".into(),
+        };
+        assert!(exporter_store(id(), &storage, None, None).is_ok());
+
+        let broken = StorageType::File {
+            base_uri: dir.path().join("missing").to_string_lossy().into_owned(),
+        };
+        match exporter_store(id(), &broken, None, None) {
+            Err(otel_arrow_dfe_engine::error::Error::ExporterError { kind, error, .. }) => {
+                assert_eq!(
+                    kind,
+                    otel_arrow_dfe_engine::error::ExporterErrorKind::Configuration
+                );
+                assert!(
+                    error.starts_with("error initializing object store"),
+                    "{error}"
+                );
+            }
+            Err(other) => panic!("expected an exporter configuration error, got {other}"),
+            Ok(_) => panic!("a missing root cannot be opened"),
+        }
+    }
 
     #[test]
     fn retry_options_deserialize_duration_strings() {
@@ -693,6 +800,39 @@ mod test {
         let base_uri = tmp.path().to_str().unwrap().to_string();
         let storage = StorageType::File { base_uri };
         assert!(from_storage_type(&storage).is_ok());
+    }
+
+    /// Scenario: each storage backend compiled in is asked for its name.
+    /// Guarantees: the name is the lowercase backend (`file`, `azure`, `s3`)
+    /// and never carries a field of the variant, so a start event can name
+    /// the backend without risking a credential in the log.
+    #[test]
+    fn each_storage_backend_names_its_kind() {
+        let file = StorageType::File {
+            base_uri: "/tmp/secret-path".to_string(),
+        };
+        assert_eq!(file.kind(), "file");
+
+        #[cfg(feature = "azure")]
+        {
+            let azure = StorageType::Azure {
+                base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+            };
+            assert_eq!(azure.kind(), "azure");
+        }
+
+        #[cfg(feature = "aws")]
+        {
+            let s3 = StorageType::S3 {
+                base_uri: "s3://my-bucket/telemetry".to_string(),
+                region: None,
+                endpoint: None,
+                allow_http: None,
+                virtual_hosted_style_request: None,
+                auth: cloud_auth::aws::AuthMethod::Default,
+            };
+            assert_eq!(s3.kind(), "s3");
+        }
     }
 
     /// Scenario: Each supported storage backend is asked whether it needs a bearer token capability.
