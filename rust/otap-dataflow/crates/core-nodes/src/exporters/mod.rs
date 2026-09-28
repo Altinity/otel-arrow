@@ -19,6 +19,10 @@ pub mod topic_exporter;
 #[cfg(feature = "parquet")]
 pub mod parquet_exporter;
 
+/// Series/values Parquet exporter with durable acknowledgements.
+#[cfg(feature = "series-parquet")]
+pub mod series_parquet_exporter;
+
 /// OTAP exporter.
 #[cfg(feature = "otap")]
 pub mod otap_exporter;

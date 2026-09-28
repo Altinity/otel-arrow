@@ -7,8 +7,10 @@ over `object_store`.
 
 The storage format is specified in [docs/FORMAT.md](docs/FORMAT.md).
 
-This crate is engine-independent: it never depends on the Dataflow engine;
-an exporter adapts it into a Dataflow pipeline.
+This crate is engine-independent: it never depends on the Dataflow engine.
+The `core-nodes` exporter `exporter:series_parquet` adapts it into a Dataflow
+pipeline; see its
+[README](../core-nodes/src/exporters/series_parquet_exporter/README.md).
 
 ## Modules
 

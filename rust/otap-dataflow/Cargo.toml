@@ -336,6 +336,7 @@ transform = ["otel-arrow-dfe-core-nodes/transform"]
 # Core exporters.
 file = ["otel-arrow-dfe-core-nodes/file"]
 parquet = ["otel-arrow-dfe-core-nodes/parquet"]
+series-parquet = ["otel-arrow-dfe-core-nodes/series-parquet"]
 
 # Contrib-node feature forwarding. Keep these lists aligned with
 # `crates/contrib-nodes/Cargo.toml`.

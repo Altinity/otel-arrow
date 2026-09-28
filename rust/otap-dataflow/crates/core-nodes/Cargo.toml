@@ -24,6 +24,7 @@ otel-arrow-dfe-otap = { workspace = true }
 otel-arrow-dfe-pdata = { workspace = true }
 otel-arrow-dfe-pdata-views = { workspace = true }
 otel-arrow-dfe-query-engine = { workspace = true, optional = true }
+otel-arrow-dfe-series-lake = { workspace = true, optional = true }
 otel-arrow-dfe-quiver = { workspace = true, optional = true }
 otel-arrow-dfe-telemetry = { workspace = true }
 otel-arrow-dfe-telemetry-macros = { workspace = true }
@@ -132,6 +133,12 @@ parquet = [
     "dep:object_store",
     "dep:parquet",
 ]
+# Opt-in: not part of `core-exporters`.
+series-parquet = [
+    "dep:object_store",
+    "dep:parquet",
+    "dep:otel-arrow-dfe-series-lake",
+]
 
 # Cross-cutting features may imply a node when they have no meaning on their
 # own; for example, Azure storage implies the Parquet exporter.
@@ -144,6 +151,11 @@ dev-tools = []
 
 [dev-dependencies]
 serde_yaml.workspace = true
+# The series_parquet tests capture the WARN events a failure must emit.
+tracing = { workspace = true, features = ["std"] }
+tracing-subscriber = { workspace = true, features = ["registry", "std"] }
+# The series_parquet delivery state machine is a proptest.
+proptest.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 fluke-hpack.workspace = true
@@ -152,7 +164,10 @@ otel-arrow-dfe-channel = { workspace = true }
 otel-arrow-dfe-engine = { workspace = true, features = ["test-utils"] }
 # The durable_buffer shutdown tests stall the WAL writer's drop.
 otel-arrow-dfe-quiver = { workspace = true, features = ["testing"] }
-# `aws` compiles the S3 storage variant, which the parquet config tests load.
+# The series_parquet tests drive the wall clock.
+otel-arrow-dfe-series-lake = { workspace = true, features = ["testing"] }
+# `aws` compiles the S3 storage variant, which the parquet and series_parquet
+# config tests load.
 otel-arrow-dfe-otap = { workspace = true, features = ["test-utils", "crypto-ring", "aws"] }
 otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
 otel-arrow-dfe-telemetry = { workspace = true }
