@@ -1550,6 +1550,8 @@ impl Drop for WalWriter {
         if self.test_crashed {
             return;
         }
+        #[cfg(feature = "testing")]
+        crate::test_hooks::before_wal_drop(&self.coordinator.options().path);
         if self.active_file.unflushed_bytes == 0 {
             return;
         }

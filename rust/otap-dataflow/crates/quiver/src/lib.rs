@@ -126,6 +126,9 @@ pub mod segment;
 pub mod segment_store;
 pub mod subscriber;
 pub mod telemetry;
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub mod test_hooks;
 pub(crate) mod wal;
 
 pub use budget::{BudgetConfigError, DiskBudget};

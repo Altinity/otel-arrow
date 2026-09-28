@@ -102,13 +102,22 @@ All events are emitted from
 | `durable_buffer.shutdown.start` | `info` | Shutdown sequence started; reports the deadline. |
 | `durable_buffer.shutdown.flushing` | `info` | About to call `engine.flush()` to finalize any open segment before draining. |
 | `durable_buffer.shutdown.drained` | `info` | Reports the number of bundles drained to downstream during shutdown. |
-| `durable_buffer.shutdown.complete` | `info` | Engine shutdown completed successfully. |
-| `durable_buffer.shutdown.deadline_exceeded` | `warn` | Shutdown deadline already passed before the flush/drain sequence; flush and drain are skipped. |
-| `durable_buffer.shutdown.drain_deadline` | `warn` | Shutdown drain loop exceeded its deadline; remaining bundles are not forwarded. |
+| `durable_buffer.shutdown.awaiting_acks` | `info` | Bundles are still in flight after the drain; their ACK/NACK are recorded until one second before the shutdown deadline. |
+| `durable_buffer.shutdown.unacknowledged` | `warn` | Bundles still in flight when the final persist starts; they are replayed on the next start. |
+| `durable_buffer.shutdown.complete` | `info` | The final persist and the engine shutdown succeeded and the storage engine closed its files; emitted only after the release thread ends, so it never accompanies `release_deadline`, `release_thread_failed`, `release_runtime_failed` or `release_panicked`. |
+| `durable_buffer.shutdown.deadline_exceeded` | `warn` | Less than one second was left before the shutdown deadline when the flush/drain sequence started; flush, drain and the completion wait are skipped and the time goes to the final persist. |
+| `durable_buffer.shutdown.drain_deadline` | `warn` | The shutdown drain reached one second before the deadline; remaining bundles are not forwarded. |
 | `durable_buffer.shutdown.backpressure` | `warn` | Downstream channel full during shutdown drain; drain halted. |
 | `durable_buffer.shutdown.bundle_error` | `warn` | Bundle processing error during shutdown drain; drain continues. |
 | `durable_buffer.shutdown.poll_error` | `warn` | `poll_next_bundle()` error during shutdown drain; drain halted. |
 | `durable_buffer.shutdown.flush_failed` | `error` | `engine.flush()` failed during shutdown (data durability is still ensured by `engine.shutdown()`). |
+| `durable_buffer.shutdown.flush_deadline` | `warn` | The flush of the open segment did not finish one second before the shutdown deadline; it keeps running on its own thread, and what it does not finish before the process exits is replayed from the WAL on the next start. |
+| `durable_buffer.shutdown.persist_deadline` | `warn` | The final persist of progress and the engine shutdown, which wait for the shutdown flush and any earlier persist still running, did not finish by the shutdown deadline; it keeps running on its own thread, and what it does not persist before the process exits is replayed from the WAL on the next start. |
+| `durable_buffer.shutdown.release_deadline` | `warn` | The storage engine did not finish its final persist and close its files (the WAL's drop-time sync), or the thread doing it did not end, by the shutdown deadline; it keeps closing on its own thread and the buffer stops without it. |
+| `durable_buffer.shutdown.release_thread_failed` | `warn` | No thread could be started to close the storage engine; the final persist runs on the pipeline thread, the engine is left open, and what it did not persist is replayed from the WAL on the next start. |
+| `durable_buffer.shutdown.release_panicked` | `error` | The thread closing the storage engine panicked; what it did not persist is replayed from the WAL on the next start. |
+| `durable_buffer.shutdown.release_runtime_failed` | `error` | The thread closing the storage engine could not build its runtime; the final persist did not run, the engine is left open, and what it did not persist is replayed from the WAL on the next start. |
+| `durable_buffer.shutdown.progress_failed` | `error` | Persisting the recorded acknowledgements failed, could not start, or did not finish by the shutdown deadline (also when the previous persist was still running); those bundles are replayed on the next start. |
 | `durable_buffer.shutdown.engine_failed` | `error` | `engine.shutdown()` failed; open segment may not have been finalized. |
 
 ## Maintenance

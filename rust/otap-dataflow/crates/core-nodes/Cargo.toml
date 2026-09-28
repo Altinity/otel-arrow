@@ -150,6 +150,8 @@ fluke-hpack.workspace = true
 flume.workspace = true
 otel-arrow-dfe-channel = { workspace = true }
 otel-arrow-dfe-engine = { workspace = true, features = ["test-utils"] }
+# The durable_buffer shutdown tests stall the WAL writer's drop.
+otel-arrow-dfe-quiver = { workspace = true, features = ["testing"] }
 otel-arrow-dfe-otap = { workspace = true, features = ["test-utils", "crypto-ring"] }
 otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
 otel-arrow-dfe-telemetry = { workspace = true }

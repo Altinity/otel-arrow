@@ -71,6 +71,13 @@ config:
 
   # Maximum bundles in-flight to downstream (default: 1000)
   max_in_flight: 1000
+
+  shutdown:
+    # How long to wait after Shutdown for the ACK/NACK of bundles in flight:
+    # a duration with a unit; true to wait as long as the shutdown deadline
+    # allows, which ends one second before it; or false (the default) to stop
+    # at once and replay them on the next start
+    await_acks: 10s
 ```
 
 ## Architecture
@@ -96,6 +103,24 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
 3. **Forward**: Timer tick polls for finalized bundles, sends downstream
 4. **ACK/NACK**: On ACK, bundle marked complete; on NACK, deferred for retry
 5. **Cleanup**: Fully-consumed segments are deleted to reclaim disk space
+6. **Shutdown**: With `shutdown.await_acks` on (it is off by default), after
+   the drain the buffer closes its outputs and records the ACK/NACK of bundles
+   still in flight until one second before the shutdown deadline or
+   `shutdown.await_acks`, whichever comes first. It persists them
+   when the wait begins and then within one `poll_interval` of each one; it
+   then persists them a last time, in place of a persist not yet due, and
+   stops. The flush, the drain and the wait end one second before the
+   deadline, which leaves that second to the final persist, and the buffer
+   never waits past the deadline, so it also fits an engine that cancels a
+   processor at its deadline. A bundle unacknowledged or unpersisted by then
+   is replayed on the next start.
+   With bundles in flight the wait can last the whole deadline (60 s on
+   SIGTERM), longer than the Kubernetes default grace period of 30 s: set
+   `terminationGracePeriodSeconds` above the shutdown deadline, or bound the
+   wait with `shutdown.await_acks`; a SIGKILL during the wait replays what was
+   acknowledged since the last persist. The storage work of the shutdown runs
+   on a thread of its own, which a deadline stops waiting for but never
+   interrupts; a later buffer on the same core waits for it to end (below)
 
 ## Telemetry
 
