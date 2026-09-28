@@ -649,6 +649,7 @@ impl<PData> ProcessorWrapper<PData> {
     where
         PData: ReceivedAtNode + FlowMetricHook,
     {
+        let pipeline_deadline = runtime_services.shutdown_deadline().clone();
         let runtime = self
             .prepare_runtime(metrics_reporter.clone(), node_interests, runtime_services)
             .await?;
@@ -661,6 +662,7 @@ impl<PData> ProcessorWrapper<PData> {
                     mut inbox,
                     mut effect_handler,
                 } => {
+                    inbox.follow_pipeline_deadline(pipeline_deadline.clone());
                     effect_handler
                         .core
                         .set_runtime_ctrl_msg_sender(runtime_ctrl_msg_tx);
@@ -752,6 +754,7 @@ impl<PData> ProcessorWrapper<PData> {
                     mut inbox,
                     mut effect_handler,
                 } => {
+                    inbox.follow_pipeline_deadline(pipeline_deadline.clone());
                     effect_handler
                         .core
                         .set_runtime_ctrl_msg_sender(runtime_ctrl_msg_tx);

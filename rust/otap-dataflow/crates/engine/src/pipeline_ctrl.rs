@@ -26,6 +26,7 @@ use crate::control_plane_metrics::{PipelineCompletionMetricsState, RuntimeContro
 use crate::error::Error;
 use crate::memory_limiter::MemoryPressureChanged;
 use crate::pipeline_metrics::PipelineMetricsMonitor;
+use crate::runtime_services::PipelineShutdownDeadline;
 use crate::terminal_state::TerminalMetricsDeadline;
 use crate::{Interests, RequestOutcome, Unwindable};
 use otel_arrow_dfe_config::DeployedPipelineKey;
@@ -353,9 +354,19 @@ pub struct RuntimeCtrlMsgManager<PData> {
     runtime_control_metrics: RuntimeControlMetricsState,
     /// One absolute deadline shared by all pipeline terminal metric handoffs.
     terminal_metrics_deadline: TerminalMetricsDeadline,
+    /// Latched with the deadline of the pipeline shutdown this manager accepts.
+    shutdown_deadline: PipelineShutdownDeadline,
 }
 
 impl<PData> RuntimeCtrlMsgManager<PData> {
+    /// Shares `latch` with the nodes, which read the pipeline's shutdown
+    /// deadline from it.
+    #[must_use]
+    pub(crate) fn with_shutdown_deadline(mut self, latch: PipelineShutdownDeadline) -> Self {
+        self.shutdown_deadline = latch;
+        self
+    }
+
     /// Creates a new RuntimeCtrlMsgManager.
     #[must_use]
     pub(crate) fn new(
@@ -397,6 +408,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
             telemetry: telemetry_policy,
             pending_sends: VecDeque::new(),
             terminal_metrics_deadline,
+            shutdown_deadline: PipelineShutdownDeadline::default(),
         };
 
         // Register telemetry timers for all nodes centrally, using the
@@ -528,6 +540,7 @@ impl<PData> RuntimeCtrlMsgManager<PData> {
                             if is_draining_ingress {
                                 continue;
                             }
+                            self.shutdown_deadline.latch(deadline);
                             self.event_reporter.report(EngineEvent::shutdown_requested(
                                 self.pipeline_key.clone(),
                                 Some(reason.clone()),
@@ -1472,6 +1485,24 @@ mod tests {
         crate::control::RuntimeCtrlMsgSender<PData>,
         crate::entity_context::PipelineEntityScope,
     ) {
+        build_test_manager_with_deadline(
+            pipeline_capacity,
+            control_senders,
+            TerminalMetricsDeadline::default(),
+        )
+    }
+
+    /// Like `build_test_manager`, with the pipeline-wide shutdown deadline
+    /// shared with the nodes under test.
+    fn build_test_manager_with_deadline<PData>(
+        pipeline_capacity: usize,
+        control_senders: ControlSenders<PData>,
+        terminal_metrics_deadline: TerminalMetricsDeadline,
+    ) -> (
+        RuntimeCtrlMsgManager<PData>,
+        crate::control::RuntimeCtrlMsgSender<PData>,
+        crate::entity_context::PipelineEntityScope,
+    ) {
         let (pipeline_tx, pipeline_rx) = runtime_ctrl_msg_channel(pipeline_capacity);
         let (_memory_pressure_tx, memory_pressure_rx) =
             watch::channel(MemoryPressureChanged::initial());
@@ -1517,7 +1548,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             empty_node_metric_handles(),
-            TerminalMetricsDeadline::default(),
+            terminal_metrics_deadline,
         );
 
         (manager, pipeline_tx, pipeline_entity_guard)
@@ -6568,5 +6599,205 @@ mod tests {
                 drop(dispatcher_guard);
             })
             .await;
+    }
+
+    /// Records the deadline and reason of every Shutdown it is given.
+    struct ShutdownRecorder {
+        shutdowns: Rc<RefCell<Vec<(Instant, String)>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::local::processor::Processor<crate::testing::TestMsg> for ShutdownRecorder {
+        async fn process(
+            &mut self,
+            msg: crate::message::Message<crate::testing::TestMsg>,
+            _effect_handler: &mut crate::local::processor::EffectHandler<crate::testing::TestMsg>,
+        ) -> Result<(), Error> {
+            if let crate::message::Message::Control(NodeControlMsg::Shutdown { deadline, reason }) =
+                msg
+            {
+                self.shutdowns.borrow_mut().push((deadline, reason));
+            }
+            Ok(())
+        }
+    }
+
+    /// Runs a receiver-first shutdown of a two-node pipeline through the
+    /// runtime-control manager: a stand-in receiver answers DrainIngress by
+    /// reporting ReceiverDrained and dropping its pdata sender, as a drained
+    /// receiver task does when it ends; a real processor run loop records its
+    /// Shutdowns. With `fill_processor_control`, the receiver first fills the
+    /// processor's control channel, so the manager has to buffer the
+    /// processor's Shutdown and retry it. With `error_fallback_first`, the
+    /// pipeline's terminal metrics deadline first takes its error-path
+    /// fallback, as when a node exits on an error before the shutdown.
+    /// Returns the pipeline deadline and the Shutdowns the processor saw.
+    async fn receiver_first_shutdown(
+        fill_processor_control: bool,
+        error_fallback_first: bool,
+    ) -> (Instant, Vec<(Instant, String)>) {
+        use crate::config::ProcessorConfig;
+        use crate::local::message::{LocalReceiver, LocalSender};
+        use crate::node::{NodeWithPDataReceiver, NodeWithPDataSender};
+        use crate::processor::ProcessorWrapper;
+        use crate::testing::TestMsg;
+        use otel_arrow_dfe_config::node::NodeUserConfig;
+        use std::sync::Arc;
+
+        let nodes = test_nodes(vec!["receiver", "processor"]);
+        let (receiver, processor) = (nodes[0].clone(), nodes[1].clone());
+        let shutdowns = Rc::new(RefCell::new(Vec::new()));
+        let mut wrapper = ProcessorWrapper::local(
+            ShutdownRecorder {
+                shutdowns: Rc::clone(&shutdowns),
+            },
+            processor.clone(),
+            Arc::new(NodeUserConfig::new_processor_config("recorder")),
+            &ProcessorConfig::new("processor"),
+        );
+        let (pdata_tx, pdata_rx) = otel_arrow_dfe_channel::mpsc::Channel::<TestMsg>::new(4);
+        wrapper
+            .set_pdata_receiver(
+                processor.clone(),
+                Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            )
+            .expect("input");
+        let (output_tx, _output_rx) = otel_arrow_dfe_channel::mpsc::Channel::<TestMsg>::new(4);
+        wrapper
+            .set_pdata_sender(
+                processor.clone(),
+                "out".into(),
+                Sender::Local(LocalSender::mpsc(output_tx)),
+            )
+            .expect("output");
+        let processor_control = crate::control::Controllable::control_sender(&wrapper);
+
+        let mut control_senders = ControlSenders::new();
+        let (receiver_control, mut receiver_inbox) = create_mock_control_sender::<TestMsg>();
+        control_senders.register(receiver.clone(), NodeType::Receiver, receiver_control);
+        control_senders.register(
+            processor.clone(),
+            NodeType::Processor,
+            processor_control.clone(),
+        );
+        let terminal_deadline = TerminalMetricsDeadline::default();
+        let terminal_deadline_probe = terminal_deadline.clone();
+        let services = crate::testing::test_pipeline_runtime_services();
+        let (manager, pipeline_tx, _guard) =
+            build_test_manager_with_deadline(16, control_senders, terminal_deadline.clone());
+        let manager = manager.with_shutdown_deadline(services.shutdown_deadline().clone());
+
+        let manager_task = tokio::task::spawn_local(manager.run());
+        let (completion_tx, completion_rx) = pipeline_completion_msg_channel(16);
+        let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(64);
+        let processor_task = tokio::task::spawn_local(wrapper.start_with_completion_metrics(
+            pipeline_tx.clone(),
+            completion_tx,
+            metrics_reporter,
+            Interests::empty(),
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            terminal_deadline,
+            services,
+        ));
+        let receiver_runtime = pipeline_tx.clone();
+        let receiver_index = receiver.index;
+        let receiver_task = tokio::task::spawn_local(async move {
+            loop {
+                match receiver_inbox.recv().await {
+                    Ok(NodeControlMsg::DrainIngress { .. }) => break,
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            if fill_processor_control {
+                while processor_control
+                    .try_send(NodeControlMsg::TimerTick {})
+                    .is_ok()
+                {}
+            }
+            receiver_runtime
+                .send(RuntimeControlMsg::ReceiverDrained {
+                    node_id: receiver_index,
+                })
+                .await
+                .expect("report drained");
+            drop(pdata_tx);
+        });
+
+        if error_fallback_first {
+            let _ = terminal_deadline_probe.get();
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        pipeline_tx
+            .send(RuntimeControlMsg::Shutdown {
+                deadline,
+                reason: "graceful restart".to_owned(),
+            })
+            .await
+            .expect("pipeline shutdown");
+        let ended = timeout(Duration::from_secs(10), processor_task).await;
+        receiver_task.abort();
+        manager_task.abort();
+        drop((completion_rx, metrics_rx));
+        ended
+            .expect("the processor ends")
+            .expect("join")
+            .expect("processor run loop");
+        let seen = shutdowns.borrow().clone();
+        (deadline, seen)
+    }
+
+    /// Scenario: receiver-first shutdown, where the drained receiver drops
+    /// its pdata sender right after it reports ReceiverDrained.
+    /// Guarantees: the processor behind it gets the pipeline's own Shutdown
+    /// deadline, not a one-second deadline synthesized for its closed input.
+    #[tokio::test]
+    async fn receiver_first_drain_gives_the_processor_the_pipeline_deadline() {
+        let (deadline, seen) = LocalSet::new()
+            .run_until(receiver_first_shutdown(false, false))
+            .await;
+        assert_eq!(seen.len(), 1, "one Shutdown: {seen:?}");
+        assert_eq!(seen[0].0, deadline, "the processor's Shutdown: {seen:?}");
+    }
+
+    /// Scenario: receiver-first shutdown while the processor's control
+    /// channel is full, so the manager buffers the processor's Shutdown and
+    /// the processor sees its input close before that Shutdown arrives.
+    /// Guarantees: the processor still shuts down with the pipeline's own
+    /// deadline, not a one-second deadline synthesized for its closed input.
+    #[tokio::test]
+    async fn receiver_first_drain_with_a_full_control_channel_keeps_the_pipeline_deadline() {
+        let (deadline, seen) = LocalSet::new()
+            .run_until(receiver_first_shutdown(true, false))
+            .await;
+        assert_eq!(seen.len(), 1, "one Shutdown: {seen:?}");
+        assert_eq!(seen[0].0, deadline, "the processor's Shutdown: {seen:?}");
+    }
+
+    /// Scenario: a node exits on an error path before the pipeline shuts
+    /// down (the terminal metrics deadline takes its 5 s fallback), then a
+    /// receiver-first shutdown with a 30 s deadline reaches a processor
+    /// through its closed input while its own Shutdown is still buffered.
+    /// Guarantees: the processor gets the pipeline's 30 s deadline, not the
+    /// earlier metrics fallback.
+    #[tokio::test]
+    async fn an_earlier_error_does_not_shorten_a_later_pipeline_shutdown() {
+        let (deadline, seen) = LocalSet::new()
+            .run_until(receiver_first_shutdown(true, true))
+            .await;
+        assert_eq!(seen.len(), 1, "one Shutdown: {seen:?}");
+        assert_eq!(seen[0].0, deadline, "the processor's Shutdown: {seen:?}");
     }
 }
