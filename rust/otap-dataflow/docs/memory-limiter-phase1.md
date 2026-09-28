@@ -364,7 +364,9 @@ clients do not retry a gRPC `RESOURCE_EXHAUSTED`.
 
 An OTLP request larger than the configured `burst` can never fit the bucket
 while pressure gating is active. HTTP rejects it with 413 and no `Retry-After`;
-gRPC returns `RESOURCE_EXHAUSTED` with negative retry pushback. Configure
+gRPC returns `RESOURCE_EXHAUSTED` with a random 1 to 3 second `RetryInfo` delay,
+since the same request is admitted once pressure clears (RFC 0002 answers it
+with negative retry pushback, as never retryable). Configure
 `burst` at least as large as the largest request the receiver should accept
 during pressure.
 

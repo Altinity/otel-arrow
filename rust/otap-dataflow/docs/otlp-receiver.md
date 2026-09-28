@@ -492,6 +492,11 @@ Example with `max_request_body_size: 4MiB`:
 - 2 MiB compressed -> 10 MiB decompressed -> Rejected
 - 2 MiB compressed -> 3 MiB decompressed -> Accepted
 
+On gRPC, `max_decoding_message_size` bounds the wire and the decompressed
+message the same way. An oversized message is refused with
+`INVALID_ARGUMENT`, which OTLP clients do not retry, and counted as
+`payload_too_large`.
+
 ### Timeout Protection
 
 Both protocols enforce timeouts to mitigate slow-client (Slowloris-style) DoS:

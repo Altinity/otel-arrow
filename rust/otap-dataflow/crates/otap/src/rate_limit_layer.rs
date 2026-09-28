@@ -14,7 +14,7 @@ use std::future::{Ready, ready};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tonic::{Code, Status, body::Body, metadata::MetadataMap};
+use tonic::{Code, Status, body::Body};
 use tower::{Layer, Service};
 
 /// Builds a gRPC `resource_exhausted` status carrying the retry delay as RetryInfo
@@ -46,17 +46,21 @@ pub fn grpc_rate_limit_saturated_status() -> Status {
     )
 }
 
-/// Builds a non-retryable gRPC status for a request larger than the configured burst.
+/// Builds a gRPC `resource_exhausted` status for a request larger than the configured
+/// burst.
+///
+/// The gate refuses such a request only while memory pressure lasts and admits it once
+/// pressure clears, so it carries a jittered RetryInfo delay like a saturation refusal.
+/// RFC 0002 answers it with negative retry pushback instead, as a request that can never
+/// succeed.
 #[must_use]
 pub fn grpc_rate_limit_burst_exceeded_status() -> Status {
-    let mut metadata = MetadataMap::new();
-    if let Ok(value) = "-1".parse() {
-        let _ = metadata.insert("grpc-retry-pushback-ms", value);
-    }
-    Status::with_metadata(
+    status_with_retry_delay(
         Code::ResourceExhausted,
         "request exceeds rate limit burst",
-        metadata,
+        Duration::from_secs(u64::from(rand::random_range(
+            crate::concurrency_shed_layer::CONCURRENCY_LIMIT_RETRY_AFTER_SECS,
+        ))),
     )
 }
 
@@ -304,19 +308,15 @@ mod tests {
     }
 
     /// Scenario: a gRPC request is larger than the configured rate-limit burst.
-    /// Guarantees: the response disables retries instead of advertising transient pushback.
+    /// Guarantees: the response is RESOURCE_EXHAUSTED with a RetryInfo delay of 1 to 3
+    /// seconds, since the same request is admitted once memory pressure clears.
     #[test]
-    fn oversized_status_is_non_retryable() {
+    fn oversized_status_is_retryable() {
         let status = grpc_rate_limit_burst_exceeded_status();
 
         assert_eq!(status.code(), Code::ResourceExhausted);
-        assert_eq!(
-            status
-                .metadata()
-                .get("grpc-retry-pushback-ms")
-                .and_then(|value| value.to_str().ok()),
-            Some("-1")
-        );
+        let delay = crate::grpc_retry_info::retry_delay(&status).expect("RetryInfo");
+        assert!((1..=3).contains(&delay.seconds), "{delay:?}");
     }
 
     /// Scenario: 200 gRPC refusals of a saturated receiver before request weight is known.

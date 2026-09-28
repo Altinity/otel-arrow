@@ -3805,14 +3805,10 @@ mod tests {
                     .get("grpc-retry-pushback-ms")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
-                if oversized {
-                    assert_eq!(pushback.as_deref(), Some("-1"));
-                } else {
-                    let delay = otel_arrow_dfe_otap::grpc_retry_info::retry_delay(&status)
-                        .expect("RetryInfo");
-                    assert!((1..=3).contains(&delay.seconds), "{delay:?}");
-                    assert_eq!(pushback, Some((delay.seconds * 1_000).to_string()));
-                }
+                let delay =
+                    otel_arrow_dfe_otap::grpc_retry_info::retry_delay(&status).expect("RetryInfo");
+                assert!((1..=3).contains(&delay.seconds), "{delay:?}");
+                assert_eq!(pushback, Some((delay.seconds * 1_000).to_string()));
                 if !oversized {
                     assert_eq!(authorization_calls.load(Ordering::Relaxed), 0);
                 }
@@ -3823,7 +3819,7 @@ mod tests {
                         metrics
                             .rejections_for(
                                 OtlpProtocol::Grpc,
-                                ReceiverRejectionErrorType::RateLimit,
+                                ReceiverRejectionErrorType::RateLimit
                             )
                             .requests
                             .get(),
@@ -3984,8 +3980,10 @@ mod tests {
         run_otlp_grpc_rate_limit_rejection_test(false);
     }
 
-    /// Scenario: an OTLP gRPC request is larger than the configured burst.
-    /// Guarantees: the client receives non-retryable pushback and the request is not admitted.
+    /// Scenario: an OTLP gRPC request is larger than the configured burst under memory
+    /// pressure.
+    /// Guarantees: the client receives RESOURCE_EXHAUSTED with a RetryInfo delay, which OTLP
+    /// clients retry, counted as `rate_limit`, and the request is not admitted.
     #[test]
     fn test_otlp_grpc_oversized_rate_limit_rejection() {
         run_otlp_grpc_rate_limit_rejection_test(true);
@@ -5136,6 +5134,67 @@ mod tests {
             .set_receiver(receiver)
             .run_test(scenario)
             .run_validation_concurrent(validation);
+    }
+
+    /// Scenario: two gRPC requests exceed `max_decoding_message_size`, one on
+    /// the wire and one gzip-compressed below the limit that decompresses above it.
+    /// Guarantees: both are refused with non-retryable INVALID_ARGUMENT, counted
+    /// as `payload_too_large`, and never reach the pipeline.
+    #[test]
+    fn test_otlp_grpc_oversized_message_is_permanent_and_counted() {
+        let test_runtime = TestRuntime::new();
+        let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut config = test_config(format!("127.0.0.1:{port}").parse().unwrap());
+        config
+            .protocols
+            .grpc
+            .as_mut()
+            .unwrap()
+            .max_decoding_message_size = Some(1024);
+        let (receiver, metrics) = refusal_test_receiver(&test_runtime, config);
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                ctx.check_then_shutdown(async {
+                    let mut request = create_logs_service_request();
+                    request.resource_logs[0]
+                        .resource
+                        .as_mut()
+                        .unwrap()
+                        .attributes
+                        .push(KeyValue {
+                            key: "x".repeat(8 * 1024),
+                            ..Default::default()
+                        });
+                    let client = LogsServiceClient::connect(endpoint.clone())
+                        .await
+                        .expect("Failed to connect");
+                    let plain = client.clone().export(request.clone()).await;
+                    let compressed = client
+                        .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+                        .export(request)
+                        .await;
+
+                    for result in [plain, compressed] {
+                        let status = result.expect_err("an oversized request must be refused");
+                        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+                    }
+                    assert_eq!(
+                        grpc_rejections(&metrics, ReceiverRejectionErrorType::PayloadTooLarge),
+                        2
+                    );
+                })
+                .await;
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation(|mut ctx| async move {
+                assert!(matches!(ctx.recv().await, Err(RecvError::Closed)));
+            });
     }
 
     // Run the receiver-side DST sweep for wait_for_result completion.

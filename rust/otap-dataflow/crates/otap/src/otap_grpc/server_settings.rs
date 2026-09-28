@@ -290,8 +290,12 @@ const fn default_max_frame_size() -> Option<u32> {
     Some(16 * 1024)
 }
 
+/// Inbound gRPC message limit when `max_decoding_message_size` is not set:
+/// tonic's 4MiB default.
+pub const DEFAULT_MAX_DECODING_MESSAGE_SIZE: u32 = 4 * 1024 * 1024;
+
 const fn default_max_decoding_message_size() -> Option<u32> {
-    Some(4 * 1024 * 1024)
+    Some(DEFAULT_MAX_DECODING_MESSAGE_SIZE)
 }
 
 const fn default_http2_keepalive_interval() -> Option<Duration> {
