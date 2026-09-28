@@ -47,7 +47,6 @@ use futures_timer::Delay;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_engine::ExporterFactory;
-use otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::control::NodeControlMsg;
@@ -96,15 +95,10 @@ pub static PARQUET_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              exporter_config: &ExporterConfig,
              capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities| {
         let mut exporter = ParquetExporter::from_config(pipeline, &node_config.config)?;
-        if exporter.config.storage.requires_bearer_token_provider() {
-            exporter.token_provider = Some(
-                capabilities
-                    .require_shared::<BearerTokenProvider>()
-                    .map_err(|e| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                        error: e.to_string(),
-                    })?,
-            );
-        }
+        exporter.token_provider = otel_arrow_dfe_otap::object_store::required_token_provider(
+            &exporter.config.storage,
+            capabilities,
+        )?;
         Ok(ExporterWrapper::local(
             exporter,
             node,
@@ -193,21 +187,12 @@ impl Exporter<OtapPdata> for ParquetExporter {
                 message = "parquet exporter retry settings are not applied to local file storage (invalid values will still be rejected)"
             );
         }
-        let object_store =
-            otel_arrow_dfe_otap::object_store::from_storage_type_with_retry_and_token_provider(
-                &self.config.storage,
-                self.config.retry.as_ref(),
-                self.token_provider.take(),
-            )
-            .map_err(|e| {
-                let source_detail = format_error_sources(&e);
-                Error::ExporterError {
-                    exporter: exporter_id.clone(),
-                    kind: ExporterErrorKind::Configuration,
-                    error: format!("error initializing object store {e}"),
-                    source_detail,
-                }
-            })?;
+        let object_store = otel_arrow_dfe_otap::object_store::exporter_store(
+            exporter_id.clone(),
+            &self.config.storage,
+            self.config.retry.as_ref(),
+            self.token_provider.take(),
+        )?;
 
         let writer_options = self.config.writer_options.unwrap_or_default();
 

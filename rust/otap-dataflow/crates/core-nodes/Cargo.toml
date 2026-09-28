@@ -150,7 +150,8 @@ fluke-hpack.workspace = true
 flume.workspace = true
 otel-arrow-dfe-channel = { workspace = true }
 otel-arrow-dfe-engine = { workspace = true, features = ["test-utils"] }
-otel-arrow-dfe-otap = { workspace = true, features = ["test-utils", "crypto-ring"] }
+# `aws` compiles the S3 storage variant, which the parquet config tests load.
+otel-arrow-dfe-otap = { workspace = true, features = ["test-utils", "crypto-ring", "aws"] }
 otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
 otel-arrow-dfe-telemetry = { workspace = true }
 flate2.workspace = true
