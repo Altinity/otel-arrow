@@ -7,6 +7,7 @@ use crate::clock;
 use crate::control::{AckMsg, NackMsg, NodeControlMsg};
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::node_local_scheduler::NodeLocalSchedulerHandle;
+use crate::runtime_services::PipelineShutdownDeadline;
 use crate::shared::message::{SharedReceiver, SharedSender};
 use crate::{Interests, ReceivedAtNode};
 use otel_arrow_dfe_channel::error::{RecvError, SendError};
@@ -283,6 +284,10 @@ struct InboxCore<PData, ControlRx, PDataRx> {
     shutting_down_deadline: Option<Instant>,
     /// Holds the ControlMsg::Shutdown until after we've drained pdata.
     pending_shutdown: Option<NodeControlMsg<PData>>,
+    /// The pipeline's shutdown deadline, once its runtime-control manager
+    /// has accepted a shutdown; bounds a Shutdown synthesized for a closed
+    /// pdata channel.
+    pipeline_deadline: Option<PipelineShutdownDeadline>,
     /// Node ID for entry-frame stamping via `ReceivedAtNode`.
     node_id: usize,
     /// Node interests for entry-frame stamping via `ReceivedAtNode`.
@@ -305,6 +310,7 @@ impl<PData, ControlRx, PDataRx> InboxCore<PData, ControlRx, PDataRx> {
             local_scheduler,
             shutting_down_deadline: None,
             pending_shutdown: None,
+            pipeline_deadline: None,
             node_id,
             interests,
             consecutive_control: 0,
@@ -333,18 +339,97 @@ where
         Message::Control(msg)
     }
 
+    /// Latches a Shutdown read from the control channel, or releases it at
+    /// once when its deadline has passed.
+    fn latch_shutdown(&mut self, deadline: Instant, reason: String) -> Option<Message<PData>> {
+        if deadline <= clock::now() {
+            self.shutdown();
+            return Some(Message::Control(NodeControlMsg::Shutdown {
+                deadline,
+                reason,
+            }));
+        }
+        if let Some(local_scheduler) = &self.local_scheduler {
+            local_scheduler.begin_shutdown(clock::now());
+        }
+        self.shutting_down_deadline = Some(deadline);
+        self.pending_shutdown = Some(NodeControlMsg::Shutdown { deadline, reason });
+        None
+    }
+
+    /// A control message read while a Shutdown is latched: a further
+    /// Shutdown is absorbed as data, its deadline moving the latched one
+    /// earlier but never later, so the node receives Shutdown once. `None`
+    /// means the message was absorbed and the receive loop continues.
+    fn draining_control(&mut self, msg: NodeControlMsg<PData>) -> Option<Message<PData>> {
+        let NodeControlMsg::Shutdown { deadline, .. } = msg else {
+            return Some(self.control_message(msg));
+        };
+        if self
+            .shutting_down_deadline
+            .is_some_and(|latched| deadline >= latched)
+        {
+            return None;
+        }
+        self.shutting_down_deadline = Some(deadline);
+        if let Some(NodeControlMsg::Shutdown {
+            deadline: pending, ..
+        }) = self.pending_shutdown.as_mut()
+        {
+            *pending = deadline;
+        }
+        None
+    }
+
+    /// What a receive returns once the pdata channel is closed and empty.
+    ///
+    /// Control messages already queued come first, so a queued Shutdown is
+    /// latched with its own deadline and reason rather than replaced by a
+    /// synthesized one; `None` means it was latched and the receive loop
+    /// continues. With nothing queued, the Shutdown is released (see
+    /// [`Self::closed_pdata_shutdown`]).
+    fn closed_pdata(&mut self) -> Option<Message<PData>> {
+        if self.pending_shutdown.is_none()
+            && let Some(control_rx) = self.control_rx.as_mut()
+            && let Ok(msg) = control_rx.try_recv()
+        {
+            return match msg {
+                NodeControlMsg::Shutdown { deadline, reason } => {
+                    self.latch_shutdown(deadline, reason)
+                }
+                msg => Some(self.control_message(msg)),
+            };
+        }
+        Some(self.closed_pdata_shutdown())
+    }
+
     fn pdata_message(&mut self, mut pdata: PData) -> Message<PData> {
         self.consecutive_control = 0;
         pdata.received_at_node(self.node_id, self.interests);
         Message::PData(pdata)
     }
 
+    /// Releases the latched Shutdown with its own deadline and reason, or,
+    /// when none has been latched, synthesizes one: with the pipeline's
+    /// shutdown deadline while the pipeline is shutting down (the node's
+    /// own Shutdown may still be buffered by the runtime-control manager),
+    /// else one second from now.
     fn closed_pdata_shutdown(&mut self) -> Message<PData> {
+        let shutdown = self.pending_shutdown.take().unwrap_or_else(|| {
+            let now = clock::now();
+            let deadline = self
+                .pipeline_deadline
+                .as_ref()
+                .and_then(PipelineShutdownDeadline::get)
+                .filter(|deadline| *deadline > now)
+                .unwrap_or_else(|| now.add(Duration::from_secs(1)));
+            NodeControlMsg::Shutdown {
+                deadline,
+                reason: "pdata channel closed".to_owned(),
+            }
+        });
         self.shutdown();
-        Message::Control(NodeControlMsg::Shutdown {
-            deadline: clock::now().add(Duration::from_secs(1)),
-            reason: "pdata channel closed".to_owned(),
-        })
+        Message::Control(shutdown)
     }
 
     /// Returns whether shutdown draining is allowed to pull `pdata` from the
@@ -422,7 +507,10 @@ where
                     .expect("pdata_rx must exist")
                     .try_recv()
             {
-                return Ok(self.closed_pdata_shutdown());
+                match self.closed_pdata() {
+                    Some(msg) => return Ok(msg),
+                    None => continue,
+                }
             }
 
             // Draining mode: Shutdown pending
@@ -486,7 +574,13 @@ where
                         .expect("control_rx must exist")
                         .try_recv()
                     {
-                        Ok(msg) => return Ok(self.control_message(msg)),
+                        Ok(msg) => match self.draining_control(msg) {
+                            Some(msg) => return Ok(msg),
+                            None => {
+                                sleep_until_deadline = None;
+                                continue;
+                            }
+                        },
                         Err(RecvError::Empty) => {}
                         Err(e) => return Err(e),
                     }
@@ -523,7 +617,13 @@ where
                         },
 
                         ctrl = self.control_rx.as_mut().expect("control_rx must exist").recv() => match ctrl {
-                            Ok(msg) => return Ok(self.control_message(msg)),
+                            Ok(msg) => match self.draining_control(msg) {
+                                Some(msg) => return Ok(msg),
+                                None => {
+                                    sleep_until_deadline = None;
+                                    continue;
+                                }
+                            },
                             Err(e) => return Err(e),
                         },
 
@@ -556,7 +656,13 @@ where
                         }
 
                         ctrl = self.control_rx.as_mut().expect("control_rx must exist").recv() => match ctrl {
-                            Ok(msg) => return Ok(self.control_message(msg)),
+                            Ok(msg) => match self.draining_control(msg) {
+                                Some(msg) => return Ok(msg),
+                                None => {
+                                    sleep_until_deadline = None;
+                                    continue;
+                                }
+                            },
                             Err(e) => return Err(e),
                         },
 
@@ -602,7 +708,10 @@ where
                     .try_recv()
                 {
                     Ok(pdata) => return Ok(self.pdata_message(pdata)),
-                    Err(RecvError::Closed) => return Ok(self.closed_pdata_shutdown()),
+                    Err(RecvError::Closed) => match self.closed_pdata() {
+                        Some(msg) => return Ok(msg),
+                        None => continue,
+                    },
                     Err(RecvError::Empty) => {}
                 }
             }
@@ -620,19 +729,10 @@ where
                     .try_recv()
                 {
                     Ok(NodeControlMsg::Shutdown { deadline, reason }) => {
-                        if deadline <= clock::now() {
-                            self.shutdown();
-                            return Ok(Message::Control(NodeControlMsg::Shutdown {
-                                deadline,
-                                reason,
-                            }));
+                        match self.latch_shutdown(deadline, reason) {
+                            Some(msg) => return Ok(msg),
+                            None => continue,
                         }
-                        if let Some(local_scheduler) = &self.local_scheduler {
-                            local_scheduler.begin_shutdown(clock::now());
-                        }
-                        self.shutting_down_deadline = Some(deadline);
-                        self.pending_shutdown = Some(NodeControlMsg::Shutdown { deadline, reason });
-                        continue;
                     }
                     Ok(msg) => return Ok(self.control_message(msg)),
                     Err(RecvError::Empty) => {}
@@ -651,7 +751,10 @@ where
                     pdata = self.pdata_rx.as_mut().expect("pdata_rx must exist").recv() => {
                         match pdata {
                             Ok(pdata) => return Ok(self.pdata_message(pdata)),
-                            Err(RecvError::Closed) => return Ok(self.closed_pdata_shutdown()),
+                            Err(RecvError::Closed) => match self.closed_pdata() {
+                                Some(msg) => return Ok(msg),
+                                None => continue,
+                            },
                             Err(e) => return Err(e),
                         }
                         }
@@ -663,16 +766,10 @@ where
                             // shutdown-drain mode, where it keeps delivering
                             // cleanup control and buffered pdata until either the
                             // backlog empties or the deadline expires.
-                            if deadline <= clock::now() {
-                                self.shutdown();
-                                return Ok(Message::Control(NodeControlMsg::Shutdown { deadline, reason }));
+                            match self.latch_shutdown(deadline, reason) {
+                                Some(msg) => return Ok(msg),
+                                None => continue,
                             }
-                            if let Some(local_scheduler) = &self.local_scheduler {
-                                local_scheduler.begin_shutdown(clock::now());
-                            }
-                            self.shutting_down_deadline = Some(deadline);
-                            self.pending_shutdown = Some(NodeControlMsg::Shutdown { deadline, reason });
-                            continue;
                         }
                         Ok(msg) => return Ok(self.control_message(msg)),
                         Err(e)  => return Err(e),
@@ -704,16 +801,10 @@ where
                             // control-preferred branch used when pdata admission
                             // is currently closed or control has not yet hit the
                             // fairness limit.
-                            if deadline <= clock::now() {
-                                self.shutdown();
-                                return Ok(Message::Control(NodeControlMsg::Shutdown { deadline, reason }));
+                            match self.latch_shutdown(deadline, reason) {
+                                Some(msg) => return Ok(msg),
+                                None => continue,
                             }
-                            if let Some(local_scheduler) = &self.local_scheduler {
-                                local_scheduler.begin_shutdown(clock::now());
-                            }
-                            self.shutting_down_deadline = Some(deadline);
-                            self.pending_shutdown = Some(NodeControlMsg::Shutdown { deadline, reason });
-                            continue;
                         }
                         Ok(msg) => return Ok(self.control_message(msg)),
                         Err(e)  => return Err(e),
@@ -722,7 +813,10 @@ where
                     pdata = self.pdata_rx.as_mut().expect("pdata_rx must exist").recv(), if accept_pdata => {
                         match pdata {
                             Ok(pdata) => return Ok(self.pdata_message(pdata)),
-                            Err(RecvError::Closed) => return Ok(self.closed_pdata_shutdown()),
+                            Err(RecvError::Closed) => match self.closed_pdata() {
+                                Some(msg) => return Ok(msg),
+                                None => continue,
+                            },
                             Err(e) => return Err(e),
                         }
                     },
@@ -789,6 +883,12 @@ impl<PData> ProcessorInbox<PData> {
                 interests,
             ),
         }
+    }
+
+    /// Bounds a Shutdown synthesized for a closed pdata channel by the
+    /// pipeline's shutdown deadline once the pipeline shuts down.
+    pub(crate) fn follow_pipeline_deadline(&mut self, deadline: PipelineShutdownDeadline) {
+        self.core.pipeline_deadline = Some(deadline);
     }
 }
 
@@ -860,6 +960,14 @@ impl<PData> ExporterInbox<PData> {
         interests: Interests,
     ) -> Self {
         Self::new_internal(control_rx, pdata_rx, node_id, interests)
+    }
+}
+
+impl<PData, ControlRx, PDataRx> ExporterInbox<PData, ControlRx, PDataRx> {
+    /// Bounds a Shutdown synthesized for a closed pdata channel by the
+    /// pipeline's shutdown deadline once the pipeline shuts down.
+    pub(crate) fn follow_pipeline_deadline(&mut self, deadline: PipelineShutdownDeadline) {
+        self.core.pipeline_deadline = Some(deadline);
     }
 }
 
@@ -1320,5 +1428,331 @@ mod tests {
             shutdown,
             Message::Control(NodeControlMsg::Shutdown { .. })
         ));
+    }
+
+    /// Scenario: an exporter with admission closed latches a Shutdown, is
+    /// handed a control message while it drains, and upstream then drops its
+    /// pdata sender.
+    /// Guarantees: the next receive releases the latched Shutdown with its own
+    /// deadline and reason, not a synthesized one-second Shutdown.
+    #[tokio::test]
+    async fn exporter_closed_pdata_releases_the_latched_shutdown() {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+        let mut inbox = ExporterInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        let deadline = clock::now() + Duration::from_secs(60);
+        control_tx
+            .send_async(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "admin".to_owned(),
+            })
+            .await
+            .expect("shutdown");
+        control_tx
+            .send_async(NodeControlMsg::Config {
+                config: serde_json::json!({}),
+            })
+            .await
+            .expect("config");
+
+        assert!(matches!(
+            inbox.recv_when(false).await.expect("config"),
+            Message::Control(NodeControlMsg::Config { .. })
+        ));
+        drop(pdata_tx);
+        match inbox.recv_when(false).await.expect("shutdown") {
+            Message::Control(NodeControlMsg::Shutdown {
+                deadline: released,
+                reason,
+            }) => {
+                assert_eq!(released, deadline);
+                assert_eq!(reason, "admin");
+            }
+            other => panic!("expected the latched shutdown, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a processor with admission closed latches a Shutdown, is
+    /// handed a control message while it drains, and upstream then drops its
+    /// pdata sender.
+    /// Guarantees: the processor inbox releases the latched Shutdown with its
+    /// own deadline and reason, exactly as the exporter inbox does.
+    #[tokio::test]
+    async fn processor_closed_pdata_releases_the_latched_shutdown() {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+        let mut inbox = ProcessorInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        let deadline = clock::now() + Duration::from_secs(60);
+        control_tx
+            .send_async(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "admin".to_owned(),
+            })
+            .await
+            .expect("shutdown");
+        control_tx
+            .send_async(NodeControlMsg::Config {
+                config: serde_json::json!({}),
+            })
+            .await
+            .expect("config");
+
+        assert!(matches!(
+            inbox.recv_when(false).await.expect("config"),
+            Message::Control(NodeControlMsg::Config { .. })
+        ));
+        drop(pdata_tx);
+        match inbox.recv_when(false).await.expect("shutdown") {
+            Message::Control(NodeControlMsg::Shutdown {
+                deadline: released,
+                reason,
+            }) => {
+                assert_eq!(released, deadline);
+                assert_eq!(reason, "admin");
+            }
+            other => panic!("expected the latched shutdown, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a Shutdown and, ahead of it, a Config are queued but not yet
+    /// read when upstream drops its pdata sender, and the processor then
+    /// receives with admission closed.
+    /// Guarantees: the closed-pdata probe does not replace the queued Shutdown
+    /// with a synthesized one-second Shutdown: the Config is delivered first,
+    /// then the queued Shutdown with its own deadline and reason.
+    #[tokio::test]
+    async fn processor_closed_pdata_releases_a_queued_shutdown() {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+        let mut inbox = ProcessorInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        let deadline = clock::now() + Duration::from_secs(60);
+        control_tx
+            .send_async(NodeControlMsg::Config {
+                config: serde_json::json!({}),
+            })
+            .await
+            .expect("config");
+        control_tx
+            .send_async(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "admin".to_owned(),
+            })
+            .await
+            .expect("shutdown");
+        drop(pdata_tx);
+
+        assert!(matches!(
+            inbox.recv_when(false).await.expect("config"),
+            Message::Control(NodeControlMsg::Config { .. })
+        ));
+        match inbox.recv_when(false).await.expect("shutdown") {
+            Message::Control(NodeControlMsg::Shutdown {
+                deadline: released,
+                reason,
+            }) => {
+                assert_eq!(reason, "admin");
+                assert_eq!(released, deadline);
+            }
+            other => panic!("expected the queued shutdown, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a Shutdown is queued but not yet read when upstream drops
+    /// its pdata sender, and the exporter then receives with admission
+    /// closed.
+    /// Guarantees: the exporter gets the queued Shutdown with its own deadline
+    /// and reason, not a synthesized one-second Shutdown.
+    #[tokio::test]
+    async fn exporter_closed_pdata_releases_a_queued_shutdown() {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+        let mut inbox = ExporterInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        let deadline = clock::now() + Duration::from_secs(60);
+        control_tx
+            .send_async(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "admin".to_owned(),
+            })
+            .await
+            .expect("shutdown");
+        drop(pdata_tx);
+
+        match inbox.recv_when(false).await.expect("shutdown") {
+            Message::Control(NodeControlMsg::Shutdown {
+                deadline: released,
+                reason,
+            }) => {
+                assert_eq!(reason, "admin");
+                assert_eq!(released, deadline);
+            }
+            other => panic!("expected the queued shutdown, got {other:?}"),
+        }
+    }
+
+    /// Scenario: the pipeline has recorded its shutdown deadline, but the
+    /// exporter's own Shutdown is not queued yet (the runtime-control manager
+    /// still buffers it) when upstream drops its pdata sender.
+    /// Guarantees: the Shutdown synthesized for the closed channel carries
+    /// the pipeline's deadline; without a recorded deadline it stays one
+    /// second.
+    #[tokio::test]
+    async fn exporter_closed_pdata_follows_the_pipeline_deadline() {
+        for recorded in [true, false] {
+            let (_control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+            let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+            let mut inbox = ExporterInbox::new(
+                Receiver::Local(LocalReceiver::mpsc(control_rx)),
+                Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+                9,
+                Interests::empty(),
+            );
+            let pipeline = PipelineShutdownDeadline::default();
+            let deadline = clock::now() + Duration::from_secs(60);
+            if recorded {
+                pipeline.latch(deadline);
+            }
+            inbox.follow_pipeline_deadline(pipeline);
+            drop(pdata_tx);
+
+            let before = clock::now();
+            match inbox.recv_when(false).await.expect("shutdown") {
+                Message::Control(NodeControlMsg::Shutdown {
+                    deadline: released,
+                    reason,
+                }) => {
+                    assert_eq!(reason, "pdata channel closed");
+                    if recorded {
+                        assert_eq!(released, deadline);
+                    } else {
+                        assert!(released >= before + Duration::from_secs(1));
+                        assert!(released < deadline);
+                    }
+                }
+                other => panic!("expected a synthesized shutdown, got {other:?}"),
+            }
+        }
+    }
+
+    /// An exporter inbox with a four-slot control and pdata channel, local
+    /// senders kept by the caller.
+    fn exporter_inbox() -> (
+        mpsc::Sender<NodeControlMsg<TestMsg>>,
+        mpsc::Sender<TestMsg>,
+        ExporterInbox<TestMsg>,
+    ) {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+        let inbox = ExporterInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        (control_tx, pdata_tx, inbox)
+    }
+
+    /// Scenario: while an exporter inbox drains a latched Shutdown, the
+    /// control channel brings a Shutdown with the same deadline (the runtime
+    /// manager's deadline resend), then one with an earlier deadline.
+    /// Guarantees: neither is returned as a Shutdown; the resend is absorbed
+    /// silently, and the earlier deadline is carried by the one Shutdown
+    /// released after the drain.
+    #[tokio::test]
+    async fn a_shutdown_during_the_drain_is_absorbed_as_its_deadline() {
+        let (control_tx, pdata_tx, mut inbox) = exporter_inbox();
+        let deadline = clock::now() + Duration::from_secs(60);
+        let tighter = deadline - Duration::from_secs(30);
+        pdata_tx
+            .send_async(TestMsg::new("buffered"))
+            .await
+            .expect("pdata");
+        for next in [deadline, deadline, tighter] {
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: next,
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("shutdown");
+        }
+
+        assert!(matches!(
+            inbox.recv_when(false).await.expect("forced data"),
+            Message::PData(_)
+        ));
+        drop(pdata_tx);
+        assert!(matches!(
+            inbox.recv_when(false).await.expect("shutdown control"),
+            Message::Control(NodeControlMsg::Shutdown { deadline: released, .. })
+                if released == tighter
+        ));
+        assert!(
+            inbox.recv_when(false).await.is_err(),
+            "Shutdown is released once"
+        );
+    }
+
+    /// Scenario: a processor inbox drains a latched Shutdown while the
+    /// runtime manager's deadline resend is queued, then its pdata closes.
+    /// Guarantees: the resend never reaches the processor; the one Shutdown
+    /// released after the drain is the latched one.
+    #[tokio::test]
+    async fn a_processor_inbox_absorbs_the_deadline_resend() {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+        let mut inbox = ProcessorInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        let deadline = clock::now() + Duration::from_secs(60);
+        pdata_tx
+            .send_async(TestMsg::new("buffered"))
+            .await
+            .expect("pdata");
+        for _ in 0..2 {
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline,
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("shutdown");
+        }
+        assert!(matches!(
+            inbox.recv_when(true).await.expect("drained data"),
+            Message::PData(_)
+        ));
+        drop(pdata_tx);
+        assert!(matches!(
+            inbox.recv_when(true).await.expect("shutdown"),
+            Message::Control(NodeControlMsg::Shutdown { deadline: released, .. })
+                if released == deadline
+        ));
+        assert!(
+            inbox.recv_when(true).await.is_err(),
+            "Shutdown is released once"
+        );
     }
 }

@@ -560,7 +560,15 @@ deadline is reached.
 As receivers exit and drop their `pdata` senders, downstream channels drain and
 close progressively toward exporters. Once a downstream input is fully drained
 or closed, the corresponding consumer receives `Shutdown` and exits its run
-loop.
+loop. When the input closes before the consumer has read its own `Shutdown`,
+the control messages already queued come first, that `Shutdown` included; if it
+is not queued yet (the control manager buffers sends to a full control
+channel), the inbox releases a `Shutdown` with the pipeline's shutdown
+deadline.
+
+Each node receives `Shutdown` once. A further `Shutdown` that reaches its
+inbox after the first, such as the control manager's resend at the deadline,
+only moves the latched deadline earlier, never later.
 
 If the shutdown deadline expires, receivers may force-resolve remaining
 receiver-local waiters and the runtime control manager forces the remaining

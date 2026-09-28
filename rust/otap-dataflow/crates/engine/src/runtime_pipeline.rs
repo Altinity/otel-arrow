@@ -925,6 +925,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
         let manager_telemetry_policy = telemetry_policy.clone();
         let manager_memory_pressure_rx = memory_pressure_rx;
         let manager_terminal_metrics_deadline = terminal_metrics_deadline.clone();
+        let manager_shutdown_deadline = runtime_services.shutdown_deadline().clone();
         let dispatcher_pipeline_context = pipeline_context.clone();
         let dispatcher_metrics_reporter = metrics_reporter.clone();
         let dispatcher_telemetry_policy = telemetry_policy.clone();
@@ -944,7 +945,8 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                 admission_metrics,
                 node_metric_handles,
                 manager_terminal_metrics_deadline,
-            );
+            )
+            .with_shutdown_deadline(manager_shutdown_deadline);
             manager.run().await
         }));
 

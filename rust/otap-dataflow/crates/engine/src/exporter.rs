@@ -347,12 +347,13 @@ impl<PData> ExporterWrapper<PData> {
                     .core
                     .set_completion_emission_metrics(completion_emission_metrics.clone());
                 effect_handler.set_propagation_policy(propagation_policy);
-                let inbox = ExporterInbox::new(
+                let mut inbox = ExporterInbox::new(
                     Receiver::Local(control_receiver),
                     pdata_rx,
                     node_id.index,
                     node_interests,
                 );
+                inbox.follow_pipeline_deadline(runtime_services.shutdown_deadline().clone());
                 exporter.start(inbox, effect_handler).await
             }
             (
@@ -366,6 +367,7 @@ impl<PData> ExporterWrapper<PData> {
                 },
                 metrics_reporter,
             ) => {
+                let shutdown_deadline = runtime_services.shutdown_deadline().clone();
                 let mut effect_handler =
                     shared::EffectHandler::new(node_id.clone(), metrics_reporter, runtime_services);
                 let pdata_rx = pdata_receiver.ok_or_else(|| Error::ExporterError {
@@ -385,12 +387,13 @@ impl<PData> ExporterWrapper<PData> {
                     .core
                     .set_completion_emission_metrics(completion_emission_metrics);
                 effect_handler.set_propagation_policy(propagation_policy);
-                let inbox = shared::ExporterInbox::new(
+                let mut inbox = shared::ExporterInbox::new(
                     control_receiver,
                     pdata_rx,
                     node_id.index,
                     node_interests,
                 );
+                inbox.follow_pipeline_deadline(shutdown_deadline);
                 exporter.start(inbox, effect_handler).await
             }
         }
