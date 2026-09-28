@@ -84,15 +84,17 @@ pub struct GrpcServerSettings {
     /// Per-connection concurrency limit enforced by the transport layer.
     /// By default it mirrors the effective `max_concurrent_requests`, so transport- and
     /// application-level backpressure remain aligned. Lower values gate connection bursts earlier,
-    /// while higher values only help if you also raise `max_concurrent_requests`. Set to `0` to
-    /// revert to the derived default.
+    /// while higher values only help if you also raise `max_concurrent_requests`. A request over
+    /// this limit waits on its connection, at most `max_concurrent_streams` per connection, and is
+    /// never refused. Set to `0` to revert to the derived default.
     #[serde(default)]
     pub transport_concurrency_limit: Option<usize>,
 
-    /// Whether the gRPC server should shed load immediately once concurrency limits are hit.
-    /// Leaving this `true` (default) results in fast `resource_exhausted` responses and protects
-    /// the single-threaded runtime from unbounded queues. Turning it off allows requests to queue
-    /// but increases memory usage and tail latency under sustained overload.
+    /// Whether the gRPC server refuses a request immediately when `max_concurrent_requests` has no
+    /// free permit. Leaving this `true` (default) answers `RESOURCE_EXHAUSTED` with a RetryInfo
+    /// delay, which OTLP clients retry, and protects the single-threaded runtime from unbounded
+    /// queues. Turning it off allows requests to queue but increases memory usage and tail latency
+    /// under sustained overload.
     #[serde(default = "default_load_shed")]
     pub load_shed: bool,
 
@@ -288,8 +290,12 @@ const fn default_max_frame_size() -> Option<u32> {
     Some(16 * 1024)
 }
 
+/// Inbound gRPC message limit when `max_decoding_message_size` is not set:
+/// tonic's 4MiB default.
+pub const DEFAULT_MAX_DECODING_MESSAGE_SIZE: u32 = 4 * 1024 * 1024;
+
 const fn default_max_decoding_message_size() -> Option<u32> {
-    Some(4 * 1024 * 1024)
+    Some(DEFAULT_MAX_DECODING_MESSAGE_SIZE)
 }
 
 const fn default_http2_keepalive_interval() -> Option<Duration> {

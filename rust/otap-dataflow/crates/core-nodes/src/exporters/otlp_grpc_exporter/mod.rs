@@ -35,6 +35,7 @@ use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
+use otel_arrow_dfe_otap::grpc_retry_info::retry_delay;
 use otel_arrow_dfe_otap::metrics::{CompletedExporterAttempt, ExporterAttempt};
 use otel_arrow_dfe_otap::otap_grpc::client_settings::GrpcClientSettings;
 use otel_arrow_dfe_otap::otap_grpc::otlp::client::{
@@ -666,7 +667,7 @@ async fn route_export_result<T>(
             // server's advisory RetryInfo delay into the human-readable reason.
             // Replace this with a structured field once #3404 lands.
             let mut reason = error_msg.clone();
-            if let Some(delay) = retry_after(status) {
+            if let Some(delay) = retry_delay(status) {
                 reason.push_str(&format!(" (retry after {})", format_retry_delay(&delay)));
             }
 
@@ -679,39 +680,6 @@ async fn route_export_result<T>(
     Ok(())
 }
 
-/// Prost-generated struct for `google.rpc.Status`.
-///
-/// See: <https://github.com/googleapis/googleapis/blob/master/google/rpc/status.proto>
-///
-/// According to the OTLP spec, servers may attach `google.rpc.Status` details for certain
-/// failures. In particular, `RESOURCE_EXHAUSTED` may include a `google.rpc.RetryInfo` entry.
-///
-/// See: <https://opentelemetry.io/docs/specs/otlp/#failures>
-#[derive(Clone, PartialEq, ::prost::Message)]
-struct RpcStatus {
-    #[prost(int32, tag = "1")]
-    pub code: i32,
-    #[prost(string, tag = "2")]
-    pub message: String,
-    #[prost(message, repeated, tag = "3")]
-    pub details: Vec<prost_types::Any>,
-}
-
-/// The `type.googleapis.com` URL for `google.rpc.RetryInfo`.
-const RETRY_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.RetryInfo";
-
-/// Prost-generated struct for `google.rpc.RetryInfo` (subset).
-///
-/// Servers may attach this detail to signal how long the client should wait
-/// before retrying. The hint is advisory.
-///
-/// See: <https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto>
-#[derive(Clone, PartialEq, ::prost::Message)]
-struct RetryInfo {
-    #[prost(message, optional, tag = "1")]
-    pub retry_delay: Option<prost_types::Duration>,
-}
-
 /// Determines whether a gRPC status represents a retryable error according to
 /// the OTLP specification.
 ///
@@ -721,7 +689,7 @@ struct RetryInfo {
 /// `RESOURCE_EXHAUSTED` is always treated as retryable. The `google.rpc.RetryInfo`
 /// detail the server may attach is advisory only, so callers are not required to
 /// honor it and its absence must not turn the failure permanent. See
-/// [`retry_after`], which surfaces that advisory delay to callers.
+/// [`retry_delay`], which surfaces that advisory delay to callers.
 ///
 /// `UNKNOWN` is treated as retryable because the generated gRPC client maps
 /// temporary client-side readiness and transport failures, such as a channel
@@ -749,38 +717,16 @@ fn is_retryable_grpc_status(status: &tonic::Status) -> bool {
 
 type GrpcAttemptError = (OtlpGrpcExporterErrorType, tonic::Status);
 
-/// Extracts the server-suggested retry delay from a `google.rpc.RetryInfo`
-/// detail carried in the status `grpc-status-details-bin` trailer, if present.
-///
-/// The details bytes are a serialized `google.rpc.Status` message whose
-/// `details` field is a `repeated google.protobuf.Any`. We decode this, locate
-/// the `RetryInfo` entry, and return its `retry_delay`.
-///
-/// This advisory hint is not consulted for the retry/permanent decision, which
-/// is driven solely by the status code in [`is_retryable_grpc_status`].
-fn retry_after(status: &tonic::Status) -> Option<prost_types::Duration> {
-    use prost::Message;
-
-    let detail_bytes = status.details();
-    if detail_bytes.is_empty() {
-        return None;
-    }
-
-    let rpc_status = RpcStatus::decode(detail_bytes).ok()?;
-    rpc_status
-        .details
-        .iter()
-        .find(|any| any.type_url == RETRY_INFO_TYPE_URL)
-        .and_then(|any| RetryInfo::decode(any.value.as_slice()).ok())
-        .and_then(|info| info.retry_delay)
-}
-
 /// Formats a `google.rpc.RetryInfo` retry delay as a compact, human-readable
 /// duration for inclusion in a NACK reason string.
 fn format_retry_delay(delay: &prost_types::Duration) -> String {
     // Normalize to whole seconds plus fractional milliseconds; RetryInfo delays
     // are advisory and typically coarse, so millisecond precision is sufficient.
-    let millis = delay.seconds * 1_000 + (delay.nanos as i64) / 1_000_000;
+    // The peer chooses the values, so the arithmetic saturates.
+    let millis = delay
+        .seconds
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(delay.nanos) / 1_000_000);
     format!("{}ms", millis)
 }
 
@@ -1396,6 +1342,8 @@ struct CompletedExport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otel_arrow_dfe_otap::grpc_retry_info::{RETRY_INFO_TYPE_URL, RetryInfo};
+    use otel_arrow_dfe_otap::otlp_http::RpcStatus;
 
     use otel_arrow_dfe_config::ContextEntryName;
     use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -2589,7 +2537,7 @@ mod tests {
         // advisory, so its absence must not make the failure permanent.
         let status = status_with_code(Code::ResourceExhausted);
         assert!(
-            retry_after(&status).is_none(),
+            retry_delay(&status).is_none(),
             "status carries no RetryInfo detail"
         );
         assert!(
@@ -2602,7 +2550,7 @@ mod tests {
     fn test_resource_exhausted_is_retryable_with_retry_info() {
         let status = status_with_retry_info(Code::ResourceExhausted);
         assert_eq!(
-            retry_after(&status),
+            retry_delay(&status),
             Some(prost_types::Duration {
                 seconds: 5,
                 nanos: 0,
@@ -2631,7 +2579,7 @@ mod tests {
         let status =
             tonic::Status::with_details(Code::ResourceExhausted, "exhausted", detail_bytes.into());
         assert!(
-            retry_after(&status).is_none(),
+            retry_delay(&status).is_none(),
             "empty details should not report a RetryInfo hint"
         );
     }
@@ -2658,7 +2606,7 @@ mod tests {
         let status =
             tonic::Status::with_details(Code::ResourceExhausted, "exhausted", detail_bytes.into());
         assert!(
-            retry_after(&status).is_none(),
+            retry_delay(&status).is_none(),
             "a non-RetryInfo detail should not report a RetryInfo hint"
         );
     }
@@ -2672,7 +2620,7 @@ mod tests {
             Bytes::from_static(b"not valid protobuf"),
         );
         assert!(
-            retry_after(&status).is_none(),
+            retry_delay(&status).is_none(),
             "malformed details should not report a RetryInfo hint"
         );
     }
@@ -2708,6 +2656,19 @@ mod tests {
                 nanos: 500_000_000,
             }),
             "1500ms"
+        );
+    }
+
+    /// Scenario: a peer sends a RetryInfo delay whose milliseconds overflow i64.
+    /// Guarantees: the delay renders saturated instead of overflowing.
+    #[test]
+    fn test_format_retry_delay_saturates() {
+        assert_eq!(
+            format_retry_delay(&prost_types::Duration {
+                seconds: i64::MAX,
+                nanos: 999_999_999,
+            }),
+            format!("{}ms", i64::MAX)
         );
     }
 

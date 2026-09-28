@@ -1571,28 +1571,28 @@ mod tests {
         let telemetry = MetricsReporter::create_new_and_receiver(4);
         let scenario = move |ctx: TestContext<OtapPdata>| {
             Box::pin(async move {
-                let mut client = ArrowLogsServiceClient::connect(grpc_endpoint)
-                    .await
-                    .expect("connect to OTAP receiver");
-                let valid_stream = stream! {
-                    let mut producer = Producer::new();
-                    let mut records = create_otap_batch(1, ArrowPayloadType::Logs);
-                    yield producer.produce_bar(&mut records).expect("encode valid OTAP batch");
-                };
-                let status = match client.arrow_logs(valid_stream).await {
-                    Err(status) => status,
-                    Ok(response) => {
-                        timeout(Duration::from_secs(3), response.into_inner().message())
-                            .await
-                            .expect("memory-pressure stream should respond")
-                            .expect_err("memory-pressure stream should return a gRPC error")
-                    }
-                };
-                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-                assert_rejection_telemetry(&ctx, telemetry, "memory_pressure", 1, 0).await;
-                ctx.send_shutdown(Instant::now(), "memory pressure test complete")
-                    .await
-                    .expect("shutdown OTAP receiver");
+                ctx.check_then_shutdown(async {
+                    let mut client = ArrowLogsServiceClient::connect(grpc_endpoint)
+                        .await
+                        .expect("connect to OTAP receiver");
+                    let valid_stream = stream! {
+                        let mut producer = Producer::new();
+                        let mut records = create_otap_batch(1, ArrowPayloadType::Logs);
+                        yield producer.produce_bar(&mut records).expect("encode valid OTAP batch");
+                    };
+                    let status = match client.arrow_logs(valid_stream).await {
+                        Err(status) => status,
+                        Ok(response) => {
+                            timeout(Duration::from_secs(3), response.into_inner().message())
+                                .await
+                                .expect("memory-pressure stream should respond")
+                                .expect_err("memory-pressure stream should return a gRPC error")
+                        }
+                    };
+                    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                    assert_rejection_telemetry(&ctx, telemetry, "memory_pressure", 1, 0).await;
+                })
+                .await;
             }) as Pin<Box<dyn Future<Output = ()>>>
         };
 

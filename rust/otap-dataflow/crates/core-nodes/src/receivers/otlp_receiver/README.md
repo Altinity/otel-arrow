@@ -233,13 +233,29 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
 - HTTP request body limits apply to both compressed and decompressed payload
   size.
 - V1 rate limiting measures decompressed request bytes. A request larger than
-  the configured burst is rejected as non-retryable while pressure gating is
-  active: HTTP returns 413 without `Retry-After`, and gRPC sends negative retry
-  pushback.
+  the configured burst is refused while pressure gating is active and admitted
+  once pressure clears: gRPC returns `RESOURCE_EXHAUSTED` with a random
+  `RetryInfo` delay of 1 to 3 seconds, and HTTP returns 413 without
+  `Retry-After`. RFC 0002 makes the gRPC refusal non-retryable (negative
+  pushback); this receiver lets clients retry it.
+- A request refused by the rate limit or hard memory pressure can succeed on
+  retry: HTTP returns 503 with `Retry-After`, and gRPC returns
+  `RESOURCE_EXHAUSTED` with a `google.rpc.RetryInfo` detail (also sent as
+  `grpc-retry-pushback-ms`), which OTLP clients need to retry it.
 - An exhausted receiver may reject before decompressed request weight is known.
-  This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response has no retry hint.
-  Exact retry guidance or non-retryable oversized classification is available
-  only after the weighted admission point.
+  This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response carries a random
+  retry delay of 1 to 3 seconds, since the exact one is not known yet. Exact
+  retry guidance is available only after the weighted admission point.
+- A gRPC request that finds no free `max_concurrent_requests` permit or
+  wait-for-result slot is refused with `RESOURCE_EXHAUSTED` and counted as
+  `concurrency_limit`. With `load_shed: false` it waits for a permit instead. A
+  request over `transport_concurrency_limit` waits on its connection and is
+  never refused. The refusal carries a random retry delay of 1 to 3 seconds,
+  as `RetryInfo` on gRPC and `Retry-After` on OTLP/HTTP 503, so clients
+  refused together do not retry together.
+- A gRPC message above `max_decoding_message_size`, on the wire or after
+  decompression, is refused with `INVALID_ARGUMENT`, which OTLP clients do not
+  retry, and counted as `payload_too_large`. OTLP/HTTP answers 400.
 - `wait_for_result` reflects the immediate downstream node, not necessarily the
   final exporter.
 
