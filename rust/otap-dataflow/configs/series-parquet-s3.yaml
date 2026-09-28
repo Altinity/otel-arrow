@@ -1,0 +1,153 @@
+# OTLP/gRPC to an S3-compatible series/values Parquet lake.
+#
+# Pipeline topology:
+#
+#   otlp receiver --> series_parquet exporter --> S3 object store
+#
+# This is `series-parquet-local.yaml` with the storage mapping pointed at an
+# S3-compatible endpoint and object-store retries made explicit. The receiver
+# is connected directly to the exporter with `wait_for_result: true`, so an OK
+# OTLP response means the request's rows are already durable in the bucket.
+# Build with `--features series-parquet,aws` and create the bucket before
+# starting.
+#
+# The static credentials are read from the environment
+# (SERIES_S3_ACCESS_KEY_ID, SERIES_S3_SECRET_ACCESS_KEY), which must name the
+# credentials of a local MinIO or RustFS container on the loopback endpoint.
+# The engine refuses to start while either variable is unset; the file itself
+# never carries a credential. Production deployments use the shared AWS auth
+# provider configuration instead.
+#
+# Admission is sized for 100k records/s on the one core, sent as requests of
+# about 512 records. An ack is held for, on average, half a window plus the
+# flush, so the requests in flight are
+#
+#   in_flight = rate * (interval / 2 + flush) / records_per_request
+#             = 100000 * (7.5s + 2s) / 512 ~= 1860
+#
+# and `max_concurrent_requests` is rounded up to 2048. The receiver lowers its
+# limit to the `pdata` channel capacity, so that is 2048 too. A receiver limit
+# below `in_flight` caps throughput at the receiver, where producers see
+# RESOURCE_EXHAUSTED with a RetryInfo delay and retry; the exporter's
+# `admission.closed` gauge stays at zero.
+# Each held request stays in memory until its block is in the bucket: 2048
+# requests of 512 records take about 100MiB, but at the 16MiB request limit
+# the receiver could hold 32GiB (see "Memory" in the exporter README); the
+# memory limiter below refuses requests before the process gets there.
+# The window takes 100000 * 15 / 512 ~= 2930 requests, under
+# `max_requests_per_block: 4096`.
+#
+# `series-parquet-strict.alloy` is the matching Grafana Alloy producer: it tails a
+# file and exports OTLP logs to the receiver below. It sets the resource
+# attribute named by `producer_id_attribute` (`host.id`), which is what fills
+# the `producer_id` column of every values row it produces.
+#
+# The bucket needs a lifecycle rule that aborts incomplete multipart uploads
+# (AbortIncompleteMultipartUpload, for example after one day): an upload a
+# failed write could not abort is left to it and counted in
+# flush.abort_failures.
+#
+# Metrics: http://127.0.0.1:8080/api/v1/telemetry/metrics?format=prometheus&reset=false
+# with --http-admin-bind 127.0.0.1:8080.
+#
+# Usage:
+#   df_engine --config configs/series-parquet-s3.yaml \
+#     --http-admin-bind 127.0.0.1:8080
+version: otel_dataflow/v1
+policies:
+  resources:
+    # One worker. Without core_allocation the pipeline runs one worker per
+    # host core, each with its own 1.64GB memory.budget.
+    core_allocation: {type: core_count, count: 1}
+    # Refuses OTLP requests with RESOURCE_EXHAUSTED and a RetryInfo delay, which
+    # producers retry, while the process RSS is above hard_limit. Sized for the
+    # one worker: memory.budget (1.64GB) plus the requests the receiver holds,
+    # about 100MiB of 512-record requests and up to 32GiB of 16MiB ones
+    # (exporter README, "Memory"), with RSS at about 1.25 times the live bytes;
+    # scale both limits with core_allocation.count. `rss` counts this process
+    # only, where a host cgroup (`source: auto`) can also hold other processes.
+    memory_limiter: {mode: enforce, source: rss, soft_limit: 4GiB, hard_limit: 5GiB}
+engine:
+  telemetry: {reporting_interval: 1s}
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          channel_capacity:
+            control: {node: 100, pipeline: 100, completion: 100}
+            # Also caps the receiver's max_concurrent_requests.
+            pdata: 2048
+        nodes:
+          receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+                  wait_for_result: true
+                  timeout: 180s
+                  max_concurrent_requests: 2048
+                  # Equal to the exporter's ingress.max_request_bytes: the
+                  # receiver's 4MiB default answers a larger request with
+                  # INVALID_ARGUMENT, which OTLP clients drop.
+                  max_decoding_message_size: 16MiB
+          exporter:
+            type: exporter:series_parquet
+            config:
+              storage:
+                s3:
+                  base_uri: s3://series-test/otel
+                  region: us-east-1
+                  endpoint: http://127.0.0.1:9000
+                  allow_http: true
+                  virtual_hosted_style_request: false
+                  # Payloads are signed. `unsigned_payload: true` skips the SHA-256
+                  # of every uploaded byte, which saves CPU, but leaves only TLS to
+                  # protect the bytes in transit: set it only with an https://
+                  # endpoint whose certificate is verified, never with this one.
+                  auth:
+                    type: static_credentials
+                    access_key_id: "${env:SERIES_S3_ACCESS_KEY_ID}"
+                    secret_access_key: "${env:SERIES_S3_SECRET_ACCESS_KEY}"
+              retry:
+                max_retries: 5
+                init_backoff: 200ms
+                max_backoff: 10s
+                backoff_base: 2.0
+                retry_timeout: 30s
+              writer_id: local_1
+              producer_id_attribute: host.id
+              window:
+                interval: 15s
+                max_block_bytes: 500MiB
+                max_requests_per_block: 4096
+                flush_retry_deadline: 60s
+              ingress:
+                max_request_bytes: 16MiB
+                max_extracted_bytes: 32MiB
+                max_row_bytes: 1MiB
+                max_nesting_depth: 32
+              series_cache: {max_entries: 200000}
+              sorting: {run_target_bytes: 8MiB, merge_chunk_bytes: 16MiB}
+              upload: {part_bytes: 8MiB, concurrency: 2, abort_timeout: 5s}
+              parquet: {row_group_bytes: 64MiB, writer_limit_bytes: 96MiB}
+              # Stored and acknowledged without them: exponential histogram and
+              # summary points (dropped.unsupported{kind}) and, below, exemplars
+              # (dropped.exemplars). `reject` refuses the whole request instead.
+              # See the exporter README, "The v1 acknowledgement contract".
+              unsupported: drop
+              logs:
+                series_attributes: [logger.name]
+                denormalize: [resource.service.name]
+                values_sort:
+                  - {column: series_id, order: asc}
+                  - {column: time_unix_nano, order: asc, nulls: last}
+              metrics:
+                exemplars: drop
+                denormalize: [resource.service.name]
+                values_sort:
+                  - {column: series_id, order: asc}
+                  - {column: time_unix_nano, order: asc}
+        connections:
+          - {from: receiver, to: exporter}

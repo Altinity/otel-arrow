@@ -1,0 +1,102 @@
+# OTLP/gRPC to a local series/values Parquet lake.
+#
+# Pipeline topology:
+#
+#   otlp receiver --> series_parquet exporter --> local files
+#
+# The receiver is connected directly to the exporter with
+# `wait_for_result: true`, so an OK OTLP response means the request's files
+# are in place; the local backend does not fsync, so they survive an engine
+# crash, not necessarily a host crash. Build with
+# `--features series-parquet` and create the base directory, owned by the
+# engine's user, before starting.
+#
+# Throughput: each OK waits for its block, on average half a window plus the
+# flush (7.5s + 2s), and the receiver holds at most max_concurrent_requests
+# (128) at once, so one worker takes about 128 / 9.5s = 13 requests/s, some
+# 7k records/s at 512 records per request. Raise max_concurrent_requests
+# with the pdata channel for more (series-parquet-s3.yaml shows the formula).
+#
+# Usage:
+#   sudo install -d -o "$USER" /var/lib/otap/series-parquet
+#   df_engine --config configs/series-parquet-local.yaml \
+#     --http-admin-bind 127.0.0.1:8080
+#
+# Metrics: http://127.0.0.1:8080/api/v1/telemetry/metrics?format=prometheus&reset=false
+version: otel_dataflow/v1
+policies:
+  resources:
+    # One worker. Without core_allocation the pipeline runs one worker per
+    # host core, each with its own 1.64GB memory.budget.
+    core_allocation: {type: core_count, count: 1}
+    # Refuses OTLP requests with RESOURCE_EXHAUSTED and a RetryInfo delay, which
+    # producers retry, while the process RSS is above hard_limit. Sized for the
+    # one worker: memory.budget (1.64GB) plus the requests the receiver holds,
+    # up to 128 x 16MiB = 2GiB (exporter README, "Memory"), with RSS at about
+    # 1.25 times the live bytes; scale both limits with core_allocation.count.
+    # `rss` counts this process only, where a host cgroup (`source: auto`) can
+    # also hold other processes.
+    memory_limiter: {mode: enforce, source: rss, soft_limit: 4GiB, hard_limit: 5GiB}
+engine:
+  telemetry: {reporting_interval: 1s}
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          channel_capacity:
+            control: {node: 100, pipeline: 100, completion: 100}
+            pdata: 128
+        nodes:
+          receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+                  wait_for_result: true
+                  timeout: 180s
+                  max_concurrent_requests: 128
+                  # Equal to the exporter's ingress.max_request_bytes: the
+                  # receiver's 4MiB default answers a larger request with
+                  # INVALID_ARGUMENT, which OTLP clients drop.
+                  max_decoding_message_size: 16MiB
+          exporter:
+            type: exporter:series_parquet
+            config:
+              storage: {file: {base_uri: /var/lib/otap/series-parquet}}
+              writer_id: local_1
+              producer_id_attribute: host.id
+              window:
+                interval: 15s
+                max_block_bytes: 500MiB
+                max_requests_per_block: 4096
+                flush_retry_deadline: 60s
+              ingress:
+                max_request_bytes: 16MiB
+                max_extracted_bytes: 32MiB
+                max_row_bytes: 1MiB
+                max_nesting_depth: 32
+              series_cache: {max_entries: 200000}
+              sorting: {run_target_bytes: 8MiB, merge_chunk_bytes: 16MiB}
+              upload: {part_bytes: 8MiB, concurrency: 2, abort_timeout: 5s}
+              parquet: {row_group_bytes: 64MiB, writer_limit_bytes: 96MiB}
+              # Stored and acknowledged without them: exponential histogram and
+              # summary points (dropped.unsupported{kind}) and, below, exemplars
+              # (dropped.exemplars). `reject` refuses the whole request instead.
+              # See the exporter README, "The v1 acknowledgement contract".
+              unsupported: drop
+              logs:
+                series_attributes: [logger.name]
+                denormalize: [resource.service.name]
+                values_sort:
+                  - {column: series_id, order: asc}
+                  - {column: time_unix_nano, order: asc, nulls: last}
+              metrics:
+                exemplars: drop
+                denormalize: [resource.service.name]
+                values_sort:
+                  - {column: series_id, order: asc}
+                  - {column: time_unix_nano, order: asc}
+        connections:
+          - {from: receiver, to: exporter}

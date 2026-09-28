@@ -3407,6 +3407,12 @@ groups: {}
         assert!(error.to_string().contains("context"));
     }
 
+    /// Scenario: every YAML file under `configs/`, including subdirectories, is read
+    /// as an engine config, with a placeholder for each `${env:VAR}` that has no
+    /// default.
+    /// Guarantees: each bundled config parses, so a shipped example cannot drift
+    /// from the config schema, and a required variable is the only thing it needs
+    /// from the site.
     #[test]
     fn bundled_configs_parse_as_engine_configs() {
         let mut dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs")];
@@ -3428,7 +3434,17 @@ groups: {}
                     continue;
                 }
 
-                let parsed = OtelDataflowSpec::from_file(&path);
+                // A `${env:VAR}` without a default names a site value, such as a
+                // credential, that must be set at startup; it gets a placeholder here.
+                let mut yaml = fs::read_to_string(&path).expect("failed to read config");
+                let parsed = loop {
+                    match OtelDataflowSpec::from_yaml(&yaml) {
+                        Err(Error::EnvVarNotFound { var }) => {
+                            yaml = yaml.replace(&format!("${{env:{var}}}"), "placeholder");
+                        }
+                        parsed => break parsed,
+                    }
+                };
                 assert!(
                     parsed.is_ok(),
                     "failed to parse engine config {}: {parsed:?}",

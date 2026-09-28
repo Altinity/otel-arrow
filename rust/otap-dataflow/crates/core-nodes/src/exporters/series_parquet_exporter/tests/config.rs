@@ -213,6 +213,19 @@ fn a_sub_second_window_interval_is_refused() {
     );
 }
 
+/// Scenario: `configs/series-parquet-local.yaml` fed to the engine's startup validator.
+/// Guarantees: the shipped example stays loadable.
+#[test]
+fn the_shipped_example_configuration_is_valid() {
+    let yaml = include_str!("../../../../../../configs/series-parquet-local.yaml");
+    let doc: serde_json::Value = serde_yaml::from_str(yaml).expect("example config parses");
+    let exporter = doc
+        .pointer("/groups/default/pipelines/main/nodes/exporter/config")
+        .expect("example config has an exporter node");
+    let cfg: Config = serde_json::from_value(exporter.clone()).expect("example config is valid");
+    assert_eq!(cfg.lake.writer_id, "local_1");
+}
+
 /// Scenario: a `writer_id` that is a Kubernetes pod name with hyphens.
 /// Guarantees: the configuration starts with the id kept as written.
 #[test]
@@ -223,6 +236,59 @@ fn a_hyphenated_writer_id_is_accepted() {
     }))
     .expect("a pod name is a valid writer id");
     assert_eq!(cfg.lake.writer_id, "otel-lake-7d9f-0");
+}
+
+/// Scenario: the receiver and exporter nodes of every shipped series_parquet configuration.
+/// Guarantees: the receiver's `max_decoding_message_size` equals the exporter's
+/// `ingress.max_request_bytes`, so no request the exporter accepts is refused by the receiver.
+#[test]
+fn the_shipped_receiver_takes_every_request_the_exporter_accepts() {
+    use otel_arrow_dfe_otap::otap_grpc::server_settings::GrpcServerSettings;
+    for yaml in [
+        include_str!("../../../../../../configs/series-parquet-local.yaml"),
+        include_str!("../../../../../../configs/series-parquet-s3.yaml"),
+        include_str!("../../../../../../configs/series-parquet-buffered.yaml"),
+    ] {
+        let doc: serde_json::Value = serde_yaml::from_str(yaml).expect("config parses");
+        let nodes = doc
+            .pointer("/groups/default/pipelines/main/nodes")
+            .expect("nodes");
+        let grpc: GrpcServerSettings = serde_json::from_value(
+            nodes
+                .pointer("/receiver/config/protocols/grpc")
+                .expect("an OTLP gRPC receiver")
+                .clone(),
+        )
+        .expect("receiver settings");
+        let exporter: Config = serde_json::from_value(
+            nodes
+                .pointer("/exporter/config")
+                .expect("an exporter")
+                .clone(),
+        )
+        .expect("exporter config");
+        assert_eq!(
+            grpc.max_decoding_message_size.map(|bytes| bytes as usize),
+            Some(exporter.lake.ingress.max_request_bytes)
+        );
+    }
+}
+
+/// Scenario: the exporter of `configs/series-parquet-buffered.yaml` against the 60s grace
+/// that SIGTERM grants.
+/// Guarantees: `window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)`, the
+/// longest the exporter's drain runs, fits the grace, so a signal shutdown ends by itself.
+#[test]
+fn the_buffered_configuration_drains_within_the_signal_grace() {
+    let yaml = include_str!("../../../../../../configs/series-parquet-buffered.yaml");
+    let doc: serde_json::Value = serde_yaml::from_str(yaml).expect("config parses");
+    let exporter = doc
+        .pointer("/groups/default/pipelines/main/nodes/exporter/config")
+        .expect("an exporter");
+    let cfg: Config = serde_json::from_value(exporter.clone()).expect("exporter config");
+    let drain =
+        cfg.window.interval + 2 * (cfg.window.flush_retry_deadline + cfg.lake.upload.abort_timeout);
+    assert!(drain <= Duration::from_secs(60), "drain bound {drain:?}");
 }
 
 /// Scenario: the factory builds file storage with no capability bound to the node.
