@@ -19,6 +19,7 @@ use std::task::Poll;
 
 use crate::accessory::slots::{Key as SlotKey, State as SlotsState};
 use crate::bearer_authorization::{AuthorizationRejection, authorize_bearer};
+use crate::concurrency_shed_layer::grpc_concurrency_limit_status;
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
 use crate::pdata::{Context, OtapPdata};
 use crate::rate_limit_layer::{
@@ -364,6 +365,44 @@ impl OtapBatchService {
     }
 }
 
+impl UnaryService<OtapPdata> for &mut OtapBatchService {
+    type Response = ();
+    type Future = BoxFuture<'static, Result<tonic::Response<Self::Response>, Status>>;
+
+    fn call(&mut self, request: tonic::Request<OtapPdata>) -> Self::Future {
+        (**self).call(request)
+    }
+}
+
+/// Runs one export call, answering a message tonic refused for exceeding
+/// `max_decoding_message_size` with non-retryable INVALID_ARGUMENT.
+///
+/// Before the service runs, tonic answers such a message with OUT_OF_RANGE (too
+/// large on the wire, retried forever by OTLP clients) or RESOURCE_EXHAUSTED
+/// (too large after decompression). No other decode failure uses those codes;
+/// the one other source, an HTTP/2 ENHANCE_YOUR_CALM reset of the request
+/// stream, closes the connection, so its relabelled answer never arrives.
+async fn serve_export(
+    mut grpc: Grpc<OtlpBytesCodec>,
+    mut service: OtapBatchService,
+    request: Request<Body>,
+) -> Response<Body> {
+    let response = grpc.unary(&mut service, request).await;
+    if service.effect_handler.is_none() {
+        return response;
+    }
+    match Status::from_header_map(response.headers()) {
+        Some(status) if matches!(status.code(), Code::OutOfRange | Code::ResourceExhausted) => {
+            service.metrics.lock().record_rejection(
+                OtlpProtocol::Grpc,
+                ReceiverRejectionErrorType::PayloadTooLarge,
+            );
+            Status::invalid_argument(status.message().to_owned()).into_http()
+        }
+        _ => response,
+    }
+}
+
 /// Guard mechanism for cancelling a slot when Tonic timeout
 /// drops the future.
 pub(crate) struct SlotGuard {
@@ -390,6 +429,11 @@ impl UnaryService<OtapPdata> for OtapBatchService {
     type Future = BoxFuture<'static, Result<tonic::Response<Self::Response>, Status>>;
 
     fn call(&mut self, request: tonic::Request<OtapPdata>) -> Self::Future {
+        // Taken first: `serve_export` reads a present handler as "tonic refused before this call".
+        let effect_handler = self
+            .effect_handler
+            .take()
+            .expect("`OtapBatchService` is not reused for multiple calls");
         let (metadata, extensions, mut otap_batch) = request.into_parts();
         let payload_size = otap_batch.num_bytes();
 
@@ -441,11 +485,6 @@ impl UnaryService<OtapPdata> for OtapBatchService {
             otap_batch.set_peer_addr(addr);
         }
 
-        let effect_handler = self
-            .effect_handler
-            .take()
-            .expect("`OtapBatchService` is not reused for multiple calls");
-
         // Capture transport headers synchronously before moving the effect handler
         // into the async block, avoiding a clone of the capture policy.
         if let Some(policy) = effect_handler.capture_policy() {
@@ -490,10 +529,7 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                                 OtlpProtocol::Grpc,
                                 ReceiverRejectionErrorType::ConcurrencyLimit,
                             );
-                            return Err(processing.refused(
-                                signal,
-                                Status::resource_exhausted("Too many concurrent requests"),
-                            ));
+                            return Err(processing.refused(signal, grpc_concurrency_limit_status()));
                         }
                         Some(pair) => pair,
                     };
@@ -775,7 +811,7 @@ impl Service<Request<Body>> for LogsServiceServer {
                 if let Some(response) = common.exhausted_rate_limit_response() {
                     return Box::pin(async move { Ok(response) });
                 }
-                let mut grpc = new_grpc(SignalType::Logs, common.settings.clone());
+                let grpc = new_grpc(SignalType::Logs, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
                 let service = OtapBatchService::new(
                     common.effect_handler,
@@ -784,7 +820,7 @@ impl Service<Request<Body>> for LogsServiceServer {
                     SignalType::Logs,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move { Ok(serve_export(grpc, service, req).await) })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
@@ -834,7 +870,7 @@ impl Service<Request<Body>> for MetricsServiceServer {
                 if let Some(response) = common.exhausted_rate_limit_response() {
                     return Box::pin(async move { Ok(response) });
                 }
-                let mut grpc = new_grpc(SignalType::Metrics, common.settings.clone());
+                let grpc = new_grpc(SignalType::Metrics, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
                 let service = OtapBatchService::new(
                     common.effect_handler,
@@ -843,7 +879,7 @@ impl Service<Request<Body>> for MetricsServiceServer {
                     SignalType::Metrics,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move { Ok(serve_export(grpc, service, req).await) })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
@@ -893,7 +929,7 @@ impl Service<Request<Body>> for TraceServiceServer {
                 if let Some(response) = common.exhausted_rate_limit_response() {
                     return Box::pin(async move { Ok(response) });
                 }
-                let mut grpc = new_grpc(SignalType::Traces, common.settings.clone());
+                let grpc = new_grpc(SignalType::Traces, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
                 let service = OtapBatchService::new(
                     common.effect_handler,
@@ -902,7 +938,7 @@ impl Service<Request<Body>> for TraceServiceServer {
                     SignalType::Traces,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move { Ok(serve_export(grpc, service, req).await) })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
@@ -1281,8 +1317,10 @@ mod tests {
         assert!(status.message().contains("does not expose"));
     }
 
-    /// Scenario: a non-empty gRPC request exceeds the configured weighted rate-limit burst.
-    /// Guarantees: the request is refused and its shared receiver message and payload bytes are recorded.
+    /// Scenario: a non-empty gRPC request exceeds the configured weighted rate-limit burst
+    /// under soft memory pressure, and the same request arrives again after pressure clears.
+    /// Guarantees: the first is refused with RESOURCE_EXHAUSTED carrying a RetryInfo delay,
+    /// counted under `rate_limit` with its message and payload bytes; the second is admitted.
     #[tokio::test]
     async fn weighted_rate_limit_rejection_records_grpc_boundary_metrics() {
         use otel_arrow_dfe_config::policy::{
@@ -1305,6 +1343,7 @@ mod tests {
             retry_after_secs: 1,
             usage_bytes: 0,
         });
+        let pressure = admission_state.clone();
         let policy = RateLimiterPolicy {
             enforcement: RateLimitEnforcement::Enforce,
             aggregation: RateLimitAggregation::ReceiverInstance,
@@ -1321,39 +1360,57 @@ mod tests {
             .expect("bind test admission")
             .expect("configured test admission");
         let (msg_tx, mut msg_rx) = tokio_mpsc::channel(1);
-        let mut senders = HashMap::new();
-        let _ = senders.insert("default".into(), SharedSender::mpsc(msg_tx));
         let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(1);
         let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
-        let effect_handler = EffectHandler::new(
-            test_node("grpc_rate_limit_metrics"),
-            senders,
-            None,
-            ctrl_tx,
-            metrics_reporter,
-            otel_arrow_dfe_engine::testing::test_pipeline_runtime_services(),
-        );
-        let mut service = OtapBatchService::new(
-            effect_handler,
-            None,
-            metrics.clone(),
-            SignalType::Logs,
-            Some(GrpcRateLimitContext {
-                rate_limiter,
-                metrics: metrics.clone(),
-            }),
-        );
+        let new_service = || {
+            let mut senders = HashMap::new();
+            let _ = senders.insert("default".into(), SharedSender::mpsc(msg_tx.clone()));
+            let effect_handler = EffectHandler::new(
+                test_node("grpc_rate_limit_metrics"),
+                senders,
+                None,
+                ctrl_tx.clone(),
+                metrics_reporter.clone(),
+                otel_arrow_dfe_engine::testing::test_pipeline_runtime_services(),
+            );
+            OtapBatchService::new(
+                effect_handler,
+                None,
+                metrics.clone(),
+                SignalType::Logs,
+                Some(GrpcRateLimitContext {
+                    rate_limiter: rate_limiter.clone(),
+                    metrics: metrics.clone(),
+                }),
+            )
+        };
+        let mut service = new_service();
         let payload = Bytes::from_static(b"grpc-rate-limited-payload");
         let payload_bytes = payload.len() as u64;
         let pdata = OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(payload).into());
 
-        let result = UnaryService::call(&mut service, tonic::Request::new(pdata)).await;
+        let result = UnaryService::call(&mut service, tonic::Request::new(pdata.clone())).await;
 
-        assert_eq!(
-            result.expect_err("request rejected").code(),
-            Code::ResourceExhausted
-        );
+        let status = result.expect_err("request rejected");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let delay = crate::grpc_retry_info::retry_delay(&status).expect("a RetryInfo delay");
+        assert!((1..=3).contains(&delay.seconds), "{delay:?}");
         assert!(msg_rx.try_recv().is_err());
+
+        pressure.apply(MemoryPressureChanged {
+            generation: 2,
+            level: MemoryPressureLevel::Normal,
+            retry_after_secs: 0,
+            usage_bytes: 0,
+        });
+        let mut service = new_service();
+        let admitted = UnaryService::call(&mut service, tonic::Request::new(pdata)).await;
+        assert!(admitted.is_ok(), "{admitted:?}");
+        assert!(
+            msg_rx.try_recv().is_ok(),
+            "the request reaches the pipeline"
+        );
+
         let mut metrics = metrics.lock();
         assert_eq!(
             metrics
@@ -1367,7 +1424,7 @@ mod tests {
                 .requests_for(SignalType::Logs, OtlpProtocol::Grpc)
                 .accepted
                 .get(),
-            0
+            1
         );
         let snapshots = metrics.boundary.terminal_snapshots();
         assert!(snapshots.iter().any(|snapshot| {
@@ -1488,7 +1545,8 @@ mod tests {
     }
 
     /// Scenario: A non-empty gRPC request cannot allocate its acknowledgement slot.
-    /// Guarantees: The request is rejected without incrementing the OTLP accepted counter.
+    /// Guarantees: The request is refused with RESOURCE_EXHAUSTED and a retry delay, counted as
+    /// `concurrency_limit`, and not counted as accepted.
     #[tokio::test]
     async fn rejected_grpc_request_is_not_accepted() {
         let metrics = new_test_metrics();
