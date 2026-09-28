@@ -22,6 +22,24 @@ use std::collections::VecDeque;
 #[cfg(all(not(windows), feature = "jemalloc"))]
 use tikv_jemalloc_ctl::{epoch, stats};
 
+/// Whether jemalloc's background purging thread is enabled now.
+///
+/// `None` when this build has no jemalloc to ask, or jemalloc does not
+/// answer; the answer is jemalloc's running `background_thread` state, which
+/// starts from its compiled-in options and `MALLOC_CONF` and stays off when
+/// jemalloc could not start the thread.
+#[must_use]
+pub fn jemalloc_background_thread() -> Option<bool> {
+    #[cfg(all(not(windows), feature = "jemalloc"))]
+    {
+        tikv_jemalloc_ctl::background_thread::read().ok()
+    }
+    #[cfg(not(all(not(windows), feature = "jemalloc")))]
+    {
+        None
+    }
+}
+
 /// Values at or above this threshold are treated as "no limit set" by the
 /// cgroup memory controller (e.g. `memory.max = max` parses to `u64::MAX`).
 const CGROUP_UNLIMITED_THRESHOLD_BYTES: u64 = 1 << 60;
@@ -1065,6 +1083,20 @@ mod tests {
         fn purge(&mut self) -> Result<(), String> {
             Err("purge failed".to_string())
         }
+    }
+
+    /// Scenario: jemalloc's background thread is switched to the opposite of its current state
+    /// at run time, then restored.
+    /// Guarantees: `jemalloc_background_thread` reports the running state, not the startup
+    /// option, so the startup banner says whether the thread runs.
+    #[cfg(all(not(windows), feature = "jemalloc-testing"))]
+    #[test]
+    fn jemalloc_background_thread_reports_the_running_state() {
+        let initial = tikv_jemalloc_ctl::background_thread::read().expect("read the state");
+        tikv_jemalloc_ctl::background_thread::write(!initial).expect("switch the thread");
+        let reported = jemalloc_background_thread();
+        tikv_jemalloc_ctl::background_thread::write(initial).expect("restore the thread");
+        assert_eq!(reported, Some(!initial));
     }
 
     #[cfg(all(not(windows), feature = "jemalloc-testing"))]
