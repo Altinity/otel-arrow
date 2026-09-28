@@ -24,18 +24,13 @@
 //! with a separate WAL and segment store. Data is partitioned by core at runtime,
 //! with each core's data stored in `{path}/core_{core_id}/`.
 //!
-//! # Dispatch Strategy Considerations
+//! # Dispatch Policy
 //!
-//! **Important**: The dispatch strategy on the incoming edge affects behavior:
-//!
-//! | Strategy | Behavior | Recommendation |
-//! |----------|----------|----------------|
-//! | `RoundRobin` | Data distributed across cores, each persists its share | [x] **Recommended** |
-//! | `Random` | Similar to round-robin | [x] OK |
-//! | `LeastLoaded` | Similar to round-robin | [x] OK |
-//! | `Broadcast` | Same data persisted N times (once per core) | (!) **Avoid** - causes Nx storage and duplicates |
-//!
-//! For the outgoing edge (to exporters), any dispatch strategy is valid.
+//! A connection with several destinations, into or out of the buffer, uses the
+//! default `one_of` dispatch policy, which hands each message to one of them, so
+//! the buffers of such a connection each persist their share. `broadcast` is
+//! parsed, but pipeline validation rejects it on a connection with more than one
+//! destination.
 //!
 //! # Message Flow
 //!
@@ -84,7 +79,7 @@ mod metrics;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -345,6 +340,14 @@ pub struct DurableBuffer {
 
     /// Last cumulative Quiver retention-loss totals used to compute segment/bundle deltas.
     last_loss_snapshot: RetentionLossSnapshot,
+
+    /// Last time an ingest error was logged, and the errors not logged since.
+    last_ingest_error_warn: Option<Instant>,
+    ingest_errors_suppressed: u64,
+
+    /// Last time a permanent rejection was logged, and those not logged since.
+    last_rejected_warn: Option<Instant>,
+    rejected_suppressed: u64,
 }
 
 impl DurableBuffer {
@@ -411,6 +414,10 @@ impl DurableBuffer {
             segment_cache_generation: 0,
             metadata_load_warned_segments: HashSet::new(),
             last_loss_snapshot: RetentionLossSnapshot::default(),
+            last_ingest_error_warn: None,
+            ingest_errors_suppressed: 0,
+            last_rejected_warn: None,
+            rejected_suppressed: 0,
         })
     }
 
@@ -797,6 +804,15 @@ impl DurableBuffer {
             }
         }
 
+        let oldest_pending_age = engine
+            .oldest_pending_since()
+            .and_then(|since| SystemTime::now().duration_since(since).ok())
+            .map_or(0.0, |age| age.as_secs_f64());
+        self.metrics
+            .operational_metrics
+            .oldest_pending_age
+            .set(oldest_pending_age);
+
         // Step 4: evict cache entries for segments no longer tracked.
         self.segment_cache
             .retain(|seq, _| progress_snapshot.contains_key(&SegmentSeq::new(*seq)));
@@ -1132,7 +1148,20 @@ impl DurableBuffer {
                         .ingest_for(IngestFailure::Error)
                         .failures
                         .add(1);
-                    otel_error!("durable_buffer.ingest.failed", error = %e);
+                    let now = Instant::now();
+                    if self
+                        .last_ingest_error_warn
+                        .is_none_or(|last| now.duration_since(last) >= WARN_RATE_LIMIT)
+                    {
+                        self.last_ingest_error_warn = Some(now);
+                        otel_error!(
+                            "durable_buffer.ingest.failed",
+                            error = %e,
+                            suppressed = std::mem::take(&mut self.ingest_errors_suppressed)
+                        );
+                    } else {
+                        self.ingest_errors_suppressed += 1;
+                    }
                 }
 
                 // Preserve original payload so upstream can retry
@@ -1427,6 +1456,10 @@ impl DurableBuffer {
             }
             Err(e) => {
                 self.metrics.operational_metrics.read_errors.add(1);
+                self.metrics
+                    .bundles_for(BundleOutcome::ConversionFailed)
+                    .resolved
+                    .add(1);
                 otel_error!("durable_buffer.bundle.conversion_failed", error = %e);
                 // Reject the bundle since we can't process it
                 handle.reject();
@@ -1515,12 +1548,22 @@ impl DurableBuffer {
                     .resolved
                     .add(1);
 
-                otel_warn!(
-                    "durable_buffer.bundle.rejected_permanent",
-                    segment_seq = bundle_ref.segment_seq.raw(),
-                    bundle_index = bundle_ref.bundle_index.raw(),
-                    reason = %nack.reason
-                );
+                let now = Instant::now();
+                if self
+                    .last_rejected_warn
+                    .is_none_or(|last| now.duration_since(last) >= WARN_RATE_LIMIT)
+                {
+                    self.last_rejected_warn = Some(now);
+                    otel_warn!(
+                        "durable_buffer.bundle.rejected_permanent",
+                        segment_seq = bundle_ref.segment_seq.raw(),
+                        bundle_index = bundle_ref.bundle_index.raw(),
+                        reason = %nack.reason,
+                        suppressed = std::mem::take(&mut self.rejected_suppressed)
+                    );
+                } else {
+                    self.rejected_suppressed += 1;
+                }
 
                 // Reject the bundle in Quiver (marks as permanently failed)
                 pending.handle.reject();
@@ -2596,7 +2639,51 @@ mod tests {
         while let Ok(snapshot) = metrics_rx.try_recv() {
             outcomes[snapshot.bucket()] = snapshot.get_metrics()[0].to_u64_lossy();
         }
-        assert_eq!(outcomes, [10, 5, 3]);
+        assert_eq!(outcomes, [10, 5, 3, 0]);
+    }
+
+    /// Scenario: a WAL bundle whose OTLP slot holds no binary column fails
+    /// conversion on the drain path and is rejected.
+    /// Guarantees: the rejection is counted once in `resolved`, under
+    /// `outcome=conversion_failed`, so the outcome totals cover every bundle.
+    #[tokio::test]
+    async fn test_conversion_failure_counts_resolved_outcome() {
+        use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_runtime_services};
+
+        let (mut processor, engine, subscriber_id, _temp_dir) = setup_test_processor(None).await;
+        engine
+            .ingest(&make_simple_bundle(SlotId::new(60), 4))
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+        let handle = engine
+            .poll_next_bundle(&subscriber_id)
+            .expect("poll")
+            .expect("one bundle");
+
+        let (_metrics_rx, reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut effect_handler = EffectHandler::new(
+            test_node("durable-buffer-conversion"),
+            HashMap::new(),
+            None,
+            reporter,
+            test_pipeline_runtime_services(),
+        );
+        assert!(matches!(
+            processor.try_process_bundle_handle(handle, &mut effect_handler),
+            ProcessBundleResult::Skipped
+        ));
+
+        let (metrics_rx, mut reporter) =
+            MetricsReporter::create_new_and_receiver(BundleOutcome::CARDINALITY);
+        reporter
+            .report_measurement(&mut processor.metrics.bundle_metrics)
+            .unwrap();
+        let mut outcomes = [0u64; BundleOutcome::CARDINALITY];
+        while let Ok(snapshot) = metrics_rx.try_recv() {
+            outcomes[snapshot.bucket()] = snapshot.get_metrics()[0].to_u64_lossy();
+        }
+        assert_eq!(outcomes, [0, 0, 0, 1]);
     }
 
     /// Test that permanent NACKs decrement the `queued_*` gauges.
@@ -2721,6 +2808,37 @@ mod tests {
             0,
             "queued_spans should be 0"
         );
+    }
+
+    /// Scenario: an empty WAL, then one bundle ingested and finalized but
+    /// not acknowledged, then that bundle acked and its segment cleaned up.
+    /// Guarantees: `oldest_pending.age` is 0 while nothing is pending, above
+    /// 0 while the bundle waits, and back to 0 once it is acknowledged.
+    #[tokio::test]
+    async fn test_oldest_pending_age_rises_until_acked() {
+        let (mut processor, engine, subscriber_id, _temp_dir) = setup_test_processor(None).await;
+        let age = |p: &DurableBuffer| p.metrics.operational_metrics.oldest_pending_age.get();
+
+        processor.recompute_metrics(&engine, &subscriber_id);
+        assert_eq!(age(&processor), 0.0);
+
+        engine
+            .ingest(&make_simple_bundle(SlotId::new(30), 1))
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        processor.recompute_metrics(&engine, &subscriber_id);
+        assert!(age(&processor) > 0.0, "age {}", age(&processor));
+
+        engine
+            .poll_next_bundle(&subscriber_id)
+            .expect("poll")
+            .expect("one bundle")
+            .ack();
+        let _ = engine.cleanup_completed_segments().expect("cleanup");
+        processor.recompute_metrics(&engine, &subscriber_id);
+        assert_eq!(age(&processor), 0.0);
     }
 
     #[tokio::test]
