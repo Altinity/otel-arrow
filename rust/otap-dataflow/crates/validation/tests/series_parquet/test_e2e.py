@@ -591,6 +591,138 @@ class AlloyConfigs(unittest.TestCase):
                 )
 
 
+class AlloyRetries(unittest.TestCase):
+    """The strict reference Alloy producer against a saturated receiver."""
+
+    PRODUCERS = 3
+    LINES_PER_PRODUCER = 10_000
+
+    # Scenario: three instances of the shipped strict Alloy producer, each on
+    # its own connection, tail a file of 10,000 lines each into the shipped
+    # local configuration, whose receiver takes one request at a time
+    # (`max_concurrent_requests: 1`), so exports that meet another in flight
+    # are refused with RESOURCE_EXHAUSTED and a RetryInfo delay.
+    # Guarantees: the receiver refuses exports at its concurrency limit, Alloy
+    # retries every refusal instead of dropping it, and every line reaches
+    # the lake.
+    def test_alloy_retries_refusals_with_retry_info(self):
+        if not shutil.which("docker"):
+            unavailable("Docker CLI absent")
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", ALLOY_IMAGE],
+            capture_output=True,
+            timeout=DOCKER_TIMEOUT_S,
+        )
+        if inspect.returncode:
+            unavailable(f"the Alloy image is absent: {ALLOY_IMAGE}")
+        with tempfile.TemporaryDirectory() as directory:
+            lines = []
+            for producer in range(self.PRODUCERS):
+                logs = Path(directory) / f"logs-{producer}"
+                logs.mkdir()
+                mine = [
+                    f"alloy-retry-{producer}-{n:05d}"
+                    for n in range(self.LINES_PER_PRODUCER)
+                ]
+                (logs / "app.log").write_text("".join(f"{line}\n" for line in mine))
+                lines += mine
+            lake = Path(directory) / "lake"
+            lake.mkdir()
+            storage = {"file": {"base_uri": str(lake)}}
+            containers = [
+                f"series-alloy-{uuid.uuid4().hex[:12]}" for _ in range(self.PRODUCERS)
+            ]
+            with Engine(
+                directory,
+                "series-parquet-local.yaml",
+                storage,
+                grpc_settings={"max_concurrent_requests": 1},
+            ) as engine:
+                try:
+                    for producer, container in enumerate(containers):
+                        alloy = subprocess.run(
+                            [
+                                "docker", "run", "--detach", "--pull=never",
+                                "--name", container, "--network", "host",
+                                "--volume", f"{ALLOY_CONFIGS}:/configs:ro",
+                                "--volume",
+                                f"{Path(directory) / f'logs-{producer}'}:/logs:ro",
+                                "--env",
+                                f"OTLP_ENDPOINT=127.0.0.1:{engine.grpc_port}",
+                                "--env", "SERIES_LOG_PATH=/logs/app.log",
+                                "--env", f"SERIES_PRODUCER_ID=producer-{producer}",
+                                ALLOY_IMAGE, "run",
+                                "--stability.level=public-preview",
+                                "--storage.path=/tmp/alloy",
+                                f"--server.http.listen-addr=127.0.0.1:{free_port()}",
+                                "/configs/series-parquet-strict.alloy",
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=DOCKER_TIMEOUT_S,
+                        )
+                        self.assertEqual(alloy.returncode, 0, alloy.stderr)
+                    missing = lines
+                    deadline = time.monotonic() + 180
+                    while missing and time.monotonic() < deadline:
+                        time.sleep(1)
+                        missing = self.missing_lines(lake, lines)
+                    alloy_log = ""
+                    for container in containers:
+                        logged = subprocess.run(
+                            ["docker", "logs", container],
+                            capture_output=True,
+                            text=True,
+                            timeout=DOCKER_TIMEOUT_S,
+                        )
+                        alloy_log += logged.stdout + logged.stderr
+                    refused = engine.counter(
+                        "rejected_total",
+                        "receiver",
+                        otel_scope_name="receiver.otlp.requests",
+                        error_type="concurrency_limit",
+                    )
+                finally:
+                    for container in containers:
+                        subprocess.run(
+                            ["docker", "rm", "--force", container],
+                            capture_output=True,
+                            timeout=DOCKER_TIMEOUT_S,
+                        )
+                engine.shutdown()
+            retried = [
+                line
+                for line in alloy_log.splitlines()
+                if "Will retry" in line and "ResourceExhausted" in line
+            ]
+            print(
+                f"alloy retry E2E: {len(lines)} lines from {self.PRODUCERS} producers, "
+                f"{refused:.0f} refusals at the concurrency limit, {len(retried)} "
+                f"retries logged by Alloy, {len(missing)} lines missing"
+            )
+            if retried:
+                print(f"first retry logged by Alloy: {retried[0]}")
+            self.assertGreater(refused, 0, "the receiver never refused an export")
+            self.assertTrue(retried, "Alloy logged no retry of a RESOURCE_EXHAUSTED")
+            self.assertNotIn("Dropping data", alloy_log, "Alloy dropped an export")
+            self.assertEqual(missing, [], "lines missing from the lake")
+
+    @staticmethod
+    def missing_lines(lake, lines):
+        """The lines of `lines` whose body the lake does not hold yet."""
+        files = parquet_files(lake, "logs", "values")
+        if not files:
+            return lines
+        with duckdb.connect() as db:
+            stored = {
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT body FROM read_parquet(?)", [files]
+                ).fetchall()
+            }
+        return [line for line in lines if line not in stored]
+
+
 class Minio(unittest.TestCase, LakeAssertions):
     """The S3 configurations against a MinIO container."""
 

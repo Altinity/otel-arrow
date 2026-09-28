@@ -23,6 +23,11 @@ the lake back with DuckDB:
   SIGKILLed while the exporter holds every acknowledged request in its open
   block, or while it writes that block to a paused MinIO; after a restart on
   the same buffer directory every request is stored at least once.
+- `AlloyRetries`: three instances of `configs/series-parquet-strict.alloy`
+  in the Alloy image tail 10,000 lines each into `series-parquet-local.yaml`
+  with `max_concurrent_requests: 1`; the receiver refuses exports at its
+  concurrency limit with RESOURCE_EXHAUSTED and a RetryInfo delay, Alloy
+  retries every one, and every line is stored.
 - `AlloyConfigs`: `alloy validate` of the Alloy image checks
   `configs/series-parquet.alloy` and `configs/series-parquet-strict.alloy`
   at the stability level they document.
