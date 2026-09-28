@@ -201,6 +201,9 @@ pub enum Error {
     #[error("Invalid type for an Id column: {}", data_type)]
     InvalidIdColumnType { data_type: DataType },
 
+    #[error("Delta-encoded column {} decodes past its type's maximum", name)]
+    DeltaDecodingOverflow { name: String },
+
     #[error(
         "Invalid data type for struct, parent: {}, name: {}, data_type: {}",
         parent,

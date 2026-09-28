@@ -86,7 +86,7 @@ where
             expect: T::DATA_TYPE,
         })?;
 
-    let new_column = Arc::new(remove_delta_encoding_from_column(column));
+    let new_column = Arc::new(try_remove_delta_encoding_from_column(column, column_name)?);
     let columns = record_batch
         .columns()
         .iter()
@@ -139,6 +139,54 @@ where
     }
 
     PrimitiveArray::<T>::new(ScalarBuffer::from(new_values), array.nulls().cloned())
+}
+
+/// Materializes a delta-encoded id column, as
+/// [`remove_delta_encoding_from_column`] does, with checked arithmetic: nulls
+/// keep the running sum, and a sum past `T`'s maximum is
+/// [`Error::DeltaDecodingOverflow`] for `column`.
+pub fn try_remove_delta_encoding_from_column<T>(
+    array: &PrimitiveArray<T>,
+    column: &str,
+) -> Result<PrimitiveArray<T>>
+where
+    T: ArrowPrimitiveType,
+{
+    let mut new_values = Vec::from(array.values().clone());
+    let mut acc = T::Native::ZERO;
+    let mut accumulate = |delta: &mut T::Native| -> Result<()> {
+        acc = acc
+            .add_checked(*delta)
+            .map_err(|_| Error::DeltaDecodingOverflow {
+                name: column.to_string(),
+            })?;
+        *delta = acc;
+        Ok(())
+    };
+
+    if let Some(nulls) = array.nulls() {
+        for (start, end) in BitSliceIterator::new(nulls.buffer().as_slice(), 0, array.len()) {
+            new_values[start..end]
+                .iter_mut()
+                .try_for_each(&mut accumulate)?;
+        }
+    } else {
+        new_values.iter_mut().try_for_each(&mut accumulate)?;
+    }
+
+    Ok(PrimitiveArray::<T>::new(
+        ScalarBuffer::from(new_values),
+        array.nulls().cloned(),
+    ))
+}
+
+/// Adds a parent id delta; a sum past the id type's maximum is
+/// [`Error::DeltaDecodingOverflow`] for the parent_id column.
+fn add_parent_id_delta<N: ArrowNativeTypeOp>(acc: N, delta: N) -> Result<N> {
+    acc.add_checked(delta)
+        .map_err(|_| Error::DeltaDecodingOverflow {
+            name: consts::PARENT_ID.to_string(),
+        })
 }
 
 /// Decodes the parent IDs from their transport optimized encoding to the actual ID values.
@@ -454,7 +502,10 @@ where
 
                     // process delta-encoded range
                     while batch_idx < batch_delta_end {
-                        curr_parent_id += materialized_parent_ids[batch_idx];
+                        curr_parent_id = add_parent_id_delta(
+                            curr_parent_id,
+                            materialized_parent_ids[batch_idx],
+                        )?;
                         materialized_parent_ids[batch_idx] = curr_parent_id;
                         batch_idx += 1;
                     }
@@ -574,7 +625,7 @@ where
     for i in 1..record_batch.num_rows() {
         let delta_or_parent_id = encoded_parent_ids.value(i);
         if eq_next.value(i - 1) {
-            curr_parent_id += delta_or_parent_id;
+            curr_parent_id = add_parent_id_delta(curr_parent_id, delta_or_parent_id)?;
         } else {
             curr_parent_id = delta_or_parent_id;
         }
@@ -4800,6 +4851,181 @@ mod test {
         let result_parent_ids = get_u32_array(&result, consts::PARENT_ID).unwrap();
         let expected = UInt32Array::from_iter_values(vec![1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(result_parent_ids, &expected);
+    }
+
+    /// Scenario: the public column-level delta decoding is called in its
+    /// unchecked form on an in-range column and in its checked `try_` form on
+    /// an in-range and an overflowing column.
+    /// Guarantees: the unchecked function keeps its signature and result; the
+    /// `try_` variant returns the same values and refuses the overflowing
+    /// column with `DeltaDecodingOverflow` naming it.
+    #[test]
+    fn column_delta_decoding_keeps_its_signature_and_adds_a_checked_variant() {
+        let deltas = UInt16Array::from(vec![Some(1), None, Some(2), Some(3)]);
+        let unchecked: UInt16Array = remove_delta_encoding_from_column(&deltas);
+        let checked = try_remove_delta_encoding_from_column(&deltas, "ids").expect("in range");
+        assert_eq!(unchecked, checked);
+        assert_eq!(checked.value(3), 6);
+
+        let overflowing = UInt16Array::from(vec![u16::MAX, 1]);
+        match try_remove_delta_encoding_from_column(&overflowing, "ids") {
+            Err(Error::DeltaDecodingOverflow { name }) => assert_eq!(name, "ids"),
+            other => panic!("expected DeltaDecodingOverflow, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a delta-encoded u16 id column whose running sum reaches
+    /// u16::MAX exactly across a null, and one whose running sum passes it.
+    /// Guarantees: the first decodes to u16::MAX; the second is an error
+    /// naming the column, never a panic or a wrapped id.
+    #[test]
+    fn remove_delta_encoding_refuses_overflowing_ids() {
+        let batch = |values: Vec<Option<u16>>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "test",
+                    DataType::UInt16,
+                    true,
+                )])),
+                vec![Arc::new(UInt16Array::from(values))],
+            )
+            .unwrap()
+        };
+
+        let at_max = remove_delta_encoding::<UInt16Type>(
+            &batch(vec![Some(u16::MAX - 1), None, Some(1)]),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(get_u16_array(&at_max, "test").unwrap().value(2), u16::MAX);
+
+        let err =
+            remove_delta_encoding::<UInt16Type>(&batch(vec![Some(u16::MAX), Some(1)]), "test")
+                .unwrap_err();
+        assert!(err.to_string().contains("test"), "{err}");
+    }
+
+    fn assert_parent_id_overflow(err: Error) {
+        assert!(
+            matches!(&err, Error::DeltaDecodingOverflow { name } if name == consts::PARENT_ID),
+            "{err}"
+        );
+    }
+
+    /// Scenario: delta runs of equal string attributes whose u16 and u32
+    /// parent ids reach the type's maximum exactly, and runs that pass it.
+    /// Guarantees: the first decode to the maximum; the second is
+    /// DeltaDecodingOverflow naming parent_id, never a panic or a wrapped id.
+    #[test]
+    fn materialize_parent_id_for_attributes_refuses_overflowing_ids() {
+        fn attrs(parent_ids: ArrayRef) -> RecordBatch {
+            let rows = parent_ids.len();
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new(consts::PARENT_ID, parent_ids.data_type().clone(), false),
+                    Field::new(consts::ATTRIBUTE_TYPE, DataType::UInt8, false),
+                    Field::new(consts::ATTRIBUTE_KEY, DataType::Utf8, false),
+                    Field::new(consts::ATTRIBUTE_STR, DataType::Utf8, true),
+                ])),
+                vec![
+                    parent_ids,
+                    Arc::new(UInt8Array::from(vec![AttributeValueType::Str as u8; rows])),
+                    Arc::new(StringArray::from(vec!["k"; rows])),
+                    Arc::new(StringArray::from(vec!["v"; rows])),
+                ],
+            )
+            .unwrap()
+        }
+
+        let at_max =
+            materialize_parent_id_for_attributes::<u16>(&attrs(Arc::new(UInt16Array::from(vec![
+                u16::MAX - 1,
+                1,
+            ]))))
+            .unwrap();
+        assert_eq!(
+            get_u16_array(&at_max, consts::PARENT_ID).unwrap().value(1),
+            u16::MAX
+        );
+        assert_parent_id_overflow(
+            materialize_parent_id_for_attributes::<u16>(&attrs(Arc::new(UInt16Array::from(vec![
+                u16::MAX,
+                1,
+            ]))))
+            .unwrap_err(),
+        );
+
+        let at_max =
+            materialize_parent_id_for_attributes::<u32>(&attrs(Arc::new(UInt32Array::from(vec![
+                u32::MAX - 1,
+                1,
+            ]))))
+            .unwrap();
+        assert_eq!(
+            get_u32_array(&at_max, consts::PARENT_ID).unwrap().value(1),
+            u32::MAX
+        );
+        assert_parent_id_overflow(
+            materialize_parent_id_for_attributes::<u32>(&attrs(Arc::new(UInt32Array::from(vec![
+                u32::MAX,
+                1,
+            ]))))
+            .unwrap_err(),
+        );
+    }
+
+    /// Scenario: column-equality delta runs (events, links, exemplars) whose
+    /// u16 and u32 parent ids reach the type's maximum exactly, and runs that
+    /// pass it.
+    /// Guarantees: the first decode to the maximum; the second is
+    /// DeltaDecodingOverflow naming parent_id, never a panic or a wrapped id.
+    #[test]
+    fn materialize_parent_ids_by_columns_refuses_overflowing_ids() {
+        fn named(parent_ids: ArrayRef) -> RecordBatch {
+            let rows = parent_ids.len();
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new(consts::PARENT_ID, parent_ids.data_type().clone(), false),
+                    Field::new(consts::NAME, DataType::Utf8, false),
+                ])),
+                vec![parent_ids, Arc::new(StringArray::from(vec!["n"; rows]))],
+            )
+            .unwrap()
+        }
+
+        let at_max = materialize_parent_ids_by_columns::<u16>(
+            &named(Arc::new(UInt16Array::from(vec![u16::MAX - 1, 1]))),
+            [consts::NAME],
+        )
+        .unwrap();
+        assert_eq!(
+            get_u16_array(&at_max, consts::PARENT_ID).unwrap().value(1),
+            u16::MAX
+        );
+        assert_parent_id_overflow(
+            materialize_parent_ids_by_columns::<u16>(
+                &named(Arc::new(UInt16Array::from(vec![u16::MAX, 1]))),
+                [consts::NAME],
+            )
+            .unwrap_err(),
+        );
+
+        let at_max = materialize_parent_ids_by_columns::<u32>(
+            &named(Arc::new(UInt32Array::from(vec![u32::MAX - 1, 1]))),
+            [consts::NAME],
+        )
+        .unwrap();
+        assert_eq!(
+            get_u32_array(&at_max, consts::PARENT_ID).unwrap().value(1),
+            u32::MAX
+        );
+        assert_parent_id_overflow(
+            materialize_parent_ids_by_columns::<u32>(
+                &named(Arc::new(UInt32Array::from(vec![u32::MAX, 1]))),
+                [consts::NAME],
+            )
+            .unwrap_err(),
+        );
     }
 
     #[test]

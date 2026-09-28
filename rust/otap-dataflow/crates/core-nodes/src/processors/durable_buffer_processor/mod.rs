@@ -122,7 +122,7 @@ use otel_arrow_dfe_engine::config::ProcessorConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::control::Context8u8;
 use otel_arrow_dfe_engine::control::{
-    AckMsg, CallData, NackMsg, NodeControlMsg, WakeupRevision, WakeupSlot,
+    AckMsg, CallData, NackCause, NackMsg, NodeControlMsg, WakeupRevision, WakeupSlot,
 };
 use otel_arrow_dfe_engine::error::Error;
 use otel_arrow_dfe_engine::local::processor::EffectHandler;
@@ -1062,7 +1062,8 @@ impl DurableBuffer {
                                 (result, num_items)
                             }
                             Err(e) => {
-                                // Conversion failed - NACK with original bytes so upstream can retry
+                                // The conversion is deterministic, so the original bytes are
+                                // refused permanently: a retry would fail the same way.
                                 self.metrics
                                     .ingest_for(IngestFailure::Error)
                                     .failures
@@ -1072,9 +1073,10 @@ impl DurableBuffer {
                                 let nack_pdata =
                                     OtapPdata::new(context, OtapPayload::from(bytes_for_nack));
                                 effect_handler
-                                    .notify_nack(NackMsg::new(
+                                    .notify_nack(NackMsg::new_permanent_with_cause(
                                         format!("OTLP to Arrow conversion failed: {}", e),
                                         nack_pdata,
+                                        NackCause::Refused,
                                     ))
                                     .await?;
                                 return Ok(());
@@ -2028,6 +2030,87 @@ mod tests {
     fn test_decode_bundle_ref_insufficient_calldata() {
         let calldata: CallData = smallvec![Context8u8::from(123u64)];
         assert!(decode_bundle_ref(&calldata).is_none());
+    }
+
+    /// Scenario: with `otlp_handling: convert_to_arrow`, a well-framed OTLP
+    /// logs request holding 65,537 empty `ResourceLogs`, one more than the
+    /// conversion's u16 ids can number, then a valid request.
+    /// Guarantees: the first is nacked permanently as `Refused` with its
+    /// original bytes, so upstream does not retry it, and the buffer keeps
+    /// running: the second is stored and acknowledged.
+    #[test]
+    fn test_a_request_the_conversion_refuses_is_nacked_permanently() {
+        use otel_arrow_dfe_config::node::NodeUserConfig;
+        use otel_arrow_dfe_engine::Interests;
+        use otel_arrow_dfe_engine::config::ProcessorConfig;
+        use otel_arrow_dfe_engine::context::ControllerContext;
+        use otel_arrow_dfe_engine::control::{
+            PipelineCompletionMsg, pipeline_completion_msg_channel,
+        };
+        use otel_arrow_dfe_engine::message::Message;
+        use otel_arrow_dfe_engine::testing::processor::TestRuntime;
+        use otel_arrow_dfe_engine::testing::test_node;
+        use otel_arrow_dfe_pdata::{OtlpProtoBytes, PayloadData};
+        use serde_json::json;
+
+        let rt = TestRuntime::new();
+        let controller = ControllerContext::new(rt.metrics_registry());
+        let pipeline_ctx = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut node_config = NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN);
+        node_config.config = json!({
+            "path": temp_dir.path(),
+            "retention_size_cap": "256 MiB",
+            "otlp_handling": "convert_to_arrow"
+        });
+        let processor = create_durable_buffer(
+            pipeline_ctx,
+            test_node("durable-buffer-conversion-refused"),
+            Arc::new(node_config),
+            &ProcessorConfig::new("durable-buffer-conversion-refused"),
+            &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+        )
+        .expect("create durable buffer");
+
+        let too_many = [0x0a, 0x00].repeat(65_537);
+        // A logs request with one empty record.
+        let valid = vec![0x0a, 0x04, 0x12, 0x02, 0x12, 0x00];
+        rt.set_processor(processor)
+            .run_test(move |mut ctx| async move {
+                let (completion_tx, mut completion_rx) = pipeline_completion_msg_channel(10);
+                ctx.set_pipeline_completion_sender(completion_tx);
+                for body in [too_many.clone(), valid] {
+                    let pdata = OtapPdata::new_default(
+                        OtlpProtoBytes::ExportLogsRequest(body.into()).into(),
+                    )
+                    .test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        Default::default(),
+                        0,
+                    );
+                    ctx.process(Message::PData(pdata))
+                        .await
+                        .expect("the buffer keeps running");
+                }
+                match completion_rx.recv().await.expect("a decision") {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert!(nack.permanent, "{}", nack.reason);
+                        assert_eq!(nack.cause, NackCause::Refused);
+                        match nack.refused.payload_ref().data() {
+                            PayloadData::OtlpBytes(bytes) => {
+                                assert!(bytes.as_bytes() == &too_many[..], "original bytes");
+                            }
+                            other => panic!("refused a non-OTLP payload: {other:?}"),
+                        }
+                    }
+                    _ => panic!("the refused request is nacked"),
+                }
+                assert!(matches!(
+                    completion_rx.recv().await.expect("a decision"),
+                    PipelineCompletionMsg::DeliverAck { .. }
+                ));
+            })
+            .validate(|_| async {});
     }
 
     /// Scenario: one transient NACK arms a normal processor-local wakeup and the
