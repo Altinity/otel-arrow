@@ -6,38 +6,30 @@
 //! The decoder converts independently decodable logs, metrics, and traces
 //! requests into native OTAP Arrow records. A best-effort implementation uses
 //! borrowed protobuf views and validates only outer framing. A strict
-//! implementation decodes the complete nested message with Prost before
-//! conversion. The pipeline policy selects one implementation when its lazy
-//! decoder instance is created.
+//! implementation checks the framing of the complete nested message against
+//! the OTLP schema before the same views convert it. The pipeline policy
+//! selects one implementation when its lazy decoder instance is created.
 //!
 //! The encoder keeps lazy, signal-specific protobuf encoders and bounded
 //! scratch buffers so repeated output avoids reallocating while an unused
 //! signal consumes no buffer.
 
+use crate::{
+    CodecError, CodecMetadata, CodecOperation, CodecRegistration, DecodePolicy, DecodeValidation,
+    EncodeOutput, EncodePolicy, PdataDecoder, PdataEncoder, PdataEncoding,
+};
 use bytes::Bytes;
 use otel_arrow_dfe_config::SignalType;
-use otel_arrow_dfe_pdata::encode::{
-    encode_logs_otap_batch, encode_metrics_otap_batch, encode_spans_otap_batch,
-};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otlp::common::MAX_OTLP_SIZE_LIMIT;
 use otel_arrow_dfe_pdata::otlp::logs::LogsProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::metrics::MetricsProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::traces::TracesProtoBytesEncoder;
 use otel_arrow_dfe_pdata::otlp::{BoundedBuf, ProtoBuffer, ProtoBytesEncoder};
-use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogsData;
-use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::MetricsData;
-use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::TracesData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::traces::RawTraceData;
-use otel_arrow_dfe_pdata::{OtapPayloadHelpers, OtlpProtoBytes, TryIntoWithOptions};
-use prost::Message;
-
-use crate::{
-    CodecError, CodecMetadata, CodecOperation, CodecRegistration, DecodePolicy, DecodeValidation,
-    EncodeOutput, EncodePolicy, PdataDecoder, PdataEncoder, PdataEncoding,
-};
+use otel_arrow_dfe_pdata::{OtapPayload, OtapPayloadHelpers, OtlpProtoBytes, TryIntoWithOptions};
 
 /// Stable identity of uncompressed OTLP protobuf service-request bytes.
 pub const OTLP_ENCODING: PdataEncoding = PdataEncoding::OTLP;
@@ -74,6 +66,10 @@ impl PdataDecoder for OtlpBestEffortDecoder {
 }
 
 /// OTLP decoder that validates the complete nested protobuf message.
+///
+/// The framing check walks the whole request against the OTLP schema and
+/// refuses what prost refuses, then the byte views, which read a checked body
+/// as prost decodes it, convert it. No prost message tree is built.
 struct OtlpStrictDecoder;
 
 impl PdataDecoder for OtlpStrictDecoder {
@@ -82,20 +78,9 @@ impl PdataDecoder for OtlpStrictDecoder {
         signal: SignalType,
         bytes: &Bytes,
     ) -> Result<OtapArrowRecords, CodecError> {
-        match signal {
-            SignalType::Logs => {
-                let data = LogsData::decode(bytes.clone()).map_err(decode_error)?;
-                encode_logs_otap_batch(&data).map_err(decode_error)
-            }
-            SignalType::Metrics => {
-                let data = MetricsData::decode(bytes.clone()).map_err(decode_error)?;
-                encode_metrics_otap_batch(&data).map_err(decode_error)
-            }
-            SignalType::Traces => {
-                let data = TracesData::decode(bytes.clone()).map_err(decode_error)?;
-                encode_spans_otap_batch(&data).map_err(decode_error)
-            }
-        }
+        let payload = OtapPayload::from(OtlpProtoBytes::new_from_bytes(signal, bytes.clone()));
+        payload.validate_otlp_framing().map_err(decode_error)?;
+        payload.try_into_with_default().map_err(decode_error)
     }
 }
 
@@ -528,5 +513,84 @@ mod tests {
             assert!(service.decode(&valid).is_ok());
         }
         assert_eq!(service.test_instance_count().unwrap(), 1);
+    }
+    /// Scenario: strict decoding of each OTLP signal with a broken nested
+    /// frame after valid records.
+    /// Guarantees: the refusal comes from the schema-aware framing check,
+    /// which names the problem, the innermost message and the byte offset,
+    /// not from a prost decode of the whole message tree.
+    #[test]
+    fn strict_refusal_names_the_broken_frame() {
+        let cases = [
+            (
+                SignalType::Logs,
+                logs_with_full_resource_and_scope().encode_to_vec(),
+            ),
+            (
+                SignalType::Metrics,
+                metrics_sum_with_full_resource_and_scope().encode_to_vec(),
+            ),
+            (
+                SignalType::Traces,
+                traces_with_full_resource_and_scope().encode_to_vec(),
+            ),
+        ];
+        let service = service(DecodeValidation::Strict);
+        for (signal, mut bytes) in cases {
+            // The appended resource_logs holds a scope_logs key at `offset`
+            // whose length runs past the end of the request.
+            let offset = bytes.len() + 2;
+            bytes.extend_from_slice(&[0x0a, 0x03, 0x1a, 0x05, 0x00]);
+            let codec = service
+                .registry()
+                .resolve_decoder(&OTLP_ENCODING, signal)
+                .unwrap();
+            let encoded = codec.admit(signal, bytes.into()).unwrap();
+            let Err(CodecError::Operation { source, .. }) = service.decode(&encoded) else {
+                panic!("{signal:?}: strict decoding must refuse the broken frame");
+            };
+            match source.downcast_ref::<otel_arrow_dfe_pdata::error::Error>() {
+                Some(otel_arrow_dfe_pdata::error::Error::InvalidOtlpWireFormat {
+                    offset: at,
+                    ..
+                }) => assert_eq!(*at, offset, "{signal:?}"),
+                other => panic!("{signal:?}: expected the framing check's error, got {other:?}"),
+            }
+        }
+    }
+
+    /// Scenario: strict decoding of the full logs, metrics and traces
+    /// fixtures, encoded back to OTLP.
+    /// Guarantees: the strict path, which converts through the byte views
+    /// after the framing check, keeps every field prost decodes: the round
+    /// trip decodes with prost to the fixture it started from.
+    #[test]
+    fn strict_decoding_keeps_what_prost_decodes() {
+        use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogsData;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::MetricsData;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::TracesData;
+
+        let service = service(DecodeValidation::Strict);
+        let registry = CodecRegistry::global().unwrap();
+        let plan =
+            EncodingPlan::resolve(&registry, &OTLP_ENCODING, EncodePolicy::default()).unwrap();
+        let round_trip = |signal: SignalType, bytes: Vec<u8>| -> Bytes {
+            let codec = service
+                .registry()
+                .resolve_decoder(&OTLP_ENCODING, signal)
+                .unwrap();
+            let encoded = codec.admit(signal, bytes.into()).unwrap();
+            let mut records = service.decode(&encoded).expect("strict decoding");
+            service.encode_bytes(&mut records, &plan).expect("encodes")
+        };
+        let logs = logs_with_full_resource_and_scope();
+        let bytes = round_trip(SignalType::Logs, logs.encode_to_vec());
+        assert_eq!(LogsData::decode(bytes).unwrap(), logs);
+        let metrics = metrics_sum_with_full_resource_and_scope();
+        let bytes = round_trip(SignalType::Metrics, metrics.encode_to_vec());
+        assert_eq!(MetricsData::decode(bytes).unwrap(), metrics);
+        let traces = traces_with_full_resource_and_scope();
+        let bytes = round_trip(SignalType::Traces, traces.encode_to_vec());
+        assert_eq!(TracesData::decode(bytes).unwrap(), traces);
     }
 }
