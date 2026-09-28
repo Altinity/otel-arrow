@@ -299,7 +299,8 @@ The reference deployment for Grafana Alloy producers: the S3 pipeline with a
 - Refuses with UNAVAILABLE while the WAL is at its 32GiB cap; the buffer
   retries failed blocks, so the exporter's flush deadline is 15s
 - A SIGTERM drain ends by the 60s deadline plus `upload.abort_timeout`, 65s
-  in all; give the supervisor a longer grace period, such as 90s
+  in all; give the supervisor a longer grace period (90s in the deployment
+  example)
 
 Requires a binary built with `--features series-parquet,aws,durable-buffer`,
 an existing bucket with the same lifecycle rule, and the WAL directory. Metrics

@@ -3454,6 +3454,65 @@ groups: {}
         }
     }
 
+    /// Scenario: the Kubernetes engine config of the series_parquet deployment
+    /// example is read next to `configs/series-parquet-buffered.yaml`.
+    /// Guarantees: it is a valid engine config, and it differs from the buffered
+    /// config only in the site lines its header names: the receiver address, the
+    /// exporter storage and writer_id, and the process memory limiter.
+    #[test]
+    fn series_parquet_deploy_config_differs_only_in_site_lines() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |path: &str| {
+            fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("read {path}: {e}"))
+        };
+        let deploy_text = read("deploy/series-parquet/k8s/engine/engine.yaml");
+        // Parsed without env substitution: the site values are `${env:...}` placeholders.
+        let spec: OtelDataflowSpec =
+            serde_yaml::from_str(&deploy_text).expect("the deploy config parses");
+        spec.validate().expect("the deploy config validates");
+
+        let deploy: serde_yaml::Value = serde_yaml::from_str(&deploy_text).expect("yaml");
+        let mut buffered: serde_yaml::Value =
+            serde_yaml::from_str(&read("configs/series-parquet-buffered.yaml")).expect("yaml");
+        let nodes = ["groups", "default", "pipelines", "main", "nodes"];
+        let site_lines: [&[&str]; 4] = [
+            &["policies", "resources", "memory_limiter"],
+            &[
+                &nodes[..],
+                &["receiver", "config", "protocols", "grpc", "listening_addr"],
+            ]
+            .concat(),
+            &[&nodes[..], &["exporter", "config", "storage"]].concat(),
+            &[&nodes[..], &["exporter", "config", "writer_id"]].concat(),
+        ];
+        for path in site_lines {
+            let (last, parents) = path.split_last().expect("non-empty path");
+            let lookup = |mut value: &serde_yaml::Value| {
+                for key in parents {
+                    value = &value[*key];
+                }
+                value.get(*last).cloned()
+            };
+            let site = lookup(&deploy);
+            let mut parent = &mut buffered;
+            for key in parents {
+                parent = &mut parent[*key];
+            }
+            let parent = parent
+                .as_mapping_mut()
+                .expect("site line parent is a mapping");
+            match site {
+                Some(value) => _ = parent.insert((*last).into(), value),
+                None => _ = parent.remove(*last),
+            }
+        }
+        assert_eq!(
+            buffered, deploy,
+            "deploy/series-parquet/k8s/engine/engine.yaml differs from \
+             configs/series-parquet-buffered.yaml beyond its site lines"
+        );
+    }
+
     /// Kubernetes CRD compatibility tests.
     ///
     /// These tests ensure `OtelDataflowSpec` remains representable as a Kubernetes

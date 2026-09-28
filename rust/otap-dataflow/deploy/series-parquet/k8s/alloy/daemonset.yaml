@@ -1,0 +1,97 @@
+# A sketch: one Alloy per node tails one file and sends it to the engine
+# Service. The storage path is a host directory, so the file positions and the
+# sending queue survive a pod restart on the same node.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: series-parquet-alloy
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: series-parquet-alloy
+  template:
+    spec:
+      # Alloy saves its file positions and queue on a graceful stop.
+      terminationGracePeriodSeconds: 30
+      # Alloy runs as the image's alloy user with no capability. It reads the
+      # log files through their group: site value, the group that owns them
+      # and has read permission on them and their directory (4 is `adm` on
+      # Debian and Ubuntu hosts).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 473
+        runAsGroup: 473
+        supplementalGroups: [4]
+        seccompProfile:
+          type: RuntimeDefault
+      # The kubelet creates the storage host directory owned by root; this
+      # gives it to the alloy user, holding only CAP_CHOWN. It mounts it
+      # outside /var/lib/alloy, which only the alloy user may enter.
+      initContainers:
+        - name: storage-owner
+          image: grafana/alloy:v1.19.2
+          command: ["chown", "473:473", "/storage"]
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN"]
+          volumeMounts:
+            - name: data
+              mountPath: /storage
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.19.2
+          args:
+            - run
+            - --stability.level=public-preview
+            - --storage.path=/var/lib/alloy/data
+            # Serves /metrics beyond the pod, for the Alloy alerts; see
+            # networkpolicy.yaml for who reaches it.
+            - --server.http.listen-addr=0.0.0.0:12345
+            - /etc/alloy/config.alloy
+          env:
+            # The engine Service in the engine's namespace.
+            - name: OTLP_ENDPOINT
+              value: series-parquet.series-parquet.svc:4317
+            - name: SERIES_LOG_PATH
+              value: /var/log/app/app.log
+            - name: SERIES_SERVICE_NAME
+              value: app
+            # Unique per producer: the node name.
+            - name: SERIES_PRODUCER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http-metrics
+              containerPort: 12345
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alloy
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/alloy/data
+            - name: logs
+              mountPath: /var/log/app
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: series-parquet-alloy
+        - name: data
+          hostPath:
+            path: /var/lib/series-parquet-alloy
+            type: DirectoryOrCreate
+        - name: logs
+          hostPath:
+            path: /var/log/app
+            type: Directory

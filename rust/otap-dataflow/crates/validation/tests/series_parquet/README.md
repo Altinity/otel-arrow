@@ -28,6 +28,9 @@ the lake back with DuckDB:
   with `max_concurrent_requests: 1`; the receiver refuses exports at its
   concurrency limit with RESOURCE_EXHAUSTED and a RetryInfo delay, Alloy
   retries every one, and every line is stored.
+- `Minio.test_alert_families_exposed`: the buffered configuration provoked
+  into the failures the deployment example's alert rules watch, and its
+  `check.py` run on the engine's scrape.
 - `AlloyConfigs`: `alloy validate` of the Alloy image checks
   `configs/series-parquet.alloy` and `configs/series-parquet-strict.alloy`
   at the stability level they document.

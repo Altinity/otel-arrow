@@ -52,6 +52,8 @@ fi
 # without a default, where the variable is unset.
 export SERIES_S3_ACCESS_KEY_ID="${SERIES_S3_ACCESS_KEY_ID:-placeholder}"
 export SERIES_S3_SECRET_ACCESS_KEY="${SERIES_S3_SECRET_ACCESS_KEY:-placeholder}"
+export SERIES_S3_BASE_URI="${SERIES_S3_BASE_URI:-s3://placeholder/series}"
+export POD_NAME="${POD_NAME:-placeholder}"
 
 TOTAL=0
 PASSED=0

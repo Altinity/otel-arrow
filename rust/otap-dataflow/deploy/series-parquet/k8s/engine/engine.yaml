@@ -1,48 +1,20 @@
-# OTLP/gRPC through a durable buffer to an S3-compatible series/values
-# Parquet lake: the reference deployment for Grafana Alloy producers.
-#
-# Pipeline topology:
-#
-#   otlp receiver --> durable_buffer (WAL) --> series_parquet exporter --> S3
-#
-# An OK OTLP response means the request is written to the buffer's write-ahead
-# log on this host, not yet in the bucket; the exporter's acknowledgement goes
-# to the buffer, which retries a failed block until the store takes it. The
-# WAL is synced at most every 25ms and on each 100ms tick, so an acknowledged
-# request survives a process crash (SIGKILL, OOM) but a host crash or power
-# loss can lose the last ~100ms of acknowledged requests. The matching
-# producer is `series-parquet.alloy`. `series-parquet-s3.yaml` is the strict
-# alternative, whose OK means the rows are in the bucket.
-#
-# Sizing, alerts and failure behaviour are in the series_parquet exporter
-# README, "Deploying with Alloy". Build with
-# `--features series-parquet,aws,durable-buffer`, create the bucket and the
-# WAL directory before starting. The static credentials come from
-# SERIES_S3_ACCESS_KEY_ID and SERIES_S3_SECRET_ACCESS_KEY; the engine refuses
-# to start while either is unset.
-#
-# Shutdown: SIGTERM grants a 60s deadline. The exporter returns by the
-# deadline plus upload.abort_timeout (exporter README, "The drain"), whatever
-# the window and retry settings; what it has not written stays in the WAL and
-# is sent after the restart. A supervisor's grace period must exceed that.
-#
-# The bucket needs a lifecycle rule that aborts incomplete multipart uploads
-# (AbortIncompleteMultipartUpload, for example after one day): an upload a
-# failed write could not abort is left to it and counted in
-# flush.abort_failures.
-#
-# Metrics: http://127.0.0.1:8080/api/v1/telemetry/metrics?format=prometheus&reset=false
-# with --http-admin-bind 127.0.0.1:8080.
-#
-# Usage:
-#   df_engine --config configs/series-parquet-buffered.yaml \
-#     --http-admin-bind 127.0.0.1:8080
+# configs/series-parquet-buffered.yaml for Kubernetes. Only the site lines
+# differ: the receiver binds 0.0.0.0, writer_id is the pod name, the bucket,
+# region, endpoint and credentials come from the environment (site.env, the
+# Secret, or IRSA), and the memory limiter reads the pod's cgroup limit. Every
+# other setting and its reason is that file's; the config crate's tests check
+# that, and after an upgrade compare the two:
+#   diff configs/series-parquet-buffered.yaml deploy/series-parquet/k8s/engine/engine.yaml
 version: otel_dataflow/v1
 policies:
   resources:
     # One worker takes about 100k records/s behind the buffer; add a core per
     # 100k/s up to the WAL device's ceiling (README, "Deploying with Alloy").
     core_allocation: {type: core_count, count: 1}
+    # Refuses OTLP requests with RESOURCE_EXHAUSTED and a RetryInfo delay,
+    # which producers retry, once the cgroup working set passes 95% of the
+    # pod memory limit (soft 90%).
+    memory_limiter: {mode: enforce, source: auto}
 engine:
   telemetry: {reporting_interval: 1s}
 groups:
@@ -61,7 +33,7 @@ groups:
               protocols:
                 grpc:
                   # Bind the address the producers reach.
-                  listening_addr: "127.0.0.1:4317"
+                  listening_addr: "0.0.0.0:4317"
                   # The response waits for the WAL write (process-crash safe; see the header for power loss).
                   wait_for_result: true
                   # Above Alloy's 10s attempt timeout, so the producer's deadline ends an attempt first.
@@ -99,19 +71,14 @@ groups:
             config:
               storage:
                 s3:
-                  base_uri: s3://series-test/otel
-                  region: us-east-1
-                  endpoint: http://127.0.0.1:9000
-                  allow_http: true
-                  virtual_hosted_style_request: false
-                  # Payloads are signed. `unsigned_payload: true` skips the SHA-256
-                  # of every uploaded byte, which saves CPU, but leaves only TLS to
-                  # protect the bytes in transit: set it only with an https://
-                  # endpoint whose certificate is verified, never with this one.
-                  auth:
-                    type: static_credentials
-                    access_key_id: "${env:SERIES_S3_ACCESS_KEY_ID}"
-                    secret_access_key: "${env:SERIES_S3_SECRET_ACCESS_KEY}"
+                  base_uri: "${env:SERIES_S3_BASE_URI}"
+                  # Region, endpoint, credentials and path style come from the
+                  # AWS_* variables (site.env and the Secret) or IRSA.
+                  auth: {type: default}
+                  # unsigned_payload comes from AWS_UNSIGNED_PAYLOAD (site.env):
+                  # true skips the SHA-256 of every uploaded byte and leaves only
+                  # TLS to protect the bytes, so site.env sets it for the https://
+                  # AWS endpoint and its plain-HTTP MinIO overlay sets false.
               # Store-level retries end below flush_retry_deadline, as startup requires.
               retry:
                 max_retries: 5
@@ -119,7 +86,7 @@ groups:
                 max_backoff: 5s
                 backoff_base: 2.0
                 retry_timeout: 10s
-              writer_id: buffered_1
+              writer_id: "${env:POD_NAME}"
               producer_id_attribute: host.id
               window:
                 interval: 15s

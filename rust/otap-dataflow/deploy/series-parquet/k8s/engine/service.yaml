@@ -1,0 +1,31 @@
+# OTLP/gRPC for the producers. A gRPC connection stays on the pod it opened,
+# so producers spread over pods by connection, not by request.
+apiVersion: v1
+kind: Service
+metadata:
+  name: series-parquet
+spec:
+  selector:
+    app.kubernetes.io/name: series-parquet
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      appProtocol: grpc
+---
+# The StatefulSet's governing Service and the scrape target of the admin port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: series-parquet-headless
+  labels:
+    app.kubernetes.io/component: admin
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: series-parquet
+  publishNotReadyAddresses: true
+  ports:
+    - name: admin
+      port: 8080
+      targetPort: admin

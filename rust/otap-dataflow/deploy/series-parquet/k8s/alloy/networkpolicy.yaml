@@ -1,0 +1,24 @@
+# Takes effect only with a CNI that enforces NetworkPolicy. Alloy's HTTP
+# server also serves its UI, its configuration and debug endpoints, so only
+# the Prometheus pods reach it. Outbound traffic to the engine is not
+# restricted.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: series-parquet-alloy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: series-parquet-alloy
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: http-metrics
+      from:
+        # Site values, as in ../engine/networkpolicy.yaml.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
