@@ -110,6 +110,33 @@ mod test {
         assert_eq!(config, expected)
     }
 
+    /// Scenario: a parquet exporter S3 configuration over HTTPS with
+    /// `unsigned_payload` unset, and with it set.
+    /// Guarantees: the parquet exporter keeps the option as written, so the
+    /// shared store constructor it hands the storage to signs every payload
+    /// unless the user asked otherwise.
+    #[test]
+    fn unsigned_payload_is_kept_as_written() {
+        for (written, expected) in [(None, None), (Some(true), Some(true))] {
+            let mut s3 = json!({
+                "base_uri": "s3://bucket/parquet",
+                "endpoint": "https://s3.example.com",
+                "auth": { "type": "default" }
+            });
+            if let Some(unsigned) = written {
+                s3["unsigned_payload"] = unsigned.into();
+            }
+            let config: Config =
+                serde_json::from_value(json!({ "storage": { "s3": s3 } })).expect("valid config");
+            match config.storage {
+                StorageType::S3 {
+                    unsigned_payload, ..
+                } => assert_eq!(unsigned_payload, expected),
+                other => panic!("not S3: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn test_deserialize_explicit_retry() {
         let json_cfg = json!({
