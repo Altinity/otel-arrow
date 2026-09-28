@@ -49,6 +49,7 @@ use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
 use otel_arrow_dfe_engine::shared::capability::auth::bearer_token_authorizer::BearerTokenAuthorizer;
 use otel_arrow_dfe_engine::shared::receiver as shared;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
+use otel_arrow_dfe_otap::concurrency_shed_layer::ConcurrencyShedLayer;
 use otel_arrow_dfe_otap::memory_pressure_layer::MemoryPressureLayer;
 use otel_arrow_dfe_otap::otap_grpc::common;
 use otel_arrow_dfe_otap::otap_grpc::common::AckRegistry;
@@ -57,7 +58,7 @@ use otel_arrow_dfe_otap::otlp_http::HttpServerSettings;
 use otel_arrow_dfe_otap::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
 use otel_arrow_dfe_otap::rate_limit_layer::RateLimitLayer;
 use otel_arrow_dfe_otap::shared_concurrency::SharedConcurrencyLayer;
-use otel_arrow_dfe_telemetry::common_attributes::Outcome;
+use otel_arrow_dfe_telemetry::common_attributes::{Outcome, ReceiverRejectionErrorType};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
@@ -563,9 +564,10 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
             // ingress cannot exceed downstream capacity.
             //
             // Important: `SharedConcurrencyLayer` acquires permits in `poll_ready` (not in
-            // `call`), so tonic will apply backpressure and stop accepting new HTTP/2
-            // streams when the shared pool is saturated. This avoids unbounded queuing of
-            // parked request futures holding decoded payloads in memory.
+            // `call`), so a request finds a saturated pool before its payload is decoded:
+            // with `load_shed` the shed layer refuses it, otherwise tonic stops accepting
+            // new HTTP/2 streams. Either way no parked request future holds a decoded
+            // payload in memory.
             //
             // TODO(optimization): When `grpc_max == global_max` (the default case after
             // tuning), the per-protocol `GlobalConcurrencyLimitLayer` is redundant since
@@ -611,9 +613,21 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
                     forward_authorized_identity,
                 )
             });
+            // The shed layer sits outside every limit so a request that finds any
+            // of them full is refused with a retryable status.
+            let shed_layer = grpc_config.load_shed.then(|| {
+                let metrics = self.metrics.clone();
+                ConcurrencyShedLayer::new(move || {
+                    metrics.lock().record_rejection(
+                        OtlpProtocol::Grpc,
+                        ReceiverRejectionErrorType::ConcurrencyLimit,
+                    );
+                })
+            });
             // ServiceBuilder runs layers in insertion order, so admission limits
             // remain outside authorization and reject saturated requests first.
             let server_layers = ServiceBuilder::new()
+                .option_layer(shed_layer)
                 .layer(limit_layer)
                 .option_layer(authorization_layer);
             let mut server =
@@ -4923,6 +4937,73 @@ mod tests {
         }
     }
 
+    /// Scenario: a second gRPC connection sends while an unacknowledged request
+    /// holds the receiver's only `max_concurrent_requests` permit.
+    /// Guarantees: the refusal is RESOURCE_EXHAUSTED with a RetryInfo delay
+    /// (retryable for OTLP clients), names the limit, and counts one
+    /// `concurrency_limit` rejection.
+    #[test]
+    fn test_otlp_grpc_receiver_limit_refusal_is_retryable_and_counted() {
+        let test_runtime = TestRuntime::new();
+        let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut config = test_config(format!("127.0.0.1:{port}").parse().unwrap());
+        config
+            .protocols
+            .grpc
+            .as_mut()
+            .unwrap()
+            .max_concurrent_requests = 1;
+        let (receiver, metrics) = refusal_test_receiver(&test_runtime, config);
+        let held = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let validation = hold_first_request(held.clone(), release.clone(), 0);
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                ctx.check_then_shutdown(async {
+                    let first_endpoint = endpoint.clone();
+                    let first = tokio::spawn(async move {
+                        let mut client = LogsServiceClient::connect(first_endpoint).await.unwrap();
+                        client.export(create_logs_service_request()).await
+                    });
+                    timeout(Duration::from_secs(3), held.notified())
+                        .await
+                        .expect("Timed out waiting for the held request");
+
+                    let mut second_client = LogsServiceClient::connect(endpoint.clone())
+                        .await
+                        .expect("Failed to connect a second client");
+                    let second = second_client.export(create_logs_service_request()).await;
+                    let rejections =
+                        grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
+                    release.notify_one();
+                    let first = first.await.unwrap();
+
+                    let status =
+                        second.expect_err("the second request must be refused at the limit");
+                    assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+                    assert!(
+                        otel_arrow_dfe_otap::grpc_retry_info::retry_delay(&status).is_some(),
+                        "{status:?}"
+                    );
+                    assert!(
+                        status.message().contains("max_concurrent_requests"),
+                        "{status:?}"
+                    );
+                    assert_eq!(rejections, 1);
+                    assert!(first.is_ok(), "the held request must succeed: {first:?}");
+                })
+                .await;
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation_concurrent(validation);
+    }
+
     /// Scenario: an unacknowledged OTLP/HTTP request holds the only
     /// wait-for-result slot that gRPC shares, and a gRPC request arrives.
     /// Guarantees: the gRPC slot refusal is RESOURCE_EXHAUSTED with RetryInfo, names the limit, and
@@ -4981,6 +5062,71 @@ mod tests {
                     assert_eq!(rejections, 1);
                     let (http_status, _) = http.expect("HTTP response");
                     assert_eq!(http_status, http::StatusCode::OK);
+                })
+                .await;
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation_concurrent(validation);
+    }
+
+    /// Scenario: one gRPC connection sends two requests while
+    /// `transport_concurrency_limit` is 1 and the receiver-wide limit is 2.
+    /// Guarantees: the second request waits for the connection's permit and
+    /// succeeds; nothing is refused or counted.
+    #[test]
+    fn test_otlp_grpc_connection_limit_queues_instead_of_refusing() {
+        let test_runtime = TestRuntime::new();
+        let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut config = test_config(format!("127.0.0.1:{port}").parse().unwrap());
+        let grpc = config.protocols.grpc.as_mut().unwrap();
+        grpc.max_concurrent_requests = 2;
+        grpc.transport_concurrency_limit = Some(1);
+        let (receiver, metrics) = refusal_test_receiver(&test_runtime, config);
+        let held = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let validation = hold_first_request(held.clone(), release.clone(), 1);
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                ctx.check_then_shutdown(async {
+                    let client = LogsServiceClient::connect(endpoint.clone())
+                        .await
+                        .expect("Failed to connect");
+                    let mut first_client = client.clone();
+                    let first = tokio::spawn(async move {
+                        first_client.export(create_logs_service_request()).await
+                    });
+                    timeout(Duration::from_secs(3), held.notified())
+                        .await
+                        .expect("Timed out waiting for the held request");
+
+                    let mut second_client = client.clone();
+                    let second = tokio::spawn(async move {
+                        second_client.export(create_logs_service_request()).await
+                    });
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let finished_early = second.is_finished();
+                    release.notify_one();
+                    let first = first.await.unwrap();
+                    let second = second.await.unwrap();
+                    let rejections =
+                        grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
+
+                    assert!(
+                        !finished_early,
+                        "the second request must wait for the connection permit: {second:?}"
+                    );
+                    assert!(first.is_ok(), "the held request must succeed: {first:?}");
+                    assert!(
+                        second.is_ok(),
+                        "the queued request must succeed: {second:?}"
+                    );
+                    assert_eq!(rejections, 0);
                 })
                 .await;
             }) as Pin<Box<dyn Future<Output = ()>>>

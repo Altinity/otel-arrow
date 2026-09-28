@@ -145,6 +145,11 @@ pub fn tune_max_concurrent_requests(config: &mut GrpcServerSettings, downstream_
 }
 
 /// Applies the shared server tuning options to a tonic server builder.
+///
+/// A request over `transport_concurrency_limit` waits on its connection: tonic's own shedding
+/// would answer RESOURCE_EXHAUSTED without RetryInfo (see [`crate::grpc_retry_info`]).
+/// Refusals at `max_concurrent_requests` come from
+/// [`crate::concurrency_shed_layer::ConcurrencyShedLayer`] instead.
 pub fn apply_server_tuning<L>(builder: Server<L>, config: &GrpcServerSettings) -> Server<L> {
     let transport_limit = config
         .transport_concurrency_limit
@@ -156,7 +161,7 @@ pub fn apply_server_tuning<L>(builder: Server<L>, config: &GrpcServerSettings) -
 
     let mut builder = builder
         .concurrency_limit_per_connection(transport_limit)
-        .load_shed(config.load_shed)
+        .load_shed(false)
         .initial_stream_window_size(config.initial_stream_window_size)
         .initial_connection_window_size(config.initial_connection_window_size)
         .max_frame_size(config.max_frame_size)
@@ -179,4 +184,86 @@ pub fn apply_server_tuning<L>(builder: Server<L>, config: &GrpcServerSettings) -
     }
 
     builder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::{
+        ExportLogsServiceRequest, ExportLogsServiceResponse,
+        logs_service_client::LogsServiceClient,
+        logs_service_server::{LogsService, LogsServiceServer},
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tonic::{Request, Response, Status};
+
+    /// Holds every request until released.
+    struct HoldingLogs {
+        held: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl LogsService for HoldingLogs {
+        async fn export(
+            &self,
+            _request: Request<ExportLogsServiceRequest>,
+        ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+            self.held.notify_one();
+            self.release.notified().await;
+            Ok(Response::new(ExportLogsServiceResponse::default()))
+        }
+    }
+
+    /// Scenario: one connection holds its only transport permit and sends a second request.
+    /// Guarantees: the second request waits for the permit instead of being refused.
+    #[tokio::test]
+    async fn a_request_over_the_connection_limit_waits() {
+        let config = GrpcServerSettings {
+            max_concurrent_requests: 2,
+            transport_concurrency_limit: Some(1),
+            ..GrpcServerSettings::default()
+        };
+        let held = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let service = LogsServiceServer::new(HoldingLogs {
+            held: held.clone(),
+            release: release.clone(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let server = tokio::spawn(
+            apply_server_tuning(Server::builder(), &config)
+                .add_service(service)
+                .serve_with_incoming(incoming),
+        );
+
+        let client = LogsServiceClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let mut first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .export(ExportLogsServiceRequest::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), held.notified())
+            .await
+            .expect("the first request reaches the service");
+
+        let mut second_client = client.clone();
+        let second = tokio::time::timeout(
+            Duration::from_millis(500),
+            second_client.export(ExportLogsServiceRequest::default()),
+        )
+        .await;
+        release.notify_waiters();
+        release.notify_one();
+        let _ = first.await;
+        server.abort();
+        assert!(second.is_err(), "the second request waits for the permit");
+    }
 }

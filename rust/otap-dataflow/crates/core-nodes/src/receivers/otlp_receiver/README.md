@@ -245,11 +245,13 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   retry delay of 1 to 3 seconds, since the exact one is not known yet. Exact
   retry guidance or non-retryable oversized classification is available
   only after the weighted admission point.
-- A gRPC request that finds no free wait-for-result slot is refused with
-  `RESOURCE_EXHAUSTED` and counted as `concurrency_limit`; OTLP/HTTP answers a
-  request that finds no permit in time 503. Both carry a random retry delay of
-  1 to 3 seconds, as `RetryInfo` on gRPC and `Retry-After` on OTLP/HTTP, so
-  clients refused together do not retry together.
+- A gRPC request that finds no free `max_concurrent_requests` permit or
+  wait-for-result slot is refused with `RESOURCE_EXHAUSTED` and counted as
+  `concurrency_limit`. With `load_shed: false` it waits for a permit instead. A
+  request over `transport_concurrency_limit` waits on its connection and is
+  never refused. The refusal carries a random retry delay of 1 to 3 seconds,
+  as `RetryInfo` on gRPC and `Retry-After` on OTLP/HTTP 503, so clients
+  refused together do not retry together.
 - `wait_for_result` reflects the immediate downstream node, not necessarily the
   final exporter.
 
