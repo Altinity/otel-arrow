@@ -3,15 +3,8 @@
 
 //! Configuration for the durable buffer.
 //!
-//! # Dispatch Strategy
-//!
-//! The durable buffer should be connected with `RoundRobin` (or `Random`/`LeastLoaded`)
-//! dispatch on its incoming edge. Using `Broadcast` will cause each message to be persisted
-//! multiple times (once per core), leading to:
-//! - Nx storage consumption
-//! - Nx duplicate messages forwarded downstream
-//!
-//! See the [module documentation](super) for more details.
+//! A connection that feeds several durable buffers uses the `one_of` dispatch
+//! policy; see the [module documentation](super).
 
 use std::path::PathBuf;
 use std::time::Duration;

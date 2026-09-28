@@ -754,6 +754,20 @@ impl<P: SegmentProvider> SubscriberRegistry<P> {
             .min()
     }
 
+    /// The least of each subscriber's first answer `probe` gives for its
+    /// incomplete segments, oldest first (see
+    /// [`SubscriberState::first_incomplete`]).
+    pub fn oldest_incomplete_with<T: Ord>(
+        &self,
+        mut probe: impl FnMut(SegmentSeq) -> Option<T>,
+    ) -> Option<T> {
+        self.subscribers
+            .read()
+            .values()
+            .filter_map(|state_lock| state_lock.read().first_incomplete(&mut probe))
+            .min()
+    }
+
     /// Returns the minimum of the highest tracked segment across all active subscribers.
     ///
     /// When all tracked segments are complete (i.e., `oldest_incomplete_segment()` returns
