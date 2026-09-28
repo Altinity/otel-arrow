@@ -1,0 +1,11 @@
+# Direct dependencies of the series_parquet end-to-end suite, pinned.
+# `requirements.lock.txt` pins every transitive dependency with hashes;
+# install with
+#   pip install --require-hashes -r requirements.lock.txt
+# and regenerate it after changing a pin with the pip-compile command at its
+# top.
+boto3==1.43.99
+duckdb==1.5.5
+grpcio==1.84.0
+opentelemetry-proto==1.44.0
+PyYAML==6.0.3

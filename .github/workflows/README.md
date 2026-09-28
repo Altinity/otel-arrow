@@ -35,6 +35,9 @@ check depends on them:
 
 - [`series-lake-golden.yml`](series-lake-golden.yml): regenerates the
   series-lake golden vectors with the independent Python generator.
+- [`series-parquet-e2e.yml`](series-parquet-e2e.yml): builds `df_engine` and
+  runs the series_parquet end-to-end suite against local files, MinIO and
+  Alloy in Docker.
 
 ## Caching and artifacts
 
