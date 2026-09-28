@@ -93,6 +93,7 @@ use crate::proto::OtlpProtoMessage;
 use crate::views::otlp::bytes::logs::RawLogsData;
 use crate::views::otlp::bytes::metrics::RawMetricsData;
 use crate::views::otlp::bytes::traces::RawTraceData;
+use crate::views::otlp::bytes::validate;
 use crate::{TryFromWithOptions, TryIntoWithOptions};
 use bytes::BytesMut;
 use otel_arrow_dfe_config::{ConversionOptions, SignalFormat, SignalType};
@@ -235,6 +236,28 @@ impl OtapPayload {
     /// Consumes this payload and extracts or converts it to OTAP records.
     pub fn into_otap(self) -> Result<OtapArrowRecords, crate::encode::Error> {
         self.try_into_with_default()
+    }
+
+    /// Check the protobuf framing of an OTLP body and of every message nested
+    /// in it, which the conversion to OTAP records reads lazily and never
+    /// refuses; see [`crate::views::otlp::bytes::validate`] for what is
+    /// checked. A payload of Arrow records has no framing and passes.
+    ///
+    /// # Errors
+    /// [`Error::InvalidOtlpWireFormat`] naming the problem, the innermost
+    /// message holding it and its byte offset, or [`Error::OtlpNestingTooDeep`].
+    pub fn validate_otlp_framing(&self) -> Result<(), Error> {
+        let PayloadData::OtlpBytes(bytes) = &self.data else {
+            return Ok(());
+        };
+        let root = match bytes {
+            OtlpProtoBytes::ExportLogsRequest(_) => validate::Message::ExportLogsServiceRequest,
+            OtlpProtoBytes::ExportMetricsRequest(_) => {
+                validate::Message::ExportMetricsServiceRequest
+            }
+            OtlpProtoBytes::ExportTracesRequest(_) => validate::Message::ExportTraceServiceRequest,
+        };
+        validate::validate_request(bytes.as_bytes(), root)
     }
 
     /// Returns the type of signal represented by this `OtapPdata` instance.
