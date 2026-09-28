@@ -85,6 +85,25 @@ impl<PData> TestContext<PData> {
         .await
     }
 
+    /// Awaits `checks`, sends shutdown even if they panicked, then re-raises the panic.
+    ///
+    /// A scenario that panics before shutdown leaves the receiver serving, and
+    /// `run_validation_concurrent` waits for it forever.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the panic of `checks`, which takes precedence over a failed shutdown
+    /// (the receiver may already have exited); panics on a failed shutdown only when
+    /// `checks` succeeded.
+    pub async fn check_then_shutdown<F: Future<Output = ()>>(&self, checks: F) {
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        let shutdown = self.send_shutdown(Instant::now(), "Test complete").await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        shutdown.expect("Failed to send shutdown");
+    }
+
     /// Sleeps for the specified duration.
     pub async fn sleep(&self, duration: Duration) {
         sleep(duration).await;
@@ -438,5 +457,40 @@ impl<PData> ValidationPhase<PData> {
         self.rt
             .block_on(validation_handle)
             .expect("Validation task failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn closed_context() -> TestContext<()> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        TestContext {
+            control_sender: Sender::Shared(SharedSender::mpsc(sender)),
+        }
+    }
+
+    fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+        panic
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default()
+    }
+
+    /// Scenario: the checks panic and the receiver is already gone, so shutdown fails too.
+    /// Guarantees: `check_then_shutdown` re-raises the checks' panic, not the shutdown error.
+    #[test]
+    fn check_panic_wins_over_failed_shutdown() {
+        let context = closed_context();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(context.check_then_shutdown(async {
+                panic!("original check failure");
+            }));
+        }))
+        .expect_err("the check failure must propagate");
+        assert_eq!(panic_message(panic), "original check failure");
     }
 }

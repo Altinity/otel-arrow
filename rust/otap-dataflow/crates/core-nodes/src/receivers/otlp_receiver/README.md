@@ -236,10 +236,20 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   the configured burst is rejected as non-retryable while pressure gating is
   active: HTTP returns 413 without `Retry-After`, and gRPC sends negative retry
   pushback.
+- A request refused by the rate limit or hard memory pressure can succeed on
+  retry: HTTP returns 503 with `Retry-After`, and gRPC returns
+  `RESOURCE_EXHAUSTED` with a `google.rpc.RetryInfo` detail (also sent as
+  `grpc-retry-pushback-ms`), which OTLP clients need to retry it.
 - An exhausted receiver may reject before decompressed request weight is known.
-  This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response has no retry hint.
-  Exact retry guidance or non-retryable oversized classification is available
+  This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response carries a random
+  retry delay of 1 to 3 seconds, since the exact one is not known yet. Exact
+  retry guidance or non-retryable oversized classification is available
   only after the weighted admission point.
+- A gRPC request that finds no free wait-for-result slot is refused with
+  `RESOURCE_EXHAUSTED` and counted as `concurrency_limit`; OTLP/HTTP answers a
+  request that finds no permit in time 503. Both carry a random retry delay of
+  1 to 3 seconds, as `RetryInfo` on gRPC and `Retry-After` on OTLP/HTTP, so
+  clients refused together do not retry together.
 - `wait_for_result` reflects the immediate downstream node, not necessarily the
   final exporter.
 

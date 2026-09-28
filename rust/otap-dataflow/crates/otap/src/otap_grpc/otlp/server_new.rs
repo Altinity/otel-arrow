@@ -19,6 +19,7 @@ use std::task::Poll;
 
 use crate::accessory::slots::{Key as SlotKey, State as SlotsState};
 use crate::bearer_authorization::{AuthorizationRejection, authorize_bearer};
+use crate::concurrency_shed_layer::grpc_concurrency_limit_status;
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
 use crate::pdata::{Context, OtapPdata};
 use crate::rate_limit_layer::{
@@ -490,10 +491,7 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                                 OtlpProtocol::Grpc,
                                 ReceiverRejectionErrorType::ConcurrencyLimit,
                             );
-                            return Err(processing.refused(
-                                signal,
-                                Status::resource_exhausted("Too many concurrent requests"),
-                            ));
+                            return Err(processing.refused(signal, grpc_concurrency_limit_status()));
                         }
                         Some(pair) => pair,
                     };
@@ -1488,7 +1486,8 @@ mod tests {
     }
 
     /// Scenario: A non-empty gRPC request cannot allocate its acknowledgement slot.
-    /// Guarantees: The request is rejected without incrementing the OTLP accepted counter.
+    /// Guarantees: The request is refused with RESOURCE_EXHAUSTED and a retry delay, counted as
+    /// `concurrency_limit`, and not counted as accepted.
     #[tokio::test]
     async fn rejected_grpc_request_is_not_accepted() {
         let metrics = new_test_metrics();

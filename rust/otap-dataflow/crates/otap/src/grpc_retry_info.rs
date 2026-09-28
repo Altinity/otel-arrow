@@ -3,6 +3,14 @@
 
 //! `google.rpc.RetryInfo` on gRPC refusals: the retry delay OTLP clients read
 //! from the `grpc-status-details-bin` trailer.
+//!
+//! The receivers refuse a request that can succeed later (concurrency limit,
+//! rate limit, memory pressure) with RESOURCE_EXHAUSTED, as RFC 0002
+//! (pressure-aware rate throttling) specifies. The OTLP specification makes
+//! RESOURCE_EXHAUSTED retryable only with a RetryInfo detail, so
+//! spec-following clients, such as the Go collector's exporters, drop it
+//! without one; this repository's exporters retry it either way. Each refusal
+//! therefore carries its delay as RetryInfo and as `grpc-retry-pushback-ms`.
 
 use crate::otlp_http::RpcStatus;
 use prost::Message;

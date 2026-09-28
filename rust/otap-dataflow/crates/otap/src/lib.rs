@@ -47,8 +47,14 @@ pub mod memory_pressure_layer;
 /// Shared ingress shedding based on receiver-local rate limits.
 pub mod rate_limit_layer;
 
+/// Retryable gRPC refusal at the receiver's concurrency limit.
+pub mod concurrency_shed_layer;
+
 /// `google.rpc.RetryInfo` details on retryable gRPC refusals.
 pub mod grpc_retry_info;
+
+/// Rate limit of per-request refusal WARN lines.
+pub mod log_gate;
 
 /// Shared mapping from a pipeline NACK to OTLP wire status codes.
 mod nack_status;

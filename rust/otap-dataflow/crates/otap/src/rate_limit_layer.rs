@@ -3,6 +3,7 @@
 
 //! Tower middleware that rejects gRPC requests when a receiver rate bucket is exhausted.
 
+use crate::grpc_retry_info::status_with_retry_delay;
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
 use futures::future::Either;
 use http::{Request, Response};
@@ -12,24 +13,37 @@ use parking_lot::Mutex;
 use std::future::{Ready, ready};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tonic::{Code, Status, body::Body, metadata::MetadataMap};
 use tower::{Layer, Service};
 
-/// Builds a gRPC `resource_exhausted` status with retry pushback metadata.
+/// Builds a gRPC `resource_exhausted` status carrying the retry delay as RetryInfo
+/// and retry pushback metadata (see [`crate::grpc_retry_info`]).
 #[must_use]
 pub fn grpc_rate_limit_status(retry_after_secs: u32) -> Status {
-    let mut metadata = MetadataMap::new();
-    let retry_pushback_ms = u64::from(retry_after_secs.max(1)) * 1_000;
-    if let Ok(value) = retry_pushback_ms.to_string().parse() {
-        let _ = metadata.insert("grpc-retry-pushback-ms", value);
-    }
-    Status::with_metadata(Code::ResourceExhausted, "rate limit", metadata)
+    status_with_retry_delay(
+        Code::ResourceExhausted,
+        "rate limit",
+        Duration::from_secs(u64::from(retry_after_secs.max(1))),
+    )
 }
 
 /// Builds a gRPC `resource_exhausted` status for a weight-blind saturation refusal.
+///
+/// The request's weight, and so its exact recovery delay, is not known yet, so the
+/// status carries a retry delay drawn from
+/// [`crate::concurrency_shed_layer::CONCURRENCY_LIMIT_RETRY_AFTER_SECS`], whose jitter
+/// spreads the retries of clients refused together. RFC 0002 gives this early
+/// refusal no retry guidance; without RetryInfo, OTLP clients would not retry it.
 #[must_use]
 pub fn grpc_rate_limit_saturated_status() -> Status {
-    Status::new(Code::ResourceExhausted, "rate limit")
+    status_with_retry_delay(
+        Code::ResourceExhausted,
+        "rate limit",
+        Duration::from_secs(u64::from(rand::random_range(
+            crate::concurrency_shed_layer::CONCURRENCY_LIMIT_RETRY_AFTER_SECS,
+        ))),
+    )
 }
 
 /// Builds a non-retryable gRPC status for a request larger than the configured burst.
@@ -305,24 +319,45 @@ mod tests {
         );
     }
 
-    /// Scenario: gRPC rejects a saturated receiver before request weight is known.
-    /// Guarantees: the generic refusal is resource-exhausted without request-specific
-    /// retry pushback metadata.
+    /// Scenario: 200 gRPC refusals of a saturated receiver before request weight is known.
+    /// Guarantees: each is RESOURCE_EXHAUSTED with a `google.rpc.RetryInfo` delay of
+    /// 1 to 3 whole seconds equal to its `grpc-retry-pushback-ms`, and the delays differ.
     #[test]
-    fn saturated_status_omits_retry_pushback() {
-        let status = grpc_rate_limit_saturated_status();
-
-        assert_eq!(status.code(), Code::ResourceExhausted);
-        assert!(status.metadata().get("grpc-retry-pushback-ms").is_none());
+    fn saturated_status_carries_jittered_retry_info() {
+        let delays: std::collections::BTreeSet<i64> = (0..200)
+            .map(|_| {
+                let status = grpc_rate_limit_saturated_status();
+                assert_eq!(status.code(), Code::ResourceExhausted);
+                let delay = crate::grpc_retry_info::retry_delay(&status).expect("RetryInfo");
+                assert_eq!(delay.nanos, 0);
+                let pushback_ms = status
+                    .metadata()
+                    .get("grpc-retry-pushback-ms")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                assert_eq!(pushback_ms, Some((delay.seconds * 1_000).to_string()));
+                delay.seconds
+            })
+            .collect();
+        assert!(delays.iter().all(|d| (1..=3).contains(d)), "{delays:?}");
+        assert!(delays.len() > 1, "{delays:?}");
     }
 
     /// Scenario: gRPC rejects a request after its weighted recovery delay is known.
-    /// Guarantees: the authoritative refusal retains exact positive retry pushback.
+    /// Guarantees: the authoritative refusal is RESOURCE_EXHAUSTED and carries the exact
+    /// delay as a `google.rpc.RetryInfo` detail and as retry pushback.
     #[test]
     fn weighted_status_includes_retry_pushback() {
         let status = grpc_rate_limit_status(14);
 
         assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(
+            crate::grpc_retry_info::retry_delay(&status),
+            Some(prost_types::Duration {
+                seconds: 14,
+                nanos: 0
+            })
+        );
         assert_eq!(
             status
                 .metadata()
@@ -333,7 +368,8 @@ mod tests {
     }
 
     /// Scenario: the gRPC rate bucket is exhausted while soft pressure is active.
-    /// Guarantees: rate fast-fail rejects before polling the inner concurrency-limited service.
+    /// Guarantees: rate fast-fail rejects before polling the inner concurrency-limited service,
+    /// with RESOURCE_EXHAUSTED carrying a retry delay (RetryInfo and pushback).
     #[test]
     fn exhausted_rate_limit_short_circuits_before_inner_readiness_and_call() {
         let state = MemoryPressureState::default();
@@ -375,7 +411,8 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("8")
         );
-        assert!(!response.headers().contains_key("grpc-retry-pushback-ms"));
+        assert!(response.headers().contains_key("grpc-retry-pushback-ms"));
+        assert!(response.headers().contains_key("grpc-status-details-bin"));
 
         let metrics = metrics.lock();
         assert_eq!(
