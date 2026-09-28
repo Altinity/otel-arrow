@@ -256,6 +256,10 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
 - A gRPC message above `max_decoding_message_size`, on the wire or after
   decompression, is refused with `INVALID_ARGUMENT`, which OTLP clients do not
   retry, and counted as `payload_too_large`. OTLP/HTTP answers 400.
+- The conversion to OTAP records, wherever a pipeline runs it, takes at most
+  65,536 attributed log records, spans or metrics per request, and as many
+  scopes and resources; a larger request fails as a whole. Keep producer
+  batches within it, for example `send_batch_max_size: 65536`.
 - `wait_for_result` reflects the immediate downstream node, not necessarily the
   final exporter.
 

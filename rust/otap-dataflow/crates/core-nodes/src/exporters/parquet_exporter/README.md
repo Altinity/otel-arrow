@@ -140,7 +140,7 @@ channel and is not duplicated by the exporter.
 
 | Event | Severity | Description |
 | --- | --- | --- |
-| *None* | N/A | No node-specific events are emitted. |
+| `parquet_exporter.conversion_failed` | `warn` | A request the conversion to Arrow records refuses (more than 65,536 resources, scopes or records, or an id delta that overflows) was dropped as a failed export; at most one line per second, `suppressed` counting the lines left out. |
 
 ## Limits
 

@@ -15,6 +15,7 @@
 //! native types. It will handle converting between different builders dynamically  based on the
 //! data which is appended.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -22,6 +23,7 @@ use arrow::array::{
     DictionaryArray, FixedSizeBinaryBuilder, FixedSizeBinaryDictionaryBuilder, PrimitiveBuilder,
     PrimitiveDictionaryBuilder, StringArray, StringBuilder, StringDictionaryBuilder,
 };
+use arrow::datatypes::ArrowNativeType;
 use arrow::datatypes::{
     ArrowDictionaryKeyType, DataType, DurationNanosecondType, Float32Type, Float64Type, Int8Type,
     Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -754,6 +756,43 @@ pub type TimestampNanosecondArrayBuilder = AdaptiveArrayBuilder<
 >;
 pub type DurationNanosecondArrayBuilder = PrimitiveArrayBuilder<DurationNanosecondType>;
 
+thread_local! {
+    /// String values [`binary_to_utf8_array`] has replaced lossily on this
+    /// thread, read by [`count_utf8_repairs`].
+    static UTF8_REPAIRS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Run `convert` and return its result together with the number of string
+/// values it stored with U+FFFD in place of invalid UTF-8.
+///
+/// The conversion from OTLP to OTAP records repairs invalid UTF-8 in a
+/// top-level string (see [`binary_to_utf8_array`]) and refuses the request
+/// when it sits inside an array or key-value list value, which is encoded as
+/// CBOR; a caller that reports the repairs wraps the conversion in this. A value of a dictionary-encoded column counts once per
+/// row that references it. Calls may nest: an outer call counts the repairs of
+/// an inner one too, also when the inner closure panics.
+pub fn count_utf8_repairs<T>(convert: impl FnOnce() -> T) -> (T, u64) {
+    /// Adds the enclosing call's count back on drop, unwinding included.
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UTF8_REPAIRS.set(self.0 + UTF8_REPAIRS.get());
+        }
+    }
+    let restore = Restore(UTF8_REPAIRS.replace(0));
+    let result = convert();
+    let repaired = UTF8_REPAIRS.get();
+    drop(restore);
+    (result, repaired)
+}
+
+/// Add `repaired` to this thread's count of lossy UTF-8 repairs.
+fn record_utf8_repairs(repaired: usize) {
+    if repaired > 0 {
+        UTF8_REPAIRS.set(UTF8_REPAIRS.get() + repaired as u64);
+    }
+}
+
 /// Convert an array containing binary data to one which contains UTF-8 Data. This will handle
 /// converting either a native array (e.g. [`BinaryArray`] to [`StringArray`]) or
 /// [`DictionaryArray`]s where the values are [`DataType::Binary`].
@@ -761,6 +800,8 @@ pub type DurationNanosecondArrayBuilder = PrimitiveArrayBuilder<DurationNanoseco
 /// If any value contains invalid UTF-8, the invalid byte sequences are replaced with the
 /// Unicode replacement character (U+FFFD `?`) using lossy conversion, ensuring that a single
 /// malformed value never causes the entire batch to fail.
+///
+/// Each replaced value is counted for [`count_utf8_repairs`].
 ///
 /// Returns an error if the passed source array does not contain binary data.
 pub fn binary_to_utf8_array(src: &ArrayRef) -> Result<ArrayRef, ArrowError> {
@@ -772,7 +813,9 @@ pub fn binary_to_utf8_array(src: &ArrayRef) -> Result<ArrayRef, ArrowError> {
             .as_any()
             .downcast_ref::<BinaryArray>()
             .expect("is binary array");
-        return Ok(binary_to_utf8_lossy(binary_arr));
+        let (array, repaired) = binary_to_utf8_lossy(binary_arr);
+        record_utf8_repairs(repaired.len());
+        return Ok(array);
     }
 
     if let DataType::Dictionary(k, v) = src_data_type {
@@ -796,27 +839,33 @@ pub fn binary_to_utf8_array(src: &ArrayRef) -> Result<ArrayRef, ArrowError> {
 }
 
 /// Convert a [`BinaryArray`] to a [`StringArray`], replacing any invalid UTF-8 byte sequences
-/// with the Unicode replacement character (U+FFFD `?`).
+/// with the Unicode replacement character (U+FFFD `?`), and return the indexes of the values it
+/// replaced.
 ///
 /// Uses a fast path that attempts a zero-copy conversion first. If the entire values buffer is
 /// valid UTF-8, no additional allocation is needed. Only when invalid UTF-8 is encountered does
 /// it fall back to a per-value lossy conversion.
-fn binary_to_utf8_lossy(binary_arr: &BinaryArray) -> ArrayRef {
+fn binary_to_utf8_lossy(binary_arr: &BinaryArray) -> (ArrayRef, Vec<usize>) {
     // Fast path: try zero-copy batch conversion (validates entire buffer in one pass).
     if let Ok(arr) = StringArray::try_from_binary(binary_arr.clone()) {
-        return Arc::new(arr) as ArrayRef;
+        return (Arc::new(arr) as ArrayRef, Vec::new());
     }
 
     // Slow path: at least one value has invalid UTF-8. Rebuild per-value with lossy conversion.
     let mut builder = StringBuilder::with_capacity(binary_arr.len(), binary_arr.value_data().len());
+    let mut repaired = Vec::new();
     for i in 0..binary_arr.len() {
         if binary_arr.is_null(i) {
             builder.append_null();
         } else {
-            builder.append_value(String::from_utf8_lossy(binary_arr.value(i)));
+            let value = String::from_utf8_lossy(binary_arr.value(i));
+            if matches!(value, std::borrow::Cow::Owned(_)) {
+                repaired.push(i);
+            }
+            builder.append_value(value);
         }
     }
-    Arc::new(builder.finish()) as ArrayRef
+    (Arc::new(builder.finish()) as ArrayRef, repaired)
 }
 
 fn binary_dict_to_utf8_dict_array<K: ArrowDictionaryKeyType>(
@@ -841,7 +890,18 @@ fn binary_dict_to_utf8_dict_array<K: ArrowDictionaryKeyType>(
                 dict_arr.value_type()
             ))
         })?;
-    let new_values = binary_to_utf8_lossy(values);
+    let (new_values, repaired) = binary_to_utf8_lossy(values);
+    if !repaired.is_empty() {
+        let mut is_repaired = vec![false; values.len()];
+        for index in repaired {
+            is_repaired[index] = true;
+        }
+        let keys = dict_arr.keys();
+        let rows = (0..keys.len())
+            .filter(|&row| keys.is_valid(row) && is_repaired[keys.value(row).as_usize()])
+            .count();
+        record_utf8_repairs(rows);
+    }
 
     Ok(Arc::new(DictionaryArray::new(
         dict_arr.keys().clone(),
@@ -1853,5 +1913,67 @@ pub mod test {
         assert_eq!(result.value(0), "ok");
         assert!(result.is_null(1));
         assert_eq!(result.value(2), "\u{FFFD}"); // lone continuation byte replaced
+    }
+
+    /// Scenario: `binary_to_utf8_array` over valid values, over a native array
+    /// holding two invalid values and a null, and over a dictionary whose one
+    /// invalid value three rows reference and whose one row is null, the last
+    /// two inside a nested `count_utf8_repairs`.
+    /// Guarantees: valid values count nothing, each replaced native value
+    /// counts once, a replaced dictionary value counts once per row that
+    /// references it, and an outer count includes an inner one.
+    #[test]
+    fn utf8_repairs_are_counted_per_row() {
+        let convert = |array: ArrayRef| binary_to_utf8_array(&array).unwrap();
+        let (_, valid) =
+            count_utf8_repairs(|| convert(Arc::new(BinaryArray::from_iter_values([b"a", b"b"]))));
+        assert_eq!(valid, 0);
+
+        let (inner, outer) = count_utf8_repairs(|| {
+            let (_, native) = count_utf8_repairs(|| {
+                convert(Arc::new(BinaryArray::from_iter([
+                    Some(&[0xffu8][..]),
+                    None,
+                    Some(b"ok"),
+                    Some(&[0xc3u8][..]),
+                ])))
+            });
+            let keys = UInt8Array::from_iter([Some(1), Some(0), Some(1), None, Some(1)]);
+            let dict = DictionaryArray::new(
+                keys,
+                Arc::new(BinaryArray::from_iter_values([b"valid" as &[u8], &[0xfe]])),
+            );
+            let (_, dictionary) = count_utf8_repairs(|| convert(Arc::new(dict)));
+            (native, dictionary)
+        });
+        assert_eq!(inner, (2, 3));
+        assert_eq!(outer, 5);
+    }
+
+    /// Scenario: an outer `count_utf8_repairs` whose closure repairs one value,
+    /// then runs an inner `count_utf8_repairs` that repairs one more and
+    /// panics, catches the panic, and repairs a third.
+    /// Guarantees: the outer call reports all three: an unwinding inner call
+    /// restores the enclosing count and adds its own repairs to it.
+    #[test]
+    fn a_panicking_inner_count_keeps_the_outer_count() {
+        let convert = || {
+            let _ = binary_to_utf8_array(
+                &(Arc::new(BinaryArray::from_iter_values([&[0xffu8][..]])) as ArrayRef),
+            )
+            .unwrap();
+        };
+        let ((), repaired) = count_utf8_repairs(|| {
+            convert();
+            let unwound = std::panic::catch_unwind(|| {
+                count_utf8_repairs(|| {
+                    convert();
+                    panic!("inner conversion failed");
+                })
+            });
+            assert!(unwound.is_err());
+            convert();
+        });
+        assert_eq!(repaired, 3);
     }
 }

@@ -33,9 +33,9 @@ use crate::{
     otap::transform::{
         create_next_element_equality_array, create_next_eq_array_for_array,
         materialize_parent_id_for_attributes, materialize_parent_id_for_exemplars,
-        materialize_parent_ids_by_columns, remove_delta_encoding,
-        remove_delta_encoding_from_column, sort_to_indices,
+        materialize_parent_ids_by_columns, remove_delta_encoding, sort_to_indices,
         transport_optimize::attributes::transport_optimize_encode_attrs,
+        try_remove_delta_encoding_from_column,
     },
     otlp::attributes::{AttributeValueType, parent_id::ParentId},
     proto::opentelemetry::arrow::v1::ArrowPayloadType,
@@ -946,7 +946,8 @@ pub fn remove_transport_optimized_encodings(
                             actual: struct_ids.data_type().clone(),
                         })?;
 
-                    let new_struct_ids = remove_delta_encoding_from_column(struct_ids);
+                    let new_struct_ids =
+                        try_remove_delta_encoding_from_column(struct_ids, struct_id_path)?;
                     replace_column(
                         struct_id_path,
                         None,
