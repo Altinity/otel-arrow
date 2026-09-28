@@ -1330,6 +1330,38 @@ impl_consumer_ext!(otel_arrow_dfe_engine::local::exporter::EffectHandler<OtapPda
 impl_consumer_ext!(otel_arrow_dfe_engine::shared::processor::EffectHandler<OtapPdata>);
 impl_consumer_ext!(otel_arrow_dfe_engine::shared::exporter::EffectHandler<OtapPdata>);
 
+/// Routes a completion through a slot reserved in the pipeline-completion
+/// channel. Its return time is `decided_ns`, the [`nanos_since_birth`] of the
+/// moment the completion was decided, before any wait for the slot, as
+/// [`ConsumerEffectHandlerExtension`] stamps a send before it waits.
+pub trait CompletionPermitExtension {
+    /// Route `ack`, decided at `decided_ns`, through the reserved slot,
+    /// without waiting.
+    fn notify_ack(self, ack: AckMsg<OtapPdata>, decided_ns: u64) -> Result<(), Error>;
+
+    /// Route `nack`, decided at `decided_ns`, through the reserved slot,
+    /// without waiting.
+    fn notify_nack(self, nack: NackMsg<OtapPdata>, decided_ns: u64) -> Result<(), Error>;
+}
+
+impl CompletionPermitExtension
+    for otel_arrow_dfe_engine::effect_handler::CompletionPermit<OtapPdata>
+{
+    fn notify_ack(self, mut ack: AckMsg<OtapPdata>, decided_ns: u64) -> Result<(), Error> {
+        if ack.accepted.has_timing(Interests::ACKS) {
+            ack.unwind.return_time_ns = decided_ns;
+        }
+        self.route_ack(ack)
+    }
+
+    fn notify_nack(self, mut nack: NackMsg<OtapPdata>, decided_ns: u64) -> Result<(), Error> {
+        if nack.refused.has_timing(Interests::NACKS) {
+            nack.unwind.return_time_ns = decided_ns;
+        }
+        self.route_nack(nack)
+    }
+}
+
 /* --------  effect handler extensions (shared, local) -------- */
 
 /// Forward-path flow_metric accumulation for non-overlapping ranges.

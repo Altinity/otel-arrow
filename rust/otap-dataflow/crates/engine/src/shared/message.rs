@@ -128,25 +128,12 @@ impl<T> SharedSender<T> {
                 .map_err(|e| SendError::Closed(e.0)),
         };
 
-        if result.is_ok()
-            && let Some(queue_depth) = &self.queue_depth
-        {
-            queue_depth.record_send();
-        }
-        if let Some(metrics) = &self.metrics
-            && let Ok(mut metrics) = metrics.lock()
-        {
-            match &result {
-                Ok(()) => metrics.record_send_ok(signal),
-                Err(SendError::Full(_)) => {
-                    metrics.record_send_error(signal, ChannelSendErrorType::Full);
-                }
-                Err(SendError::Closed(_)) => {
-                    metrics.record_send_error(signal, ChannelSendErrorType::Closed);
-                }
-            }
-        }
-
+        record_send(
+            self.metrics.as_ref(),
+            self.queue_depth.as_ref(),
+            signal,
+            &result,
+        );
         result
     }
 
@@ -164,25 +151,104 @@ impl<T> SharedSender<T> {
             }),
         };
 
-        if result.is_ok()
-            && let Some(queue_depth) = &self.queue_depth
-        {
-            queue_depth.record_send();
-        }
-        if let Some(metrics) = &self.metrics
-            && let Ok(mut metrics) = metrics.lock()
-        {
-            match &result {
-                Ok(()) => metrics.record_send_ok(signal),
-                Err(SendError::Full(_)) => {
-                    metrics.record_send_error(signal, ChannelSendErrorType::Full);
-                }
-                Err(SendError::Closed(_)) => {
-                    metrics.record_send_error(signal, ChannelSendErrorType::Closed);
-                }
+        record_send(
+            self.metrics.as_ref(),
+            self.queue_depth.as_ref(),
+            signal,
+            &result,
+        );
+        result
+    }
+
+    /// Waits for room in the channel and reserves it, so a message chosen
+    /// only once the room is there is sent without waiting (see
+    /// [`SharedPermit::send`]).
+    ///
+    /// Cancel safe: dropping the future gives up its place and any slot it
+    /// was assigned. An MPMC channel cannot reserve: its permit is granted at
+    /// once and its send can still find the channel full.
+    pub async fn reserve(&self) -> Result<SharedPermit<T>, SendError<()>> {
+        let inner = match &self.inner {
+            SharedSenderInner::Mpsc(sender) => SharedPermitInner::Mpsc(
+                sender
+                    .clone()
+                    .reserve_owned()
+                    .await
+                    .map_err(|_| SendError::Closed(()))?,
+            ),
+            SharedSenderInner::Mpmc(sender) => SharedPermitInner::Mpmc(sender.clone()),
+        };
+        Ok(SharedPermit {
+            inner,
+            metrics: self.metrics.clone(),
+            queue_depth: self.queue_depth.clone(),
+            signal: self.signal,
+        })
+    }
+}
+
+/// Record one send attempt in the sender's channel metrics.
+fn record_send<T>(
+    metrics: Option<&SharedChannelSenderMetricsHandle>,
+    queue_depth: Option<&SharedChannelQueueDepth>,
+    signal: Option<SignalType>,
+    result: &Result<(), SendError<T>>,
+) {
+    if result.is_ok()
+        && let Some(queue_depth) = queue_depth
+    {
+        queue_depth.record_send();
+    }
+    if let Some(metrics) = metrics
+        && let Ok(mut metrics) = metrics.lock()
+    {
+        match result {
+            Ok(()) => metrics.record_send_ok(signal),
+            Err(SendError::Full(_)) => {
+                metrics.record_send_error(signal, ChannelSendErrorType::Full);
+            }
+            Err(SendError::Closed(_)) => {
+                metrics.record_send_error(signal, ChannelSendErrorType::Closed);
             }
         }
+    }
+}
 
+enum SharedPermitInner<T> {
+    Mpsc(tokio::sync::mpsc::OwnedPermit<T>),
+    Mpmc(flume::Sender<T>),
+}
+
+/// A slot reserved in a [`SharedSender`]'s channel (see
+/// [`SharedSender::reserve`]); dropping it gives the slot back.
+#[must_use = "A reserved slot is held until the permit is used or dropped."]
+pub struct SharedPermit<T> {
+    inner: SharedPermitInner<T>,
+    metrics: Option<SharedChannelSenderMetricsHandle>,
+    queue_depth: Option<SharedChannelQueueDepth>,
+    signal: Option<fn(&T) -> Option<SignalType>>,
+}
+
+impl<T> SharedPermit<T> {
+    /// Sends `msg` in the reserved slot, without waiting.
+    pub fn send(self, msg: T) -> Result<(), SendError<T>> {
+        let signal = self.signal.and_then(|extract| extract(&msg));
+        let result = match self.inner {
+            SharedPermitInner::Mpsc(permit) => {
+                drop(permit.send(msg));
+                Ok(())
+            }
+            SharedPermitInner::Mpmc(sender) => sender.try_send(msg).map_err(|e| match e {
+                flume::TrySendError::Full(v) => SendError::Full(v),
+                flume::TrySendError::Disconnected(v) => SendError::Closed(v),
+            }),
+        };
+        record_send(
+            self.metrics.as_ref(),
+            self.queue_depth.as_ref(),
+            signal,
+            &result,
+        );
         result
     }
 }
@@ -361,6 +427,37 @@ impl<T> SharedReceiver<T> {
 mod tests {
     use super::*;
     use otel_arrow_dfe_channel::error::RecvError;
+
+    /// Scenario: a full MPSC channel, a reservation waiting for room, then a
+    /// slot freed by the receiver.
+    /// Guarantees: the reservation resolves only once there is room, holds
+    /// no message while it waits, and its permit sends without waiting;
+    /// a dropped permit gives its slot back.
+    #[tokio::test]
+    async fn test_mpsc_reserve_waits_for_room_and_sends_in_the_slot() {
+        use futures::FutureExt;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<u32>(1);
+        let sender = SharedSender::mpsc(tx);
+        let mut receiver = SharedReceiver::mpsc(rx);
+        sender.try_send(1).expect("room for the first message");
+
+        let mut reserving = std::pin::pin!(sender.reserve());
+        assert!(reserving.as_mut().now_or_never().is_none(), "no room yet");
+        assert_eq!(receiver.try_recv().expect("the first message"), 1);
+        let permit = reserving.await.expect("room after the receive");
+        assert!(
+            matches!(sender.try_send(3), Err(SendError::Full(3))),
+            "the slot is reserved"
+        );
+        permit.send(2).expect("the permit sends");
+        assert_eq!(receiver.try_recv().expect("the reserved message"), 2);
+
+        drop(sender.reserve().await.expect("room"));
+        sender
+            .try_send(4)
+            .expect("a dropped permit gives its slot back");
+    }
 
     #[test]
     fn test_mpsc_try_recv_empty_returns_empty_not_closed() {

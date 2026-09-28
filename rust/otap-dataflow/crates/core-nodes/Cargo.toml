@@ -150,6 +150,8 @@ fluke-hpack.workspace = true
 flume.workspace = true
 otel-arrow-dfe-channel = { workspace = true }
 otel-arrow-dfe-engine = { workspace = true, features = ["test-utils"] }
+# The durable_buffer shutdown tests stall the WAL writer's drop.
+otel-arrow-dfe-quiver = { workspace = true, features = ["testing"] }
 # `aws` compiles the S3 storage variant, which the parquet config tests load.
 otel-arrow-dfe-otap = { workspace = true, features = ["test-utils", "crypto-ring", "aws"] }
 otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }

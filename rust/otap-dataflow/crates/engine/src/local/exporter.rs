@@ -35,7 +35,9 @@
 
 use crate::Interests;
 use crate::control::{AckMsg, NackMsg};
-use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
+use crate::effect_handler::{
+    CompletionPermit, EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle,
+};
 use crate::error::Error;
 use crate::message::ExporterInbox;
 use crate::node::NodeId;
@@ -153,6 +155,15 @@ impl<PData> EffectHandler<PData> {
         self.core.info(message).await;
     }
 
+    /// Reserve a slot in the pipeline-completion channel, waiting for room.
+    ///
+    /// An exporter that orders the completions it owes decides which one to
+    /// send only once the slot is its own, so none is held by a send still
+    /// waiting for room. Cancel safe: dropping the future gives the place up.
+    pub async fn reserve_completion(&self) -> Result<CompletionPermit<PData>, Error> {
+        self.core.reserve_completion().await
+    }
+
     /// Starts a cancellable periodic timer that emits TimerTick on the control channel.
     /// Returns a handle that can be used to cancel the timer.
     ///
@@ -210,5 +221,136 @@ impl<PData: crate::Unwindable> crate::_private::AckNackRouting<PData> for Effect
 
     async fn route_nack(&self, nack: NackMsg<PData>) -> Result<(), Error> {
         self.core.route_nack(nack).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(missing_docs)]
+    use super::*;
+    use crate::Unwindable;
+    use crate::completion_emission_metrics::make_completion_emission_metrics;
+    use crate::context::ControllerContext;
+    use crate::control::{
+        Frame, PipelineCompletionMsg, RouteData, pipeline_completion_msg_channel,
+    };
+    use crate::entity_context::NodeTelemetryHandle;
+    use crate::testing::test_node;
+    use futures::FutureExt;
+    use otel_arrow_dfe_config::{MetricLevel, SignalType, node::NodeKind};
+    use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
+    use std::collections::HashMap;
+
+    #[derive(Debug)]
+    struct TestPData {
+        frames: Vec<Frame>,
+    }
+
+    impl TestPData {
+        fn with_frame(interests: Interests) -> Self {
+            Self {
+                frames: vec![Frame {
+                    node_id: 1,
+                    interests,
+                    route: RouteData::default(),
+                    output_items: 0,
+                    input_items: 0,
+                    output_size: 0,
+                    input_size: 0,
+                }],
+            }
+        }
+    }
+
+    impl Unwindable for TestPData {
+        fn has_frames(&self) -> bool {
+            !self.frames.is_empty()
+        }
+
+        fn pop_frame(&mut self) -> Option<Frame> {
+            self.frames.pop()
+        }
+
+        fn signal(&self) -> Option<SignalType> {
+            None
+        }
+
+        fn drop_payload(&mut self) {}
+    }
+
+    fn test_node_telemetry() -> (TelemetryRegistryHandle, NodeTelemetryHandle) {
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry.clone());
+        let pipeline_ctx = controller
+            .pipeline_context_with("test_grp".into(), "test_pipeline".into(), 0, 1, 0)
+            .with_node_context(
+                "test_node".into(),
+                "urn:test:exporter:example".into(),
+                NodeKind::Exporter,
+                HashMap::new(),
+            );
+        let entity_key = pipeline_ctx.register_node_entity();
+        (
+            registry,
+            NodeTelemetryHandle::new(pipeline_ctx.metrics_registry(), entity_key),
+        )
+    }
+
+    /// Scenario: an exporter reserves completion slots in a pipeline-completion
+    /// channel of capacity one: an Ack through the first slot, a second
+    /// reservation while that Ack fills the channel, then a Nack without
+    /// frames through the second slot.
+    /// Guarantees: a reservation resolves only once the channel has room; the
+    /// permit routes the Ack without waiting and records it in the completion
+    /// emission metrics; a completion with no frames is skipped and its slot
+    /// given back.
+    #[tokio::test]
+    async fn reserve_completion_waits_for_room_and_routes_through_the_slot() {
+        let (_registry, telemetry_handle) = test_node_telemetry();
+        let completion_metrics =
+            make_completion_emission_metrics(&Some(telemetry_handle), MetricLevel::Normal)
+                .expect("completion emission metrics should be registered");
+        let (completion_tx, mut completion_rx) = pipeline_completion_msg_channel(1);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let mut eh = EffectHandler::<TestPData>::new(
+            test_node("exporter"),
+            metrics_reporter,
+            crate::testing::test_pipeline_runtime_services(),
+        );
+        eh.set_pipeline_completion_msg_sender(completion_tx);
+        eh.core
+            .set_completion_emission_metrics(Some(completion_metrics.clone()));
+
+        let permit = eh.reserve_completion().await.expect("room for the Ack");
+        permit
+            .route_ack(AckMsg::new(TestPData::with_frame(Interests::ACKS)))
+            .expect("the permit routes the Ack");
+
+        let mut reserving = std::pin::pin!(eh.reserve_completion());
+        assert!(
+            reserving.as_mut().now_or_never().is_none(),
+            "the Ack fills the channel"
+        );
+        assert!(matches!(
+            completion_rx.recv().await.expect("the Ack"),
+            PipelineCompletionMsg::DeliverAck { .. }
+        ));
+        let permit = reserving.await.expect("room after the receive");
+        permit
+            .route_nack(NackMsg::new("no frames", TestPData { frames: Vec::new() }))
+            .expect("a Nack without frames is skipped");
+
+        drop(
+            eh.reserve_completion()
+                .now_or_never()
+                .expect("the skipped Nack gave its slot back")
+                .expect("room"),
+        );
+        assert!(completion_rx.try_recv().is_err(), "nothing else was sent");
+        let counts = completion_metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .counts();
+        assert_eq!(counts, (1, 0));
     }
 }

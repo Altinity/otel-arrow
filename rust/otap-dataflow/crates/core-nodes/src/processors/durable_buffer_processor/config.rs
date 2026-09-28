@@ -7,7 +7,7 @@
 //! policy; see the [module documentation](super).
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use byte_unit::{Byte, Unit};
 use otel_arrow_dfe_quiver::config::RetentionPolicy;
@@ -171,6 +171,80 @@ pub struct DurableBufferConfig {
     /// When at limit, new sends are deferred until ACKs free up slots.
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
+
+    /// Graceful-shutdown settings.
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
+}
+
+/// Graceful-shutdown settings of the durable buffer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShutdownConfig {
+    /// How long, after `Shutdown`, the buffer waits for the `Ack`/`Nack` of
+    /// the bundles it has sent downstream before it persists its progress and
+    /// stops: a duration such as `"10s"`, `true` to wait as long as the
+    /// shutdown deadline allows, or `false` to stop at once. Either wait ends
+    /// one second before the shutdown deadline, which the final persist
+    /// keeps. Unset, it is `false`.
+    #[serde(default)]
+    pub await_acks: AwaitAcks,
+}
+
+/// The completion wait of [`ShutdownConfig::await_acks`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AwaitAcks {
+    /// Wait until the shutdown deadline.
+    UntilDeadline,
+    /// Wait at most this long, and not past the shutdown deadline.
+    For(Duration),
+    /// Do not wait: bundles still in flight are replayed on the next start.
+    #[default]
+    Off,
+}
+
+impl AwaitAcks {
+    /// Until when a buffer that starts waiting at `now` waits, for a shutdown
+    /// with `deadline`; `None` when it does not wait. Past the deadline it is
+    /// `now`: the wait ends at once but still takes the completions already
+    /// queued.
+    #[must_use]
+    pub fn until(self, now: Instant, deadline: Instant) -> Option<Instant> {
+        let until = match self {
+            Self::UntilDeadline => deadline,
+            Self::For(bound) => now
+                .checked_add(bound)
+                .map_or(deadline, |at| at.min(deadline)),
+            Self::Off => return None,
+        };
+        Some(until.max(now))
+    }
+}
+
+impl<'de> Deserialize<'de> for AwaitAcks {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Enabled(bool),
+            Bound(String),
+            Number(f64),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Enabled(false) => Ok(Self::Off),
+            Raw::Enabled(true) => Ok(Self::UntilDeadline),
+            Raw::Number(n) => Err(serde::de::Error::custom(format!(
+                "await_acks: {n} has no unit; write a duration such as \"{n}s\", or true or false"
+            ))),
+            Raw::Bound(text) => humantime_serde::re::humantime::parse_duration(&text)
+                .map(Self::For)
+                .map_err(|e| {
+                    serde::de::Error::custom(format!(
+                        "await_acks must be a duration such as \"10s\", or true or false: {e}"
+                    ))
+                }),
+        }
+    }
 }
 
 impl DurableBufferConfig {
@@ -260,6 +334,63 @@ mod tests {
         assert_eq!(config.max_retry_interval, Duration::from_secs(60));
         assert!((config.retry_multiplier - 1.5).abs() < f64::EPSILON);
         assert_eq!(config.max_in_flight, 500);
+    }
+
+    /// Scenario: `shutdown.await_acks` unset, `false`, `true` and a duration,
+    /// and an unparsable value.
+    /// Guarantees: unset and `false` do not wait, `true` waits until the
+    /// deadline, a duration bounds the wait below the deadline, and anything
+    /// else is refused.
+    #[test]
+    fn test_await_acks_serde() {
+        let parse = |shutdown: &str| {
+            serde_json::from_str::<DurableBufferConfig>(&format!(
+                r#"{{"path": "/tmp/test"{shutdown}}}"#
+            ))
+            .map(|config| config.shutdown.await_acks)
+        };
+        assert_eq!(parse("").unwrap(), AwaitAcks::Off);
+        assert_eq!(
+            parse(r#", "shutdown": {"await_acks": false}"#).unwrap(),
+            AwaitAcks::Off
+        );
+        assert_eq!(
+            parse(r#", "shutdown": {"await_acks": true}"#).unwrap(),
+            AwaitAcks::UntilDeadline
+        );
+        assert_eq!(
+            parse(r#", "shutdown": {"await_acks": "10s"}"#).unwrap(),
+            AwaitAcks::For(Duration::from_secs(10))
+        );
+        assert!(parse(r#", "shutdown": {"await_acks": "soon"}"#).is_err());
+        let bare = parse(r#", "shutdown": {"await_acks": 10}"#)
+            .expect_err("a bare number is refused")
+            .to_string();
+        assert!(bare.contains("unit"), "unhelpful error: {bare}");
+
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(60);
+        assert_eq!(
+            AwaitAcks::UntilDeadline.until(now, deadline),
+            Some(deadline)
+        );
+        assert_eq!(
+            AwaitAcks::For(Duration::from_secs(10)).until(now, deadline),
+            Some(now + Duration::from_secs(10))
+        );
+        assert_eq!(
+            AwaitAcks::For(Duration::from_secs(90)).until(now, deadline),
+            Some(deadline)
+        );
+        assert_eq!(AwaitAcks::Off.until(now, deadline), None);
+        // Past the deadline the wait ends at once, for what is already queued.
+        let late = deadline + Duration::from_secs(1);
+        assert_eq!(AwaitAcks::UntilDeadline.until(late, deadline), Some(late));
+        assert_eq!(
+            AwaitAcks::For(Duration::from_secs(10)).until(late, deadline),
+            Some(late)
+        );
+        assert_eq!(AwaitAcks::Off.until(late, deadline), None);
     }
 
     #[test]

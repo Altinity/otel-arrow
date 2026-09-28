@@ -21,6 +21,8 @@ default = ["otap-dataflow-integrations", "mmap"]
 otap-dataflow-integrations = []
 serde = ["dep:serde"]
 mmap = ["dep:memmap2"]
+# Hooks for tests of dependent crates; never enabled in a release build.
+testing = []
 
 [dependencies]
 arrow-array.workspace = true

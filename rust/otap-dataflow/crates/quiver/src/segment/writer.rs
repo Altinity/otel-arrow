@@ -204,6 +204,8 @@ impl SegmentWriter {
                 let file = writer
                     .into_inner()
                     .map_err(|e| SegmentError::io(path.clone(), e.into_error()))?;
+                #[cfg(feature = "testing")]
+                crate::test_hooks::before_segment_sync(&path);
 
                 Ok((file, result))
             }
