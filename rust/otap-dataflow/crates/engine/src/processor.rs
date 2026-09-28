@@ -41,6 +41,7 @@ use otel_arrow_dfe_telemetry::metrics::MeasurementMetricSet;
 use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// FlowMetric-relevant slice of a processor `EffectHandler`'s surface.
 ///
@@ -186,6 +187,52 @@ impl ProcessorRuntimeRequirements {
         self.makes_drop_decisions = true;
         self
     }
+}
+
+/// The deadline of the `Shutdown` a message carries.
+const fn shutdown_deadline_of<PData>(msg: &Message<PData>) -> Option<Instant> {
+    match msg {
+        Message::Control(NodeControlMsg::Shutdown { deadline, .. }) => Some(*deadline),
+        _ => None,
+    }
+}
+
+/// The completion phase after a processor has handled the `Shutdown` its
+/// inbox released (see `awaits_completions` on the processor traits): while
+/// the processor awaits completions, its outputs close and `Ack` and `Nack`
+/// are delivered until it expects none, its own bound or the deadline, then
+/// `completions_ended` is called with the deadline. A further `Shutdown` only
+/// moves the deadline earlier. A failed completion ends the wait, but
+/// `completions_ended` is still called and the first error returned. Shared
+/// by the local and the shared run loop.
+macro_rules! await_completions {
+    ($processor:ident, $inbox:ident, $effect_handler:ident, $deadline:expr) => {{
+        let mut result: Result<(), Error> = Ok(());
+        if $inbox.released_shutdown() && $processor.awaits_completions().is_some() {
+            $effect_handler.router.close();
+            let mut deadline: Instant = $deadline;
+            while let Some(until) = $processor.awaits_completions() {
+                let Some(msg) = $inbox.recv_completion(until, &mut deadline).await else {
+                    break;
+                };
+                if let Err(err) = $processor
+                    .process(Message::Control(msg), &mut $effect_handler)
+                    .await
+                {
+                    result = Err(err);
+                    break;
+                }
+            }
+            let last = $processor
+                .completions_ended(deadline, &mut $effect_handler)
+                .await;
+            if result.is_ok() {
+                result = last;
+            }
+        }
+        $inbox.close_completions();
+        result
+    }};
 }
 
 /// A wrapper for the processor that allows for both `Send` and `!Send` effect handlers.
@@ -691,6 +738,7 @@ impl<PData> ProcessorWrapper<PData> {
                     // Preserve the first processing error so final metric
                     // collection can run before the error is returned.
                     while let Ok(mut msg) = inbox.recv_when(processor.accept_pdata()).await {
+                        let shutdown = shutdown_deadline_of(&msg);
                         if effect_handler.flow_metrics_active() {
                             match &mut msg {
                                 Message::Control(NodeControlMsg::CollectTelemetry { .. })
@@ -708,6 +756,13 @@ impl<PData> ProcessorWrapper<PData> {
                             }
                         }
                         if let Err(err) = processor.process(msg, &mut effect_handler).await {
+                            processing_error = Some(err);
+                            break;
+                        }
+                        if let Some(deadline) = shutdown
+                            && let Err(err) =
+                                await_completions!(processor, inbox, effect_handler, deadline)
+                        {
                             processing_error = Some(err);
                             break;
                         }
@@ -783,6 +838,7 @@ impl<PData> ProcessorWrapper<PData> {
                     // Preserve the first processing error so final metric
                     // collection can run before the error is returned.
                     while let Ok(mut msg) = inbox.recv_when(processor.accept_pdata()).await {
+                        let shutdown = shutdown_deadline_of(&msg);
                         if effect_handler.flow_metrics_active() {
                             match &mut msg {
                                 Message::Control(NodeControlMsg::CollectTelemetry { .. })
@@ -800,6 +856,13 @@ impl<PData> ProcessorWrapper<PData> {
                             }
                         }
                         if let Err(err) = processor.process(msg, &mut effect_handler).await {
+                            processing_error = Some(err);
+                            break;
+                        }
+                        if let Some(deadline) = shutdown
+                            && let Err(err) =
+                                await_completions!(processor, inbox, effect_handler, deadline)
+                        {
                             processing_error = Some(err);
                             break;
                         }
@@ -998,6 +1061,7 @@ impl<PData> NodeWithPDataReceiver<PData> for ProcessorWrapper<PData> {
 
 #[cfg(test)]
 mod tests {
+    use crate::clock::SimClock;
     use crate::config::ProcessorConfig;
     use crate::control::{
         Controllable, NodeControlMsg,
@@ -1026,8 +1090,10 @@ mod tests {
     use otel_arrow_dfe_telemetry::common_attributes::SignalAttributes;
     use otel_arrow_dfe_telemetry::metrics::{MeasurementMetricSet, MetricValue};
     use serde_json::Value;
+    use std::cell::RefCell;
     use std::ops::Add;
     use std::pin::Pin;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -2038,5 +2104,700 @@ mod tests {
             error, "original processing error",
             "original error must take precedence over CollectTelemetry error"
         );
+    }
+
+    /// Forwards the pdata it is given and, after `Shutdown`, awaits their
+    /// completion until `awaits_until`, recording every message, the end of
+    /// the phase (`completions_ended`) as `ended`, and every deadline
+    /// `Shutdown` and `completions_ended` carry.
+    struct AwaitingProcessor {
+        seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        deadlines: Arc<std::sync::Mutex<Vec<Instant>>>,
+        in_flight: bool,
+        shut_down: bool,
+        /// What `awaits_completions` returns while a forwarded pdata is not
+        /// completed; `None` awaits nothing.
+        awaits_until: Option<Instant>,
+        /// Whether handling an Ack or Nack fails.
+        fail_on_completion: bool,
+        /// Handling the first Shutdown moves the simulated clock to this
+        /// instant, standing in for a slow Shutdown.
+        slow_shutdown_to: Option<(SimClock, Instant)>,
+        /// How long the first pdata keeps `process` busy after forwarding it.
+        pdata_delay: Duration,
+    }
+
+    impl AwaitingProcessor {
+        /// Records `msg` and returns the pdata to forward, or the failure of
+        /// a completion; shared by the local and the shared impls.
+        fn observe(&mut self, msg: Message<TestMsg>) -> Result<Option<TestMsg>, Error> {
+            let (label, forward) = match msg {
+                Message::PData(data) => {
+                    self.in_flight = true;
+                    ("pdata", Some(data))
+                }
+                Message::Control(NodeControlMsg::Ack(_)) => {
+                    self.in_flight = false;
+                    ("ack", None)
+                }
+                Message::Control(NodeControlMsg::Nack(_)) => {
+                    self.in_flight = false;
+                    ("nack", None)
+                }
+                Message::Control(Shutdown { deadline, .. }) => {
+                    if !self.shut_down
+                        && let Some((clock, to)) = &self.slow_shutdown_to
+                    {
+                        clock.advance_to(*to);
+                    }
+                    self.shut_down = true;
+                    self.deadlines.lock().expect("deadlines").push(deadline);
+                    ("shutdown", None)
+                }
+                Message::Control(TimerTick {}) => ("tick", None),
+                Message::Control(_) => return Ok(None),
+            };
+            self.seen.lock().expect("seen").push(label);
+            if self.fail_on_completion && matches!(label, "ack" | "nack") {
+                return Err(Error::ProcessorError {
+                    processor: test_node("awaiting"),
+                    kind: ProcessorErrorKind::Other,
+                    error: "completion failed".to_owned(),
+                    source_detail: String::new(),
+                });
+            }
+            Ok(forward)
+        }
+
+        /// Records the end of the completion phase and its deadline.
+        fn ended(&mut self, deadline: Instant) {
+            self.deadlines.lock().expect("deadlines").push(deadline);
+            self.seen.lock().expect("seen").push("ended");
+        }
+
+        fn awaits(&self) -> Option<Instant> {
+            if self.shut_down && self.in_flight {
+                self.awaits_until
+            } else {
+                None
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl local::Processor<TestMsg> for AwaitingProcessor {
+        async fn process(
+            &mut self,
+            msg: Message<TestMsg>,
+            effect_handler: &mut local::EffectHandler<TestMsg>,
+        ) -> Result<(), Error> {
+            let first_pdata = matches!(msg, Message::PData(_)) && !self.in_flight;
+            if let Some(data) = self.observe(msg)? {
+                effect_handler
+                    .send_message(data)
+                    .await
+                    .expect("the output is open before shutdown");
+            }
+            if first_pdata {
+                tokio::time::sleep(self.pdata_delay).await;
+            }
+            Ok(())
+        }
+
+        fn awaits_completions(&self) -> Option<Instant> {
+            self.awaits()
+        }
+
+        async fn completions_ended(
+            &mut self,
+            deadline: Instant,
+            _effect_handler: &mut local::EffectHandler<TestMsg>,
+        ) -> Result<(), Error> {
+            self.ended(deadline);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl shared::Processor<TestMsg> for AwaitingProcessor {
+        async fn process(
+            &mut self,
+            msg: Message<TestMsg>,
+            effect_handler: &mut shared::EffectHandler<TestMsg>,
+        ) -> Result<(), Error> {
+            let first_pdata = matches!(msg, Message::PData(_)) && !self.in_flight;
+            if let Some(data) = self.observe(msg)? {
+                effect_handler
+                    .send_message(data)
+                    .await
+                    .expect("the output is open before shutdown");
+            }
+            if first_pdata {
+                tokio::time::sleep(self.pdata_delay).await;
+            }
+            Ok(())
+        }
+
+        fn awaits_completions(&self) -> Option<Instant> {
+            self.awaits()
+        }
+
+        async fn completions_ended(
+            &mut self,
+            deadline: Instant,
+            _effect_handler: &mut shared::EffectHandler<TestMsg>,
+        ) -> Result<(), Error> {
+            self.ended(deadline);
+            Ok(())
+        }
+    }
+
+    /// A control message queued right behind the first Shutdown.
+    #[derive(Clone, Copy)]
+    enum AfterShutdown {
+        Ack,
+        Nack,
+        Tick,
+        Shutdown(Instant),
+    }
+
+    /// One run of an `AwaitingProcessor` through the engine's run loop, on a
+    /// simulated clock.
+    struct AwaitingRun {
+        clock: SimClock,
+        /// Run the shared wrapper (and its run loop) instead of the local one.
+        shared: bool,
+        deadline: Instant,
+        awaits_until: Option<Instant>,
+        fail_on_completion: bool,
+        slow_shutdown_to: Option<Instant>,
+        after_shutdown: Vec<AfterShutdown>,
+        /// How long the first pdata keeps the processor busy after it is
+        /// forwarded; the Shutdown and `after_shutdown` are queued meanwhile.
+        pdata_delay: Duration,
+        /// Queue a second pdata behind the first before the input closes.
+        second_pdata: bool,
+        /// Once the processor's output has closed, move the simulated clock
+        /// to this instant.
+        advance_to: Option<Instant>,
+    }
+
+    /// What an `AwaitingRun` observed.
+    struct AwaitingOutcome {
+        seen: Vec<&'static str>,
+        deadlines: Vec<Instant>,
+        /// Whether the processor's output closed before the run loop ended.
+        closed_before_end: bool,
+        /// The simulated instant the run loop ended at.
+        ended: Instant,
+        result: Result<(), Error>,
+    }
+
+    impl AwaitingRun {
+        /// A run whose Shutdown carries `deadline` and whose processor waits
+        /// for its completions until `awaits_until`.
+        fn new(clock: &SimClock, deadline: Instant, awaits_until: Option<Instant>) -> Self {
+            Self {
+                clock: clock.clone(),
+                shared: false,
+                deadline,
+                awaits_until,
+                fail_on_completion: false,
+                slow_shutdown_to: None,
+                after_shutdown: Vec::new(),
+                pdata_delay: Duration::ZERO,
+                second_pdata: false,
+                advance_to: None,
+            }
+        }
+
+        /// One pdata is forwarded, then Shutdown with `deadline` is queued,
+        /// followed by `after_shutdown`; all are queued before the processor
+        /// runs again, so they sit behind the Shutdown the inbox releases.
+        fn run(self) -> AwaitingOutcome {
+            let _clock = self.clock.install();
+            block_on_local(self.run_installed())
+        }
+
+        async fn run_installed(self) -> AwaitingOutcome {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let processor = AwaitingProcessor {
+                seen: Arc::clone(&seen),
+                deadlines: Arc::clone(&deadlines),
+                in_flight: false,
+                shut_down: false,
+                awaits_until: self.awaits_until,
+                fail_on_completion: self.fail_on_completion,
+                slow_shutdown_to: self.slow_shutdown_to.map(|to| (self.clock.clone(), to)),
+                pdata_delay: self.pdata_delay,
+            };
+            let config = ProcessorConfig::new("awaiting");
+            let node = test_node(config.name.clone());
+            let user_config = Arc::new(NodeUserConfig::new_processor_config("awaiting"));
+            let mut wrapper = if self.shared {
+                ProcessorWrapper::shared(processor, node.clone(), user_config, &config)
+            } else {
+                ProcessorWrapper::local(processor, node.clone(), user_config, &config)
+            };
+            let (input_tx, input_rx) = tokio::sync::mpsc::channel(4);
+            wrapper
+                .set_pdata_receiver(
+                    node.clone(),
+                    Receiver::Shared(SharedReceiver::mpsc(input_rx)),
+                )
+                .expect("input");
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4);
+            wrapper
+                .set_pdata_sender(
+                    node,
+                    "out".into(),
+                    Sender::Shared(SharedSender::mpsc(output_tx)),
+                )
+                .expect("output");
+            let control = wrapper.control_sender();
+            let (runtime_ctrl_tx, _runtime_ctrl_rx) = runtime_ctrl_msg_channel(8);
+            let (completion_tx, _completion_rx) = pipeline_completion_msg_channel(8);
+            let (_metrics_rx, metrics_reporter) =
+                otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(64);
+            let task = tokio::task::spawn_local(crate::testing::processor::run_processor(
+                wrapper,
+                runtime_ctrl_tx,
+                completion_tx,
+                metrics_reporter,
+                crate::Interests::empty(),
+            ));
+
+            input_tx.send(TestMsg::new("data")).await.expect("input");
+            let forwarded = tokio::time::timeout(Duration::from_secs(5), output_rx.recv())
+                .await
+                .expect("forwarded in time")
+                .expect("forwarded");
+            if self.second_pdata {
+                input_tx.send(TestMsg::new("second")).await.expect("input");
+            }
+            drop(input_tx);
+            control
+                .send(Shutdown {
+                    deadline: self.deadline,
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("shutdown");
+            for after in self.after_shutdown {
+                let msg = match after {
+                    AfterShutdown::Ack => {
+                        NodeControlMsg::Ack(crate::control::AckMsg::new(forwarded.clone()))
+                    }
+                    AfterShutdown::Nack => NodeControlMsg::Nack(crate::control::NackMsg::new(
+                        "downstream refused",
+                        forwarded.clone(),
+                    )),
+                    AfterShutdown::Tick => TimerTick {},
+                    AfterShutdown::Shutdown(deadline) => Shutdown {
+                        deadline,
+                        reason: "tighter".to_owned(),
+                    },
+                };
+                control.send(msg).await.expect("queued behind shutdown");
+            }
+            // Pdata still forwarded before the output closes is skipped.
+            let closed = loop {
+                match tokio::time::timeout(Duration::from_secs(10), output_rx.recv())
+                    .await
+                    .expect("the output closes")
+                {
+                    Some(_) => {}
+                    None => break true,
+                }
+            };
+            let closed_before_end = closed && !task.is_finished();
+            if let Some(to) = self.advance_to {
+                self.clock.advance_to(to);
+            }
+            let result = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("the run loop ends")
+                .expect("join");
+            let ended = crate::clock::now();
+            let seen = seen.lock().expect("seen").clone();
+            let deadlines = deadlines.lock().expect("deadlines").clone();
+            AwaitingOutcome {
+                seen,
+                deadlines,
+                closed_before_end,
+                ended,
+                result,
+            }
+        }
+    }
+
+    /// Runs `future` on a current-thread runtime inside a `LocalSet`.
+    fn block_on_local<F: Future>(future: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        tokio::task::LocalSet::new().block_on(&rt, future)
+    }
+
+    /// Scenario: the local and the shared run loop, where a processor that
+    /// awaits a completion after Shutdown has an Ack queued behind the
+    /// Shutdown its inbox releases.
+    /// Guarantees: Shutdown is delivered once, then the Ack, then
+    /// `completions_ended` with the deadline, without waiting for it.
+    #[test]
+    fn awaited_completion_is_delivered_after_shutdown() {
+        for shared in [false, true] {
+            let clock = SimClock::new();
+            let deadline = clock.now() + Duration::from_secs(5);
+            let mut run = AwaitingRun::new(&clock, deadline, Some(deadline));
+            run.shared = shared;
+            run.after_shutdown.push(AfterShutdown::Ack);
+            let outcome = run.run();
+            outcome.result.expect("run loop");
+            assert_eq!(
+                outcome.seen,
+                ["pdata", "shutdown", "ack", "ended"],
+                "shared={shared}"
+            );
+            assert_eq!(outcome.deadlines, [deadline, deadline], "shared={shared}");
+            assert!(outcome.ended < deadline, "shared={shared}");
+        }
+    }
+
+    /// Scenario: a processor that awaits nothing after Shutdown has an Ack
+    /// queued behind Shutdown.
+    /// Guarantees: no completion phase runs: neither the Ack nor
+    /// `completions_ended` is called.
+    #[test]
+    fn a_processor_that_awaits_nothing_gets_no_completion_phase() {
+        let clock = SimClock::new();
+        let deadline = clock.now() + Duration::from_secs(5);
+        let mut run = AwaitingRun::new(&clock, deadline, None);
+        run.after_shutdown.push(AfterShutdown::Ack);
+        let outcome = run.run();
+        outcome.result.expect("run loop");
+        assert_eq!(outcome.seen, ["pdata", "shutdown"]);
+        assert!(outcome.ended < deadline);
+    }
+
+    /// Scenario: a processor awaits a completion that never arrives, with its
+    /// own bound 300 ms before a 600 ms deadline; the clock then moves to
+    /// the bound.
+    /// Guarantees: `completions_ended` is called at the processor's bound,
+    /// with the shutdown deadline.
+    #[test]
+    fn the_processor_bound_ends_the_wait_before_the_deadline() {
+        let clock = SimClock::new();
+        let deadline = clock.now() + Duration::from_millis(600);
+        let bound = deadline - Duration::from_millis(300);
+        let mut run = AwaitingRun::new(&clock, deadline, Some(bound));
+        run.advance_to = Some(bound);
+        let outcome = run.run();
+        outcome.result.expect("run loop");
+        assert_eq!(outcome.seen, ["pdata", "shutdown", "ended"]);
+        assert_eq!(outcome.deadlines, [deadline, deadline]);
+        assert_eq!(outcome.ended, bound, "the wait ends at the bound");
+    }
+
+    /// Scenario: a processor awaits a completion after Shutdown that never
+    /// arrives, and the clock moves to the deadline.
+    /// Guarantees: its output closes while it waits, so downstream can shut
+    /// down; `completions_ended` is called at the deadline and the run loop
+    /// ends.
+    #[test]
+    fn awaited_completion_phase_ends_at_the_deadline() {
+        let clock = SimClock::new();
+        let deadline = clock.now() + Duration::from_millis(300);
+        let mut run = AwaitingRun::new(&clock, deadline, Some(deadline + Duration::from_secs(60)));
+        run.advance_to = Some(deadline);
+        let outcome = run.run();
+        outcome.result.expect("run loop");
+        assert_eq!(outcome.seen, ["pdata", "shutdown", "ended"]);
+        assert!(
+            outcome.closed_before_end,
+            "the output closes while completions are awaited"
+        );
+        assert_eq!(outcome.ended, deadline, "the phase ends at the deadline");
+    }
+
+    /// Scenario: the completion phase in the local and in the shared run
+    /// loop, with a Nack queued behind the released Shutdown.
+    /// Guarantees: the Nack ends the wait like an Ack, and `completions_ended`
+    /// follows with the original deadline, before it.
+    #[test]
+    fn a_nack_during_the_completion_phase_ends_the_wait() {
+        for shared in [false, true] {
+            let clock = SimClock::new();
+            let deadline = clock.now() + Duration::from_secs(5);
+            let mut run = AwaitingRun::new(&clock, deadline, Some(deadline));
+            run.shared = shared;
+            run.after_shutdown.push(AfterShutdown::Nack);
+            let outcome = run.run();
+            outcome.result.expect("run loop");
+            assert_eq!(
+                outcome.seen,
+                ["pdata", "shutdown", "nack", "ended"],
+                "shared={shared}"
+            );
+            assert_eq!(outcome.deadlines, [deadline, deadline], "shared={shared}");
+            assert!(outcome.ended < deadline, "shared={shared}");
+        }
+    }
+
+    /// Scenario: the completion phase in the local and in the shared run
+    /// loop, with a TimerTick queued ahead of the Ack behind the released
+    /// Shutdown.
+    /// Guarantees: the tick is discarded, not delivered, and the Ack behind
+    /// it still ends the wait.
+    #[test]
+    fn a_timer_tick_before_the_ack_is_discarded() {
+        for shared in [false, true] {
+            let clock = SimClock::new();
+            let deadline = clock.now() + Duration::from_secs(5);
+            let mut run = AwaitingRun::new(&clock, deadline, Some(deadline));
+            run.shared = shared;
+            run.after_shutdown
+                .extend([AfterShutdown::Tick, AfterShutdown::Ack]);
+            let outcome = run.run();
+            outcome.result.expect("run loop");
+            assert_eq!(
+                outcome.seen,
+                ["pdata", "shutdown", "ack", "ended"],
+                "shared={shared}"
+            );
+            assert!(outcome.ended < deadline, "shared={shared}");
+        }
+    }
+
+    /// Scenario: the completion phase in the local and in the shared run
+    /// loop, where the processor fails while handling the awaited Ack.
+    /// Guarantees: `completions_ended` is still called, so the processor can
+    /// release what it holds, and the run loop returns the failure.
+    #[test]
+    fn a_failed_completion_still_gets_completions_ended() {
+        for shared in [false, true] {
+            let clock = SimClock::new();
+            let deadline = clock.now() + Duration::from_secs(5);
+            let mut run = AwaitingRun::new(&clock, deadline, Some(deadline));
+            run.shared = shared;
+            run.fail_on_completion = true;
+            run.after_shutdown.push(AfterShutdown::Ack);
+            let outcome = run.run();
+            assert_eq!(
+                outcome.seen,
+                ["pdata", "shutdown", "ack", "ended"],
+                "shared={shared}"
+            );
+            let err = outcome.result.expect_err("the failure is returned");
+            assert!(
+                err.to_string().contains("completion failed"),
+                "shared={shared}: {err}"
+            );
+        }
+    }
+
+    /// Scenario: the completion phase in the local and in the shared run
+    /// loop, where the Ack is queued before the deadline but the processor's
+    /// Shutdown handling runs past the deadline, so the Ack is dequeued after
+    /// it.
+    /// Guarantees: the queued Ack is still delivered, before
+    /// `completions_ended`, instead of being dropped with the channel.
+    #[test]
+    fn an_ack_queued_before_the_deadline_is_delivered_after_it() {
+        for shared in [false, true] {
+            let clock = SimClock::new();
+            let deadline = clock.now() + Duration::from_millis(300);
+            let mut run = AwaitingRun::new(&clock, deadline, Some(deadline));
+            run.shared = shared;
+            run.slow_shutdown_to = Some(deadline + Duration::from_millis(300));
+            run.after_shutdown.push(AfterShutdown::Ack);
+            let outcome = run.run();
+            outcome.result.expect("run loop");
+            assert_eq!(
+                outcome.seen,
+                ["pdata", "shutdown", "ack", "ended"],
+                "shared={shared}"
+            );
+        }
+    }
+
+    /// Scenario: the completion phase in the local and in the shared run
+    /// loop, where a second Shutdown with a tighter deadline arrives while
+    /// the processor awaits a completion that never comes, and the clock then
+    /// moves to the tighter deadline.
+    /// Guarantees: the tighter Shutdown is not delivered as a Shutdown; it
+    /// ends the wait at its deadline, which `completions_ended` carries.
+    #[test]
+    fn a_tighter_shutdown_during_the_completion_phase_moves_the_deadline() {
+        for shared in [false, true] {
+            let clock = SimClock::new();
+            let deadline = clock.now() + Duration::from_secs(5);
+            let tighter = clock.now() + Duration::from_millis(500);
+            let mut run = AwaitingRun::new(&clock, deadline, Some(deadline));
+            run.shared = shared;
+            run.after_shutdown.push(AfterShutdown::Shutdown(tighter));
+            run.advance_to = Some(tighter);
+            let outcome = run.run();
+            outcome.result.expect("run loop");
+            assert_eq!(
+                outcome.seen,
+                ["pdata", "shutdown", "ended"],
+                "shared={shared}"
+            );
+            assert_eq!(outcome.deadlines, [deadline, tighter], "shared={shared}");
+            assert_eq!(outcome.ended, tighter, "shared={shared}");
+        }
+    }
+
+    /// Scenario: the completion phase in the local and in the shared run
+    /// loop, where a second Shutdown with a later deadline arrives while the
+    /// processor awaits a completion that never comes, and the clock then
+    /// moves to the first deadline.
+    /// Guarantees: the later deadline neither ends nor extends the wait:
+    /// `completions_ended` comes at the first deadline and carries it.
+    #[test]
+    fn a_later_shutdown_during_the_completion_phase_keeps_the_first_deadline() {
+        for shared in [false, true] {
+            let clock = SimClock::new();
+            let deadline = clock.now() + Duration::from_millis(500);
+            let later = clock.now() + Duration::from_secs(60);
+            let mut run = AwaitingRun::new(&clock, deadline, Some(later));
+            run.shared = shared;
+            run.after_shutdown.push(AfterShutdown::Shutdown(later));
+            run.advance_to = Some(deadline);
+            let outcome = run.run();
+            outcome.result.expect("run loop");
+            assert_eq!(outcome.deadlines, [deadline, deadline], "shared={shared}");
+            assert_eq!(outcome.ended, deadline, "shared={shared}");
+        }
+    }
+
+    /// Scenario: the local and the shared run loop, where the deadline resend
+    /// of the runtime-control manager (a second Shutdown with the same
+    /// deadline) and a second pdata are queued while the processor is still
+    /// inside `process` for the first pdata, and the processor then awaits the
+    /// completion of both until the deadline.
+    /// Guarantees: the resend is absorbed by the latched Shutdown: the second
+    /// pdata is delivered while the outputs are still open, the processor
+    /// sees Shutdown exactly once, and the phase runs once.
+    #[test]
+    fn a_deadline_resend_during_process_does_not_start_the_phase_early() {
+        for shared in [false, true] {
+            let clock = SimClock::new();
+            let deadline = clock.now() + Duration::from_millis(500);
+            let mut run = AwaitingRun::new(&clock, deadline, Some(deadline));
+            run.shared = shared;
+            run.pdata_delay = Duration::from_millis(100);
+            run.second_pdata = true;
+            run.after_shutdown.push(AfterShutdown::Shutdown(deadline));
+            run.advance_to = Some(deadline);
+            let outcome = run.run();
+            outcome.result.expect("run loop");
+            assert_eq!(
+                outcome.seen,
+                ["pdata", "pdata", "shutdown", "ended"],
+                "shared={shared}"
+            );
+            assert_eq!(outcome.deadlines, [deadline, deadline], "shared={shared}");
+        }
+    }
+
+    /// Records its messages and, while it handles Shutdown, whether its own
+    /// control channel still accepts a message.
+    struct ProbingProcessor {
+        seen: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl local::Processor<TestMsg> for ProbingProcessor {
+        async fn process(
+            &mut self,
+            msg: Message<TestMsg>,
+            _effect_handler: &mut local::EffectHandler<TestMsg>,
+        ) -> Result<(), Error> {
+            if let Message::Control(Shutdown { .. }) = msg {
+                self.seen.borrow_mut().push("shutdown");
+            }
+            Ok(())
+        }
+
+        async fn completions_ended(
+            &mut self,
+            _deadline: Instant,
+            _effect_handler: &mut local::EffectHandler<TestMsg>,
+        ) -> Result<(), Error> {
+            self.seen.borrow_mut().push("ended");
+            Ok(())
+        }
+    }
+
+    /// Scenario: a processor that awaits no completions is shut down through
+    /// the engine's run loop.
+    /// Guarantees: it receives exactly one Shutdown and no `completions_ended`,
+    /// and its control channel is closed once the run loop has ended.
+    #[test]
+    fn a_default_processor_keeps_no_control_receiver_after_shutdown() {
+        let local_tasks = tokio::task::LocalSet::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let config = ProcessorConfig::new("probing");
+        let node = test_node(config.name.clone());
+        let mut wrapper = ProcessorWrapper::local(
+            ProbingProcessor {
+                seen: Rc::clone(&seen),
+            },
+            node.clone(),
+            Arc::new(NodeUserConfig::new_processor_config("probing")),
+            &config,
+        );
+        let (input_tx, input_rx) = otel_arrow_dfe_channel::mpsc::Channel::<TestMsg>::new(4);
+        wrapper
+            .set_pdata_receiver(node.clone(), Receiver::Local(LocalReceiver::mpsc(input_rx)))
+            .expect("input");
+        let (output_tx, _output_rx) = otel_arrow_dfe_channel::mpsc::Channel::new(4);
+        wrapper
+            .set_pdata_sender(
+                node,
+                "out".into(),
+                Sender::Local(LocalSender::mpsc(output_tx)),
+            )
+            .expect("output");
+        let control = wrapper.control_sender();
+        local_tasks.block_on(&rt, async move {
+            let (runtime_ctrl_tx, _runtime_ctrl_rx) = runtime_ctrl_msg_channel(8);
+            let (completion_tx, _completion_rx) = pipeline_completion_msg_channel(8);
+            let (_metrics_rx, metrics_reporter) =
+                otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(64);
+            let task = tokio::task::spawn_local(crate::testing::processor::run_processor(
+                wrapper,
+                runtime_ctrl_tx,
+                completion_tx,
+                metrics_reporter,
+                crate::Interests::empty(),
+            ));
+            drop(input_tx);
+            control
+                .send(Shutdown {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("shutdown");
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the run loop ends")
+                .expect("join")
+                .expect("run loop");
+            assert!(
+                control.try_send(TimerTick {}).is_err(),
+                "the control channel is closed"
+            );
+        });
+        assert_eq!(*seen.borrow(), ["shutdown"]);
     }
 }

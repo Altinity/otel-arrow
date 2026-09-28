@@ -477,3 +477,43 @@ impl ValidationPhase {
         result
     }
 }
+
+/// Runs `wrapper` through the processor run loop the pipeline runtime uses,
+/// without flow metrics, with the test runtime services, until the processor
+/// ends. Unlike [`TestRuntime`], the engine delivers the control messages,
+/// including the completion phase after `Shutdown`.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn run_processor<PData>(
+    wrapper: ProcessorWrapper<PData>,
+    runtime_ctrl_tx: crate::control::RuntimeCtrlMsgSender<PData>,
+    completion_tx: crate::control::PipelineCompletionMsgSender<PData>,
+    metrics_reporter: MetricsReporter,
+    interests: Interests,
+) -> Result<(), Error>
+where
+    PData: crate::ReceivedAtNode + crate::processor::FlowMetricHook,
+{
+    wrapper
+        .start_with_completion_metrics(
+            runtime_ctrl_tx,
+            completion_tx,
+            metrics_reporter,
+            interests,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            crate::terminal_state::TerminalMetricsDeadline::default(),
+            crate::testing::test_pipeline_runtime_services(),
+        )
+        .await
+}

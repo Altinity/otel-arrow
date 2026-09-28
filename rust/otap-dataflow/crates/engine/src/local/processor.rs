@@ -118,6 +118,40 @@ pub trait Processor<PData> {
         true
     }
 
+    /// Until when this processor waits for the `Ack` or `Nack` of pdata it
+    /// has sent downstream; `None` when it expects none.
+    ///
+    /// Read once the processor has handled the `Shutdown` its inbox released,
+    /// and again after each completion. While it returns `Some`, the engine
+    /// closes the processor's outputs so the nodes downstream can finish, and
+    /// delivers `Ack` and `Nack` until the returned instant or the shutdown
+    /// deadline, whichever comes first; completions already queued then are
+    /// still delivered. It ends the phase by calling
+    /// [`Self::completions_ended`], also when handling a completion failed.
+    /// The processor receives `Shutdown` once. Defaults to `None`.
+    fn awaits_completions(&self) -> Option<Instant> {
+        None
+    }
+
+    /// Called once when the completion phase that
+    /// [`Self::awaits_completions`] asked for has ended: no `Ack` or `Nack`
+    /// follows. `deadline` is the shutdown deadline, the earliest any
+    /// `Shutdown` gave. Not called for a processor that awaited nothing.
+    /// Defaults to doing nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the processor cannot finish its shutdown work;
+    /// the run loop returns it unless a completion already failed.
+    async fn completions_ended(
+        &mut self,
+        deadline: Instant,
+        effect_handler: &mut EffectHandler<PData>,
+    ) -> Result<(), Error> {
+        let _ = (deadline, effect_handler);
+        Ok(())
+    }
+
     /// Returns optional runtime services that this processor needs from the engine.
     ///
     /// This is the single source of truth for runtime wiring. For example,

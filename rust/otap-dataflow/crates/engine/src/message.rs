@@ -284,6 +284,11 @@ struct InboxCore<PData, ControlRx, PDataRx> {
     shutting_down_deadline: Option<Instant>,
     /// Holds the ControlMsg::Shutdown until after we've drained pdata.
     pending_shutdown: Option<NodeControlMsg<PData>>,
+    /// Whether the control receiver outlives the released Shutdown (see
+    /// [`ProcessorInbox::recv_completion`]).
+    retain_completions: bool,
+    /// The control receiver kept after Shutdown was released.
+    completions_rx: Option<ControlRx>,
     /// The pipeline's shutdown deadline, once its runtime-control manager
     /// has accepted a shutdown; bounds a Shutdown synthesized for a closed
     /// pdata channel.
@@ -303,6 +308,7 @@ impl<PData, ControlRx, PDataRx> InboxCore<PData, ControlRx, PDataRx> {
         local_scheduler: Option<NodeLocalSchedulerHandle<PData>>,
         node_id: usize,
         interests: Interests,
+        retain_completions: bool,
     ) -> Self {
         Self {
             control_rx: Some(control_rx),
@@ -310,6 +316,8 @@ impl<PData, ControlRx, PDataRx> InboxCore<PData, ControlRx, PDataRx> {
             local_scheduler,
             shutting_down_deadline: None,
             pending_shutdown: None,
+            retain_completions,
+            completions_rx: None,
             pipeline_deadline: None,
             node_id,
             interests,
@@ -323,7 +331,10 @@ impl<PData, ControlRx, PDataRx> InboxCore<PData, ControlRx, PDataRx> {
         if let Some(local_scheduler) = &self.local_scheduler {
             local_scheduler.begin_shutdown(clock::now());
         }
-        drop(self.control_rx.take().expect("control_rx must exist"));
+        let control_rx = self.control_rx.take().expect("control_rx must exist");
+        if self.retain_completions {
+            self.completions_rx = Some(control_rx);
+        }
         drop(self.pdata_rx.take().expect("pdata_rx must exist"));
     }
 }
@@ -861,11 +872,14 @@ impl<PData> ProcessorInbox<PData> {
         interests: Interests,
     ) -> Self {
         Self {
-            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests),
+            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests, false),
         }
     }
 
-    /// Creates a new processor inbox with an explicit processor-local scheduler.
+    /// Creates the inbox of a processor run loop, with an explicit
+    /// processor-local scheduler; it keeps the control receiver after
+    /// Shutdown is released, for the completion phase (see
+    /// [`ProcessorInbox::recv_completion`]).
     #[must_use]
     pub(crate) fn new_with_local_scheduler(
         control_rx: Receiver<NodeControlMsg<PData>>,
@@ -881,6 +895,7 @@ impl<PData> ProcessorInbox<PData> {
                 Some(local_scheduler),
                 node_id,
                 interests,
+                true,
             ),
         }
     }
@@ -889,6 +904,52 @@ impl<PData> ProcessorInbox<PData> {
     /// pipeline's shutdown deadline once the pipeline shuts down.
     pub(crate) fn follow_pipeline_deadline(&mut self, deadline: PipelineShutdownDeadline) {
         self.core.pipeline_deadline = Some(deadline);
+    }
+
+    /// Whether the inbox has released its latched Shutdown, so no pdata or
+    /// further Shutdown can be received.
+    pub(crate) const fn released_shutdown(&self) -> bool {
+        self.core.control_rx.is_none()
+    }
+
+    /// Drops the control receiver kept after Shutdown, so completions sent
+    /// from now on are refused.
+    pub(crate) fn close_completions(&mut self) {
+        self.core.completions_rx = None;
+    }
+
+    /// Receives the next `Ack` or `Nack` sent to the processor after the
+    /// inbox released its Shutdown, waiting until `until` or `deadline`,
+    /// whichever comes first.
+    ///
+    /// A further Shutdown moves `deadline` earlier, never later, and is not
+    /// returned; other control messages are discarded. Once the wait has
+    /// ended, only the messages already queued are returned, so a completion
+    /// sent in time is not lost because it was dequeued late. Returns `None`
+    /// when nothing is queued then, or when the channel is closed.
+    pub(crate) async fn recv_completion(
+        &mut self,
+        until: Instant,
+        deadline: &mut Instant,
+    ) -> Option<NodeControlMsg<PData>> {
+        let completions = self.core.completions_rx.as_mut()?;
+        loop {
+            let wait_until = until.min(*deadline);
+            let msg = tokio::select! {
+                biased;
+                () = clock::sleep_until(wait_until) => completions.try_recv().ok()?,
+                msg = completions.recv() => msg.ok()?,
+            };
+            match msg {
+                NodeControlMsg::Ack(_) | NodeControlMsg::Nack(_) => return Some(msg),
+                NodeControlMsg::Shutdown {
+                    deadline: other, ..
+                } => {
+                    *deadline = (*deadline).min(other);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -924,7 +985,7 @@ impl<PData, ControlRx, PDataRx> ExporterInbox<PData, ControlRx, PDataRx> {
         interests: Interests,
     ) -> Self {
         Self {
-            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests),
+            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests, false),
         }
     }
 }
@@ -1750,6 +1811,7 @@ mod tests {
             Message::Control(NodeControlMsg::Shutdown { deadline: released, .. })
                 if released == deadline
         ));
+        assert!(inbox.released_shutdown());
         assert!(
             inbox.recv_when(true).await.is_err(),
             "Shutdown is released once"

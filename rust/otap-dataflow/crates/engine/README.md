@@ -570,6 +570,21 @@ Each node receives `Shutdown` once. A further `Shutdown` that reaches its
 inbox after the first, such as the control manager's resend at the deadline,
 only moves the latched deadline earlier, never later.
 
+A processor whose `awaits_completions()` returns `Some(until)` after it has
+handled `Shutdown` still expects the `Ack` or `Nack` of pdata it has sent
+downstream. The engine then closes its outputs so the nodes downstream can
+finish, delivers `Ack` and `Nack` until the processor expects none, `until` or
+the shutdown deadline, whichever comes first, and ends the phase by calling
+the processor's `completions_ended(deadline, effect_handler)`, with the
+deadline after any move. Completions already queued when the wait ends are
+still delivered. If handling a completion fails, the wait ends,
+`completions_ended` is still called, and the run loop returns the error. A
+processor that returns `None` gets no completion phase, and its control
+receiver closes once it has handled `Shutdown`. A processor with work to do in
+`completions_ended`, such as a final persist, returns an `until` early enough
+to finish that work before the shutdown deadline. Both methods have defaults,
+so a processor that does not opt in is unchanged.
+
 If the shutdown deadline expires, receivers may force-resolve remaining
 receiver-local waiters and the runtime control manager forces the remaining
 nodes to exit.
