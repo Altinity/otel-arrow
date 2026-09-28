@@ -179,6 +179,7 @@ pretty_assertions = "1.4.1"
 pprof = { version = "0.15", features = ["prost-codec"] }
 proc-macro2 = "1.0"
 prometheus = "0.14.0"
+proptest = "1.5"
 prost = "0.14"
 prost-types = "0.14"
 quote = "1.0"
