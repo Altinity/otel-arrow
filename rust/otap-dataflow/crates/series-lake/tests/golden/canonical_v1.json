@@ -1,0 +1,1034 @@
+{
+ "format": "canonical_v1",
+ "vectors": [
+  {
+   "name": "logs_minimal",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1"
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c69620100000001310100000000080000000400000000080000000400000000",
+   "series_id_hex": "70485cd4a3055a7ae11befcc64e3ddff"
+  },
+  {
+   "name": "empty_string_attr",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "str",
+       "value": ""
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c69620100000001310100000000080000000400000000080000000f0000000101000000016b0100000000",
+   "series_id_hex": "c0dc334eb389f61edd712a2c14cae47e"
+  },
+  {
+   "name": "missing_scope",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "",
+    "scope_version": ""
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e6964010000000261310100000000010000000001000000000100000000080000000400000000080000000400000000",
+   "series_id_hex": "0d488bcab72f5968f42e08545ada9d01"
+  },
+  {
+   "name": "int_zero",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "int",
+       "value": 0
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b03000000080000000000000000",
+   "series_id_hex": "f0123bc9801e028c78ad95feb04d54dc"
+  },
+  {
+   "name": "neg_zero_double",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "double",
+       "bits": 9223372036854775808
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b04000000080000000000000000",
+   "series_id_hex": "22e3450efbbb5a8e0ee2fcea329b57d3"
+  },
+  {
+   "name": "pos_zero_double",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "double",
+       "bits": 0
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b04000000080000000000000000",
+   "series_id_hex": "22e3450efbbb5a8e0ee2fcea329b57d3"
+  },
+  {
+   "name": "int_min",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "int",
+       "value": -9223372036854775808
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b03000000088000000000000000",
+   "series_id_hex": "296c711b098f5e09dee8245601f520e2"
+  },
+  {
+   "name": "int_max",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "int",
+       "value": 9223372036854775807
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b03000000087fffffffffffffff",
+   "series_id_hex": "da319ce39c4dca94bc83d758c86e91ce"
+  },
+  {
+   "name": "int_42",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "int",
+       "value": 42
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b0300000008000000000000002a",
+   "series_id_hex": "53a2bd0843dcb36758b29513e58ad4a6"
+  },
+  {
+   "name": "str_42",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "str",
+       "value": "42"
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000110000000101000000016b01000000023432",
+   "series_id_hex": "0b1ab4ad1c7c91dcc6880af3e4fa2227"
+  },
+  {
+   "name": "nan_quiet",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "double",
+       "bits": 9221120237041090560
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b04000000087ff8000000000000",
+   "series_id_hex": "03de0d34f07bf8556abf8012bc768659"
+  },
+  {
+   "name": "nan_payload",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "double",
+       "bits": 9221120237041090561
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b04000000087ff8000000000000",
+   "series_id_hex": "03de0d34f07bf8556abf8012bc768659"
+  },
+  {
+   "name": "nan_negative",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "double",
+       "bits": 18444492273895866368
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b04000000087ff8000000000000",
+   "series_id_hex": "03de0d34f07bf8556abf8012bc768659"
+  },
+  {
+   "name": "pos_inf",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "double",
+       "bits": 9218868437227405312
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b04000000087ff0000000000000",
+   "series_id_hex": "a06ee0b70e1a27fd22fed378d4ca50f4"
+  },
+  {
+   "name": "neg_inf",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "double",
+       "bits": 18442240474082181120
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000170000000101000000016b0400000008fff0000000000000",
+   "series_id_hex": "fd644004ca91371b890de861eb2049dc"
+  },
+  {
+   "name": "unicode_bmp",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "str",
+       "value": "é中"
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000140000000101000000016b0100000005c3a9e4b8ad",
+   "series_id_hex": "95ee03bb9d257f90cf041538f5a04e40"
+  },
+  {
+   "name": "unicode_supplementary",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "str",
+       "value": "😀"
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000130000000101000000016b0100000004f09f9880",
+   "series_id_hex": "b3253668c7321acb8c4e8449137a2769"
+  },
+  {
+   "name": "embedded_nul",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "str",
+       "value": "a\u0000b"
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000120000000101000000016b0100000003610062",
+   "series_id_hex": "c34e99a95bd9845ec81ddaea1de2f30a"
+  },
+  {
+   "name": "bytes",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "bytes",
+       "value": "00ff10"
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000120000000101000000016b020000000300ff10",
+   "series_id_hex": "05a197e57200329e911616613378cc3e"
+  },
+  {
+   "name": "null_value",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "null"
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c69620100000001310100000000080000000400000000080000000f0000000101000000016b0600000000",
+   "series_id_hex": "0ba68636721cf0c28f3f71af4a2f1745"
+  },
+  {
+   "name": "bool_true",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "bool",
+       "value": true
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000100000000101000000016b050000000101",
+   "series_id_hex": "398a035c2080b543aaf7298aeeb20903"
+  },
+  {
+   "name": "nested_array",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "array",
+       "items": [
+        {
+         "type": "int",
+         "value": 1
+        },
+        {
+         "type": "str",
+         "value": "x"
+        },
+        {
+         "type": "array",
+         "items": [
+          {
+           "type": "null"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000340000000101000000016b070000002500000003030000000800000000000000010100000001780700000009000000010600000000",
+   "series_id_hex": "ad114d2663b55d7ebb1168651586e7ed"
+  },
+  {
+   "name": "nested_kvlist",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "k",
+      "value": {
+       "type": "kvlist",
+       "entries": [
+        {
+         "key": "b",
+         "value": {
+          "type": "int",
+          "value": 2
+         }
+        },
+        {
+         "key": "a",
+         "value": {
+          "type": "kvlist",
+          "entries": [
+           {
+            "key": "z",
+            "value": {
+             "type": "bool",
+             "value": false
+            }
+           }
+          ]
+         }
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c6962010000000131010000000008000000040000000008000000410000000101000000016b08000000320000000201000000016108000000100000000101000000017a05000000010001000000016203000000080000000000000002",
+   "series_id_hex": "73042a198eaa915d67edef028f70d09c"
+  },
+  {
+   "name": "key_order_prefix",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "attrs": [
+     {
+      "key": "ab",
+      "value": {
+       "type": "int",
+       "value": 1
+      }
+     },
+     {
+      "key": "a",
+      "value": {
+       "type": "int",
+       "value": 2
+      }
+     },
+     {
+      "key": "aé",
+      "value": {
+       "type": "int",
+       "value": 3
+      }
+     },
+     {
+      "key": "b",
+      "value": {
+       "type": "int",
+       "value": 4
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c69620100000001310100000000080000000400000000080000005300000004010000000161030000000800000000000000020100000002616203000000080000000000000001010000000361c3a90300000008000000000000000301000000016203000000080000000000000004",
+   "series_id_hex": "3d2232f4dbe35a286243d706d09a64bd"
+  },
+  {
+   "name": "metrics_gauge",
+   "descriptor": {
+    "signal": "metrics",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "metric": {
+     "name": "cpu.usage",
+     "unit": "s",
+     "kind": "gauge",
+     "temporality": "",
+     "is_monotonic": false
+    }
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000076d6574726963730800000017000000010100000007686f73742e696401000000026131010000000001000000000100000000010000000008000000040000000001000000096370752e7573616765010000000173010000000567617567650100000000050000000100080000000400000000",
+   "series_id_hex": "0cf9464c7467714e000e71525c0cc2eb"
+  },
+  {
+   "name": "metrics_sum_delta_monotonic",
+   "descriptor": {
+    "signal": "metrics",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "metric": {
+     "name": "req",
+     "unit": "1",
+     "kind": "sum",
+     "temporality": "delta",
+     "is_monotonic": true
+    }
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000076d6574726963730800000017000000010100000007686f73742e69640100000002613101000000000100000000010000000001000000000800000004000000000100000003726571010000000131010000000373756d010000000564656c7461050000000101080000000400000000",
+   "series_id_hex": "abad9590c3d2c8fec65297748b24ff92"
+  },
+  {
+   "name": "metrics_histogram_cumulative",
+   "descriptor": {
+    "signal": "metrics",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "metric": {
+     "name": "lat",
+     "unit": "ms",
+     "kind": "histogram",
+     "temporality": "cumulative",
+     "is_monotonic": false
+    }
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000076d6574726963730800000017000000010100000007686f73742e696401000000026131010000000001000000000100000000010000000008000000040000000001000000036c617401000000026d730100000009686973746f6772616d010000000a63756d756c6174697665050000000100080000000400000000",
+   "series_id_hex": "746cbdbbf51e112b89a6e59ba92b7644"
+  },
+  {
+   "name": "metrics_exp_histogram_delta",
+   "descriptor": {
+    "signal": "metrics",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "metric": {
+     "name": "lat",
+     "unit": "ms",
+     "kind": "exp_histogram",
+     "temporality": "delta",
+     "is_monotonic": false
+    }
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000076d6574726963730800000017000000010100000007686f73742e696401000000026131010000000001000000000100000000010000000008000000040000000001000000036c617401000000026d73010000000d6578705f686973746f6772616d010000000564656c7461050000000100080000000400000000",
+   "series_id_hex": "42e89ab7c35644a6d62577de7242216b"
+  },
+  {
+   "name": "metrics_summary",
+   "descriptor": {
+    "signal": "metrics",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "metric": {
+     "name": "lat",
+     "unit": "ms",
+     "kind": "summary",
+     "temporality": "",
+     "is_monotonic": false
+    }
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000076d6574726963730800000017000000010100000007686f73742e696401000000026131010000000001000000000100000000010000000008000000040000000001000000036c617401000000026d73010000000773756d6d6172790100000000050000000100080000000400000000",
+   "series_id_hex": "72d34e9798b06afbd4d32e345c55099e"
+  },
+  {
+   "name": "metrics_dp_attrs",
+   "descriptor": {
+    "signal": "metrics",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "metric": {
+     "name": "cpu.usage",
+     "unit": "s",
+     "kind": "gauge",
+     "temporality": "",
+     "is_monotonic": false
+    },
+    "attrs": [
+     {
+      "key": "cpu",
+      "value": {
+       "type": "int",
+       "value": 3
+      }
+     },
+     {
+      "key": "mode",
+      "value": {
+       "type": "str",
+       "value": "user"
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000076d6574726963730800000017000000010100000007686f73742e696401000000026131010000000001000000000100000000010000000008000000040000000001000000096370752e7573616765010000000173010000000567617567650100000000050000000100080000002b0000000201000000036370750300000008000000000000000301000000046d6f6465010000000475736572",
+   "series_id_hex": "3451f737a0ef119bd5de2b4f58ea2d5a"
+  },
+  {
+   "name": "metrics_scope_attrs",
+   "descriptor": {
+    "signal": "metrics",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "metric": {
+     "name": "cpu.usage",
+     "unit": "s",
+     "kind": "gauge",
+     "temporality": "",
+     "is_monotonic": false
+    },
+    "scope_attrs": [
+     {
+      "key": "s",
+      "value": {
+       "type": "str",
+       "value": "v"
+      }
+     }
+    ],
+    "scope_name": "m",
+    "scope_version": "2"
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000076d6574726963730800000017000000010100000007686f73742e696401000000026131010000000001000000016d010000000132010000000008000000100000000101000000017301000000017601000000096370752e7573616765010000000173010000000567617567650100000000050000000100080000000400000000",
+   "series_id_hex": "154c7fbb4b0044e02715762584ef7c9f"
+  },
+  {
+   "name": "producer_a",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1"
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000016000000010100000007686f73742e6964010000000161010000000001000000036c69620100000001310100000000080000000400000000080000000400000000",
+   "series_id_hex": "c3ea0fd58461444a8a637f6539123a9e"
+  },
+  {
+   "name": "producer_b",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "b"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1"
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000016000000010100000007686f73742e6964010000000162010000000001000000036c69620100000001310100000000080000000400000000080000000400000000",
+   "series_id_hex": "cb62272e60a73872e52f19d4b647c81b"
+  },
+  {
+   "name": "schema_urls",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "resource_schema_url": "https://r",
+    "scope_schema_url": "https://s"
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000968747470733a2f2f7201000000036c6962010000000131010000000968747470733a2f2f73080000000400000000080000000400000000",
+   "series_id_hex": "7626d83df2bb81748ae496e0321d65eb"
+  },
+  {
+   "name": "logs_allow_list_missing_key",
+   "descriptor": {
+    "signal": "logs",
+    "resource_attrs": [
+     {
+      "key": "host.id",
+      "value": {
+       "type": "str",
+       "value": "a1"
+      }
+     }
+    ],
+    "scope_name": "lib",
+    "scope_version": "1",
+    "series_attributes": [
+     "gone",
+     "user",
+     "empty"
+    ],
+    "record_attrs": [
+     {
+      "key": "user",
+      "value": {
+       "type": "str",
+       "value": "u1"
+      }
+     },
+     {
+      "key": "extra",
+      "value": {
+       "type": "int",
+       "value": 1
+      }
+     },
+     {
+      "key": "empty",
+      "value": {
+       "type": "null"
+      }
+     }
+    ],
+    "attrs": [
+     {
+      "key": "user",
+      "value": {
+       "type": "str",
+       "value": "u1"
+      }
+     },
+     {
+      "key": "empty",
+      "value": {
+       "type": "null"
+      }
+     }
+    ]
+   },
+   "canonical_hex": "010000000d4f54454c2d5345524945532f3101000000046c6f67730800000017000000010100000007686f73742e696401000000026131010000000001000000036c696201000000013101000000000800000004000000000800000023000000020100000005656d707479060000000001000000047573657201000000027531",
+   "series_id_hex": "5ce27c51940067fd82b992504d8c1f2d"
+  }
+ ]
+}

@@ -27,6 +27,15 @@ The aggregate Rust and Go status jobs define required validation through their
 `needs` lists. Treat those lists as the source of truth when adding or removing
 required jobs.
 
+## Non-required workflows
+
+These run on pull requests that touch their paths and by hand
+(`workflow_dispatch`), never in the merge queue or on `main`, and no required
+check depends on them:
+
+- [`series-lake-golden.yml`](series-lake-golden.yml): regenerates the
+  series-lake golden vectors with the independent Python generator.
+
 ## Caching and artifacts
 
 - Pull-request and merge-queue jobs restore shared Rust caches without writing
