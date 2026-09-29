@@ -1,0 +1,117 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// The producer for the strict deployment (`series-parquet-s3.yaml`), whose OK
+// waits until the request's block is in the bucket. The buffered reference,
+// acknowledged at the engine's WAL write, is `series-parquet.alloy`.
+//
+// Site values come from the environment: SERIES_LOG_PATH is the file to tail
+// (default /var/log/app/app.log), SERIES_SERVICE_NAME the service.name of its
+// lines (default unknown_service), SERIES_PRODUCER_ID the producer id, unique
+// per producer (default the hostname), and OTLP_ENDPOINT the engine's
+// receiver.
+loki.source.file "series" {
+  targets = [{ __path__ = coalesce(sys.env("SERIES_LOG_PATH"), "/var/log/app/app.log") }]
+  forward_to = [otelcol.receiver.loki.series.receiver]
+  tail_from_end = false
+}
+
+otelcol.receiver.loki "series" {
+  output {
+    logs = [otelcol.processor.transform.series.input]
+  }
+}
+
+// The lake takes its producer_id column from the resource attribute named by
+// `producer_id_attribute` (`host.id`), which the Loki bridge does not supply.
+// Each producer needs its own value: SERIES_PRODUCER_ID, else the hostname.
+// `service.name` feeds the denormalized service column.
+otelcol.processor.transform "series" {
+  error_mode = "ignore"
+  log_statements {
+    context = "resource"
+    statements = [
+      string.format(`set(attributes["host.id"], %q)`,
+        coalesce(sys.env("SERIES_PRODUCER_ID"), constants.hostname)),
+      string.format(`set(attributes["service.name"], %q)`,
+        coalesce(sys.env("SERIES_SERVICE_NAME"), "unknown_service")),
+    ]
+  }
+  output {
+    logs = [otelcol.processor.batch.series.input]
+  }
+}
+
+// Without a batch every log line is its own OTLP export. The cap keeps one
+// export well below the engine receiver's max_decoding_message_size (16MiB in
+// the strict engine configs, tonic's 4MiB when unset): a larger message is
+// refused with INVALID_ARGUMENT, and the OTLP exporter below drops it. The
+// Loki bridge wraps each line in its own ResourceLogs, about 300
+// bytes on the wire beyond the line itself, so 4000 lines of 100 bytes are
+// 1.6 MB and lines of up to about 3.9 KB stay under 16MiB.
+//
+// Larger batches raise the strict engine's ceiling: each worker takes at most
+//   receiver_slots * records_per_export / hold_time
+// records per second, the hold time being about a window (128 slots of 4000
+// records: 512k/s at a 1s window, 34k/s at 15s).
+//
+// send_batch_max_size also keeps every request below 65,536 records: the
+// engine's conversion to Arrow records numbers a request's log records with
+// 16-bit ids and refuses a larger request whole.
+otelcol.processor.batch "series" {
+  send_batch_size     = 4000
+  send_batch_max_size = 4000
+  timeout             = "5s"
+  output {
+    logs = [otelcol.exporter.otlp.series.input]
+  }
+}
+
+otelcol.exporter.otlp "series" {
+  // The engine holds the OTLP response until the whole block is durable, and
+  // blocks are sealed on aligned window boundaries. A timeout below
+  // `window.interval` therefore cannot guarantee that an attempt completes:
+  // requests arriving early in a window commonly expire, while ones arriving
+  // near a boundary, or ones that trigger a byte or request rotation, do not.
+  // Each expired attempt is resent, which is safe under at-least-once
+  // delivery but multiplies both traffic and stored rows. An attempt timeout
+  // should cover channel residence, any flush already running plus its
+  // cleanup, the rest of the current window, its own flush and the
+  // notification; 180s covers the documented 15s window and 60s flush
+  // deadline. `SERIES_ALLOY_TIMEOUT` lets a test choose a short value.
+  timeout = coalesce(sys.env("SERIES_ALLOY_TIMEOUT"), "180s")
+  client {
+    endpoint = sys.env("OTLP_ENDPOINT")
+    compression = "none"
+    tls {
+      insecure = true
+    }
+  }
+  sending_queue {
+    enabled = true
+
+    // Measured in records. An export keeps its records in the queue until it
+    // completes, so the queue must hold num_consumers full batches:
+    // 32 * 4000 = 128000.
+    sizer = "items"
+    queue_size = 128000
+
+    // Parallel exports. An export is held for half a window plus the flush on
+    // average (a whole window at worst), so the exports in flight are
+    //   in_flight = rate * (interval / 2 + flush) / records_per_export.
+    // Sized for 10000 records/s from one producer in 4000-record batches
+    // against the 15s window: 10000 * (7.5s + 2s) / 4000 ~= 24. A whole-window
+    // hold, 10000 * 17s / 4000 ~= 43, needs more consumers and a larger queue.
+    num_consumers = 32
+
+    // The source is a file. Backpressure parks the tailer and leaves unread
+    // data on disk, which is durable and free. Dropping is neither.
+    block_on_overflow = true
+  }
+  retry_on_failure {
+    enabled = true
+    initial_interval = "200ms"
+    max_interval = "1s"
+    max_elapsed_time = "0s"
+  }
+}

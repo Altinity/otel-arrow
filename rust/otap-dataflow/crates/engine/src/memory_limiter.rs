@@ -847,6 +847,13 @@ impl MemoryUsageSampler {
     }
 }
 
+/// The memory limit of this process's cgroup (v2 `memory.max`, else v1
+/// `memory.limit_in_bytes`), `None` when there is none or it is unlimited.
+#[must_use]
+pub fn cgroup_memory_limit_bytes() -> Option<u64> {
+    CgroupMemorySampler::discover()?.limit_bytes()
+}
+
 #[derive(Debug, Clone)]
 struct CgroupMemorySampler {
     current_path: PathBuf,

@@ -27,7 +27,7 @@ else
     # mutually exclusive (compile_error! in non-test builds).
     cargo build \
         --locked \
-        --features azure,aws,contrib-exporters,contrib-processors,contrib-receivers,contrib-extensions \
+        --features azure,aws,contrib-exporters,contrib-processors,contrib-receivers,contrib-extensions,series-parquet,durable-buffer \
         --manifest-path "$PROJECT_DIR/Cargo.toml"
     BINARY="$PROJECT_DIR/target/debug/df_engine"
 fi
@@ -47,6 +47,11 @@ if [ -z "$CONFIG_FILES" ]; then
     echo "ERROR: No otel_dataflow config files found."
     exit 1
 fi
+
+# Placeholders for the environment variables that bundled configs require
+# without a default, where the variable is unset.
+export SERIES_S3_ACCESS_KEY_ID="${SERIES_S3_ACCESS_KEY_ID:-placeholder}"
+export SERIES_S3_SECRET_ACCESS_KEY="${SERIES_S3_SECRET_ACCESS_KEY:-placeholder}"
 
 TOTAL=0
 PASSED=0

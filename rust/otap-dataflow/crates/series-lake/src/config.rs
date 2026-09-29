@@ -1,8 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Format configuration types: the lake subset of an exporter's
-//! configuration.
+//! Format configuration types: the lake subset of the series_parquet
+//! exporter's configuration.
 //!
 //! The section types have no serde form: the exporter owns the user schema
 //! and maps it onto them. The value types written inside a section
@@ -919,7 +919,7 @@ mod tests {
     /// Scenario: the default configuration, and one with eight denormalized columns per signal,
     /// both without `ingress.max_series_per_request`.
     /// Guarantees: the unset limit is the derived one of the configuration it is part of, as the
-    /// configuration of an exporter using this crate is, so both configurations are valid.
+    /// series_parquet exporter's is, so both configurations are valid.
     #[test]
     fn an_unset_series_limit_is_the_derived_one() {
         let defaults = LakeConfig::default();

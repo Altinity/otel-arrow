@@ -1,0 +1,159 @@
+# OTLP/gRPC through a durable buffer to an S3-compatible series/values
+# Parquet lake: the reference deployment for Grafana Alloy producers.
+#
+# Pipeline topology:
+#
+#   otlp receiver --> durable_buffer (WAL) --> series_parquet exporter --> S3
+#
+# An OK OTLP response means the request is written to the buffer's write-ahead
+# log on this host, not yet in the bucket; the exporter's acknowledgement goes
+# to the buffer, which retries a failed block until the store takes it. The
+# WAL is synced at most every 25ms and on each 100ms tick, so an acknowledged
+# request survives a process crash (SIGKILL, OOM) but a host crash or power
+# loss can lose the last ~100ms of acknowledged requests. The matching
+# producer is `series-parquet.alloy`. `series-parquet-s3.yaml` is the strict
+# alternative, whose OK means the rows are in the bucket.
+#
+# Sizing, alerts and failure behaviour are in the series_parquet exporter
+# README, "Deploying with Alloy". Build with
+# `--features series-parquet,aws,durable-buffer`, create the bucket and the
+# WAL directory before starting. The static credentials come from
+# SERIES_S3_ACCESS_KEY_ID and SERIES_S3_SECRET_ACCESS_KEY; the engine refuses
+# to start while either is unset.
+#
+# Shutdown: SIGTERM grants a 60s deadline. The exporter returns by the
+# deadline plus upload.abort_timeout (exporter README, "The drain"), whatever
+# the window and retry settings; what it has not written stays in the WAL and
+# is sent after the restart. A supervisor's grace period must exceed that.
+#
+# The bucket needs a lifecycle rule that aborts incomplete multipart uploads
+# (AbortIncompleteMultipartUpload, for example after one day): an upload a
+# failed write could not abort is left to it and counted in
+# flush.abort_failures.
+#
+# Metrics: http://127.0.0.1:8080/api/v1/telemetry/metrics?format=prometheus&reset=false
+# with --http-admin-bind 127.0.0.1:8080.
+#
+# Usage:
+#   df_engine --config configs/series-parquet-buffered.yaml \
+#     --http-admin-bind 127.0.0.1:8080
+version: otel_dataflow/v1
+policies:
+  resources:
+    # One worker takes about 100k records/s behind the buffer; add a core per
+    # 100k/s up to the WAL device's ceiling (README, "Deploying with Alloy").
+    core_allocation: {type: core_count, count: 1}
+engine:
+  telemetry: {reporting_interval: 1s}
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          channel_capacity:
+            # pdata also caps the receiver's max_concurrent_requests.
+            control: {node: 100, pipeline: 100, completion: 100}
+            pdata: 128
+        nodes:
+          receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  # Bind the address the producers reach.
+                  listening_addr: "127.0.0.1:4317"
+                  # The response waits for the WAL write (process-crash safe; see the header for power loss).
+                  wait_for_result: true
+                  # Above Alloy's 10s attempt timeout, so the producer's deadline ends an attempt first.
+                  timeout: 15s
+                  # Sized to the sum of num_consumers of every producer: a request past it gets RESOURCE_EXHAUSTED with a RetryInfo delay, which Alloy retries, slowing the producer.
+                  max_concurrent_requests: 128
+                  # Equal to the exporter's ingress.max_request_bytes and twice Alloy's 2MiB exports: a larger
+                  # request gets INVALID_ARGUMENT, which Alloy drops. It bounds the buffer's memory (max_in_flight).
+                  max_decoding_message_size: 4MiB
+          buffer:
+            type: processor:durable_buffer
+            config:
+              # Its own fast device: it writes about twice the ingest bytes (WAL entry plus segment).
+              path: /var/lib/otap/series-wal
+              # Steady ingest x (window + flush), 0.3GB at 40k lines/s, plus 1x ingest per second of outage: 34min at 40k/s; divided between cores.
+              retention_size_cap: 32GiB
+              # A full WAL refuses new requests with UNAVAILABLE; producers retry and keep their data.
+              size_cap_policy: backpressure
+              # No max_age: expiry drops acknowledged data, counted in loss.*{reason=expired}.
+              # The exporter converts the OTLP bytes itself; the buffer stores them as received.
+              otlp_handling: pass_through
+              # Bundles held in memory until their block commits. Per worker at most
+              # memory.budget + max_in_flight x 4MiB + 128 receiver slots x 4MiB
+              # = 1.64 + 2.68 + 0.54 = 4.86 GB live, about 6.1 GB RSS (x1.25): 81% of
+              # a 7Gi pod memory limit, also after a restart
+              # that replays max_in_flight bundles at once. Alloy's 2MiB exports make
+              # it 3.25 GB live, 4.1 GB RSS. Carries 640 x 4000 lines / (15s + 5s)
+              # = 128k lines/s, above the worker's ~100k/s.
+              max_in_flight: 640
+              shutdown:
+                # Opt in (off by default): record the exporter's acks until 1s before the deadline, so written blocks are not replayed.
+                await_acks: 60s
+          exporter:
+            type: exporter:series_parquet
+            config:
+              storage:
+                s3:
+                  base_uri: s3://series-test/otel
+                  region: us-east-1
+                  endpoint: http://127.0.0.1:9000
+                  allow_http: true
+                  virtual_hosted_style_request: false
+                  # Payloads are signed. `unsigned_payload: true` skips the SHA-256
+                  # of every uploaded byte, which saves CPU, but leaves only TLS to
+                  # protect the bytes in transit: set it only with an https://
+                  # endpoint whose certificate is verified, never with this one.
+                  auth:
+                    type: static_credentials
+                    access_key_id: "${env:SERIES_S3_ACCESS_KEY_ID}"
+                    secret_access_key: "${env:SERIES_S3_SECRET_ACCESS_KEY}"
+              # Store-level retries end below flush_retry_deadline, as startup requires.
+              retry:
+                max_retries: 5
+                init_backoff: 200ms
+                max_backoff: 5s
+                backoff_base: 2.0
+                retry_timeout: 10s
+              writer_id: buffered_1
+              producer_id_attribute: host.id
+              window:
+                interval: 15s
+                max_block_bytes: 500MiB
+                max_requests_per_block: 4096
+                # Short: the buffer retries a failed block, and it sets the partition lateness bound
+                # window.interval + 2 * (flush_retry_deadline + upload.abort_timeout) = 55s (FORMAT.md).
+                flush_retry_deadline: 15s
+              ingress:
+                max_request_bytes: 4MiB
+                max_extracted_bytes: 32MiB
+                max_row_bytes: 1MiB
+                max_nesting_depth: 32
+              series_cache: {max_entries: 200000}
+              sorting: {run_target_bytes: 8MiB, merge_chunk_bytes: 16MiB}
+              upload: {part_bytes: 8MiB, concurrency: 2, abort_timeout: 5s}
+              parquet: {row_group_bytes: 64MiB, writer_limit_bytes: 96MiB}
+              # Stored and acknowledged without them: exponential histogram and
+              # summary points (dropped.unsupported{kind}) and, below, exemplars
+              # (dropped.exemplars). `reject` refuses the whole request instead.
+              # See the exporter README, "The v1 acknowledgement contract".
+              unsupported: drop
+              logs:
+                series_attributes: [logger.name]
+                denormalize: [resource.service.name]
+                values_sort:
+                  - {column: series_id, order: asc}
+                  - {column: time_unix_nano, order: asc, nulls: last}
+              metrics:
+                exemplars: drop
+                denormalize: [resource.service.name]
+                values_sort:
+                  - {column: series_id, order: asc}
+                  - {column: time_unix_nano, order: asc}
+        connections:
+          - {from: receiver, to: buffer}
+          - {from: buffer, to: exporter}

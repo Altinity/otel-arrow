@@ -1,0 +1,6 @@
+type: series_parquet
+status:
+  class: exporter
+  codeowners:
+    active:
+      - filimonov

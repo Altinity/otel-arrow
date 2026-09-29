@@ -1,0 +1,147 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+// The Grafana Alloy producer of the buffered reference deployment
+// (`series-parquet-buffered.yaml`): the engine answers once a request is in
+// its WAL, in tens of milliseconds. Run Alloy with
+//   alloy run --stability.level=public-preview --storage.path=<persistent dir>
+// The storage path keeps the file positions and the sending queue across a
+// restart; the flag enables the queue's file storage. The strict variant is
+// `series-parquet-strict.alloy`.
+//
+// Site values come from the environment: SERIES_LOG_PATH is the file to tail
+// (default /var/log/app/app.log), SERIES_SERVICE_NAME the service.name of its
+// lines (default unknown_service), SERIES_PRODUCER_ID the producer id, unique
+// per producer (default the hostname), and OTLP_ENDPOINT the engine's
+// receiver.
+loki.source.file "series" {
+  targets = [{ __path__ = coalesce(sys.env("SERIES_LOG_PATH"), "/var/log/app/app.log") }]
+  forward_to = [loki.process.series.receiver]
+  tail_from_end = false
+}
+
+// Changes data: a line longer than 512KiB is cut to 512KiB, suffix included.
+// The exporter refuses a record above its ingress.max_row_bytes (1MiB), and
+// with it the whole export after the WAL has acknowledged it, so one long line
+// would drop up to 2MiB of its neighbours; the limit leaves room for the
+// record's attributes.
+loki.process "series" {
+  stage.truncate {
+    rule {
+      limit  = "512KiB"
+      suffix = "...[truncated]"
+    }
+  }
+  forward_to = [otelcol.receiver.loki.series.receiver]
+}
+
+otelcol.receiver.loki "series" {
+  output {
+    logs = [otelcol.processor.transform.series.input]
+  }
+}
+
+// The lake takes its producer_id column from the resource attribute named by
+// `producer_id_attribute` (`host.id`), which the Loki bridge does not supply.
+// Each producer needs its own value: SERIES_PRODUCER_ID, else the hostname.
+// `service.name` feeds the denormalized service column.
+otelcol.processor.transform "series" {
+  error_mode = "ignore"
+  log_statements {
+    context = "resource"
+    statements = [
+      string.format(`set(attributes["host.id"], %q)`,
+        coalesce(sys.env("SERIES_PRODUCER_ID"), constants.hostname)),
+      string.format(`set(attributes["service.name"], %q)`,
+        coalesce(sys.env("SERIES_SERVICE_NAME"), "unknown_service")),
+    ]
+  }
+  output {
+    logs = [otelcol.processor.batch.series.input]
+  }
+}
+
+// The Loki bridge turns every line into its own request; the batch makes one
+// queue entry of up to 4000 lines (1.6 MB at 100-byte lines, which carry
+// about 300 bytes more each on the wire), so the file-backed queue writes one
+// entry per batch, not per line. The bytes cap is the sending queue's.
+//
+// send_batch_max_size also keeps every request below 65,536 records: the
+// engine's conversion to Arrow records numbers a request's log records with
+// 16-bit ids and refuses a larger request whole.
+otelcol.processor.batch "series" {
+  send_batch_size     = 4000
+  send_batch_max_size = 4000
+  timeout             = "5s"
+  output {
+    logs = [otelcol.exporter.otlp.series.input]
+  }
+}
+
+// Survives an Alloy restart or crash: without it the queued batches, whose
+// lines the file positions have already passed, are lost. With the default
+// `fsync = false` a write reaches the page cache, which survives a process
+// crash but not a host crash or power loss; `fsync = true` syncs every queue
+// write, at the cost of a disk sync per batch.
+otelcol.storage.file "queue" {}
+
+otelcol.exporter.otlp "series" {
+  // Twice the slowest WAL acknowledgement measured (p99 4.4s at the WAL
+  // device's ceiling; 20-50ms below it). `SERIES_ALLOY_TIMEOUT` lets a test
+  // choose another value.
+  timeout = coalesce(sys.env("SERIES_ALLOY_TIMEOUT"), "10s")
+  client {
+    endpoint = sys.env("OTLP_ENDPOINT")
+    compression = "none"
+    tls {
+      insecure = true
+    }
+  }
+  sending_queue {
+    enabled = true
+    storage = otelcol.storage.file.queue.handler
+
+    // Parallel exports. One export takes 4000 lines per WAL write, so two
+    // carry 2 * 4000 / 0.05s = 160k lines/s at a 50ms acknowledgement. The
+    // engine refuses an export beyond its receiver's max_concurrent_requests
+    // (128 per worker) with RESOURCE_EXHAUSTED and a RetryInfo delay, which
+    // this exporter retries, so the num_consumers of every producer that can
+    // reach one worker should sum to at most that (64 producers here), or the
+    // producers slow each other.
+    num_consumers = 2
+
+    // Measured in records. An export keeps its records in the queue until it
+    // completes, so the queue holds the consumers' batches and as many
+    // waiting: 2 * 2 * 4000 = 16000.
+    sizer = "items"
+    queue_size = 16000
+
+    // Splits an export at 2MiB, whatever the line length, so no export
+    // reaches the engine receiver's 4MiB max_decoding_message_size and the
+    // buffer's max_in_flight (640) exports hold at most 640 * 2MiB = 1.34 GB
+    // per worker. A 4000-line batch of 100-byte lines (1.59 MB) stays whole;
+    // 4000 lines of 8KiB (34 MB) leave as 16 exports of 2.09 MB and one of
+    // 0.54 MB. `min_size = 0` sends each batch at once, without waiting to
+    // merge.
+    batch {
+      flush_timeout = "5s"
+      min_size      = 0
+      max_size      = 2097152
+      sizer         = "bytes"
+    }
+
+    // The source is a file. A full queue parks the tailer and leaves the
+    // unread lines on disk; dropping is the default and loses them.
+    block_on_overflow = true
+  }
+  // Never give up: a batch whose retries end is dropped. While the WAL is
+  // full the engine answers UNAVAILABLE; the queue fills, the tailer parks,
+  // and the lines wait in the file. The 5s cap resumes a producer within 5s
+  // of the engine answering again.
+  retry_on_failure {
+    enabled = true
+    initial_interval = "500ms"
+    max_interval = "5s"
+    max_elapsed_time = "0s"
+  }
+}
