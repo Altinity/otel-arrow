@@ -129,8 +129,14 @@ regardless of which protocol clients use.
 
 #### Backpressure Behavior
 
-- **gRPC**: Permit acquired in `poll_ready` via Tower layer; backpressure
-  propagates to HTTP/2 so new streams are not accepted while saturated.
+- **gRPC**: Permit acquired in `poll_ready` via Tower layer. With
+  `load_shed: true` (the default) a request that finds no free permit is
+  refused with `RESOURCE_EXHAUSTED` and a `RetryInfo` delay, which OTLP clients
+  retry, and counted as `concurrency_limit`; with `load_shed: false` it waits
+  for a permit. A request
+  over the per-connection `transport_concurrency_limit` waits on its
+  connection, at most `max_concurrent_streams` per connection, and is never
+  refused.
 - **HTTP**: Requests queue for up to `timeout` waiting for a permit; on timeout,
   respond 503 Service Unavailable.
 
@@ -356,7 +362,7 @@ nodes:
           max_concurrent_streams: null
           # Per-connection limit (null = auto)
           transport_concurrency_limit: null
-          load_shed: true               # Fast reject when overloaded
+          load_shed: true               # RESOURCE_EXHAUSTED at max_concurrent_requests
 
           # --- Compression ---
           request_compression:          # Methods accepted for requests
@@ -434,7 +440,7 @@ nodes:
 | Endpoints | Standard gRPC service methods |
 | Compression | zstd, gzip, deflate (configurable) |
 | Concurrency | Local semaphore only (gRPC-only mode); global + local (dual-protocol mode) |
-| Backpressure | `poll_ready` gating; backpressure propagates to HTTP/2 |
+| Backpressure | `poll_ready` gating; `RESOURCE_EXHAUSTED` at the limit, or a wait with `load_shed: false` |
 
 ### OTLP/HTTP
 
@@ -486,6 +492,11 @@ Example with `max_request_body_size: 4MiB`:
 - 2 MiB compressed -> 10 MiB decompressed -> Rejected
 - 2 MiB compressed -> 3 MiB decompressed -> Accepted
 
+On gRPC, `max_decoding_message_size` bounds the wire and the decompressed
+message the same way. An oversized message is refused with
+`INVALID_ARGUMENT`, which OTLP clients do not retry, and counted as
+`payload_too_large`.
+
 ### Timeout Protection
 
 Both protocols enforce timeouts to mitigate slow-client (Slowloris-style) DoS:
@@ -503,13 +514,13 @@ components. The behavior depends on deployment mode:
 
 - Global semaphore bounds total inflight requests across both protocols
 - Per-protocol semaphores provide additional per-protocol limits
-- **gRPC**: Permit acquired in `poll_ready`; backpressure propagates to HTTP/2
+- **gRPC**: Permit acquired in `poll_ready`; `RESOURCE_EXHAUSTED` at the limit
 - **HTTP**: Requests queue for up to `timeout` (default 30s); 503 on timeout
 
 **Single-protocol modes:**
 
-- **gRPC only**: `GlobalConcurrencyLimitLayer` applies; excess requests refused
-  at `poll_ready` rather than queued
+- **gRPC only**: `GlobalConcurrencyLimitLayer` applies; excess requests are
+  refused with `RESOURCE_EXHAUSTED` at `poll_ready` rather than queued
 - **HTTP only**: Local semaphore with permit timeout (default 30s)
 
 When `max_concurrent_requests: 0` (the default), the limit is auto-tuned to

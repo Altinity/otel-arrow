@@ -1,0 +1,1069 @@
+{
+  "title": "series_parquet (buffered)",
+  "uid": "series-parquet-buffered",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "tags": [
+    "series_parquet",
+    "otap-dataflow"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Data source"
+      },
+      {
+        "name": "pod",
+        "type": "query",
+        "label": "Pod",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(memory_rss{job=\"series-parquet\",otel_scope_name=\"engine\"}, pod)",
+          "refId": "pod"
+        },
+        "definition": "label_values(memory_rss{job=\"series-parquet\",otel_scope_name=\"engine\"}, pod)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Throughput",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 1
+    },
+    {
+      "type": "timeseries",
+      "title": "Intake: items into the WAL",
+      "description": "Records accepted into the durable buffer per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, signal) (rate(consumed_total{otel_scope_name=\"processor.durable_buffer.items\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} {{signal}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 2
+    },
+    {
+      "type": "timeseries",
+      "title": "Stored: values rows written",
+      "description": "Values rows the exporter committed to the store per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, signal) (rate(rows_written_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\",dataset=\"values\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} {{signal}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 3
+    },
+    {
+      "type": "timeseries",
+      "title": "Receiver requests",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod) (rate(accepted_total{otel_scope_name=\"receiver.otlp.requests\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} accepted",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (pod, error_type) (rate(rejected_total{otel_scope_name=\"receiver.otlp.requests\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} rejected {{error_type}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 4
+    },
+    {
+      "type": "timeseries",
+      "title": "Export duration (block write, mean; max since the process started)",
+      "description": "How long the exporter takes to acknowledge a request to the buffer: the window wait plus the flush. The producer's acknowledgement is the WAL write.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod) (rate(duration_seconds_sum{otel_scope_name=\"exporter.exports\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) / sum by (pod) (rate(duration_seconds_count{otel_scope_name=\"exporter.exports\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} mean",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (pod) (duration_seconds_max{otel_scope_name=\"exporter.exports\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} max since start",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 5
+    },
+    {
+      "type": "row",
+      "title": "Freshness and WAL",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 6
+    },
+    {
+      "type": "timeseries",
+      "title": "Freshness",
+      "description": "Alert above 2 x window.interval (30s) for 5m.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pod, otel_scope_core_id) (oldest_pending_age_seconds{otel_scope_name=\"processor.durable_buffer\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} core {{otel_scope_core_id}} oldest pending (buffer)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (pod, otel_scope_core_id) (oldest_unacked_age_seconds{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} core {{otel_scope_core_id}} oldest unacked (exporter)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 7
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL used vs cap",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pod, otel_scope_core_id) (storage_bytes_used_bytes{otel_scope_name=\"processor.durable_buffer\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} core {{otel_scope_core_id}} used",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (pod, otel_scope_core_id) (storage_bytes_cap_bytes{otel_scope_name=\"processor.durable_buffer\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} core {{otel_scope_core_id}} cap",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 8
+    },
+    {
+      "type": "timeseries",
+      "title": "Buffer queued and in flight",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod) (queued{otel_scope_name=\"processor.durable_buffer.items\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} items queued",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (pod) (in_flight{otel_scope_name=\"processor.durable_buffer\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} bundles in flight",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "Buffer outcomes",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, outcome) (rate(resolved_total{otel_scope_name=\"processor.durable_buffer.bundles\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (pod) (rate(retries_scheduled_total{otel_scope_name=\"processor.durable_buffer\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} retries scheduled",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (pod, failure) (rate(failures_total{otel_scope_name=\"processor.durable_buffer.ingest\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} ingest {{failure}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (pod, reason) (rate(bundles_total{otel_scope_name=\"processor.durable_buffer.loss\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} lost {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 10
+    },
+    {
+      "type": "row",
+      "title": "Exporter",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "Flush duration (mean; max since the process started)",
+      "description": "Near window.interval means the destination is the limit. The engine keeps the maximum since the process started, so an old slow flush stays on the max line.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod) (rate(flush_duration_seconds_sum{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) / sum by (pod) (rate(flush_duration_seconds_count{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} mean",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (pod) (flush_duration_seconds_max{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} max since start",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 12
+    },
+    {
+      "type": "timeseries",
+      "title": "Flushes and failures",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 35,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, reason) (rate(flushes_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} flush {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (pod, error_type) (rate(block_write_failures_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} failed {{error_type}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (pod) (rate(flush_abort_failures_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} abort failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (pod, outcome) (rate(flush_late_commits_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} late commit {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 13
+    },
+    {
+      "type": "timeseries",
+      "title": "Exporter refusals (nacks)",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod, error_type) (rate(nacks_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{pod}} {{error_type}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 14
+    },
+    {
+      "type": "timeseries",
+      "title": "Admission closed",
+      "description": "1 while the worker takes no requests: a flush longer than the window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pod, otel_scope_core_id) (admission_closed{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} core {{otel_scope_core_id}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 15
+    },
+    {
+      "type": "row",
+      "title": "Memory and series cache",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 16
+    },
+    {
+      "type": "timeseries",
+      "title": "Exporter memory: accounted vs budget",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod) (memory_accounted_bytes{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} accounted",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (pod) (memory_budget_bytes{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} budget",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 17
+    },
+    {
+      "type": "timeseries",
+      "title": "Process memory and the memory limiter",
+      "description": "RSS, and the memory limiter's sample with its soft and hard limits (90 and 95 percent of the pod limit); above hard, requests are refused.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 52,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pod) (memory_rss{otel_scope_name=\"engine\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} RSS",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (pod) (process_memory_usage_bytes{otel_scope_name=\"engine\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} limiter sample",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "max by (pod) (process_memory_soft_limit_bytes{otel_scope_name=\"engine\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} soft limit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "max by (pod) (process_memory_hard_limit_bytes{otel_scope_name=\"engine\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} hard limit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 18
+    },
+    {
+      "type": "timeseries",
+      "title": "Series cache",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod) (series_cache_entries{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} entries",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 19
+    },
+    {
+      "type": "timeseries",
+      "title": "Series cache lookups and evictions",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod) (rate(series_cache_hits_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} hits",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (pod) (rate(series_cache_misses_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} misses",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (pod) (rate(series_cache_evictions_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}} evictions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 20
+    },
+    {
+      "type": "row",
+      "title": "Data altered on store and restarts",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 68,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 21
+    },
+    {
+      "type": "timeseries",
+      "title": "Data altered on store",
+      "description": "Acknowledged data stored altered or in part (exporter README, \"The v1 acknowledgement contract\"); the SeriesParquetDataAlteredOnStore rule.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 69,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pod) (rate(timestamp_out_of_range_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{pod}} timestamp out of range",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (pod, kind) (rate(dropped_unsupported_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{pod}} dropped {{kind}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (pod) (rate(dropped_exemplars_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{pod}} dropped exemplars",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (pod, signal) (rate(repaired_invalid_utf8_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{pod}} invalid UTF-8 repaired ({{signal}})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "E",
+          "expr": "sum by (pod, column) (rate(denormalize_type_mismatch_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{pod}} type mismatch {{column}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 22
+    },
+    {
+      "type": "timeseries",
+      "title": "Pipeline uptime per core",
+      "description": "A drop, or a new line for a core, is a pipeline replaced by runtime recovery or a reconfiguration; the SeriesParquetPipelineRestarted rule.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 69,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pod, otel_scope_pipeline_id, otel_scope_core_id, otel_scope_deployment_generation) (uptime{otel_scope_name=\"pipeline\",job=\"series-parquet\",pod=~\"$pod\"})",
+          "legendFormat": "{{pod}} {{otel_scope_pipeline_id}} core {{otel_scope_core_id}} generation {{otel_scope_deployment_generation}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "id": 23
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+ "format": "series-lake-schema/1",
+ "vectors": [
+  {
+   "name": "logs/series",
+   "dataset": "logs/series",
+   "logs_denormalize": [],
+   "rendering": "series-lake-schema/1\n9:series_id8:FSB<16>!\n14:identity_bytes4:Bin!\n10:emitted_at11:Ts<us,UTC>!\n19:resource_schema_url4:Str!\n14:resource_attrs15:Map<Str!,Str?>!\n10:scope_name4:Str!\n13:scope_version4:Str!\n16:scope_schema_url4:Str!\n11:scope_attrs15:Map<Str!,Str?>!\n5:attrs15:Map<Str!,Str?>!\n",
+   "fingerprint": "b94def7e47c943f8"
+  },
+  {
+   "name": "logs/values",
+   "dataset": "logs/values",
+   "logs_denormalize": [],
+   "rendering": "series-lake-schema/1\n9:series_id8:FSB<16>!\n11:producer_id4:Str!\n4:time11:Ts<us,UTC>?\n14:time_unix_nano4:I64?\n13:observed_time11:Ts<us,UTC>?\n23:observed_time_unix_nano4:I64?\n15:severity_number4:I32!\n13:severity_text4:Str!\n4:body4:Str?\n10:event_name4:Str!\n8:trace_id8:FSB<16>?\n7:span_id7:FSB<8>?\n5:flags4:I32!\n5:attrs15:Map<Str!,Str?>!\n",
+   "fingerprint": "01512d4eb446f355"
+  },
+  {
+   "name": "metrics/series",
+   "dataset": "metrics/series",
+   "logs_denormalize": [],
+   "rendering": "series-lake-schema/1\n9:series_id8:FSB<16>!\n14:identity_bytes4:Bin!\n10:emitted_at11:Ts<us,UTC>!\n19:resource_schema_url4:Str!\n14:resource_attrs15:Map<Str!,Str?>!\n10:scope_name4:Str!\n13:scope_version4:Str!\n16:scope_schema_url4:Str!\n11:scope_attrs15:Map<Str!,Str?>!\n5:attrs15:Map<Str!,Str?>!\n11:metric_name4:Str!\n4:unit4:Str!\n11:metric_type4:Str!\n11:temporality4:Str!\n12:is_monotonic4:Bol!\n11:description4:Str!\n",
+   "fingerprint": "e7c5410e543a8cc4"
+  },
+  {
+   "name": "metrics/values",
+   "dataset": "metrics/values",
+   "logs_denormalize": [],
+   "rendering": "series-lake-schema/1\n9:series_id8:FSB<16>!\n11:producer_id4:Str!\n11:metric_name4:Str!\n4:time11:Ts<us,UTC>?\n14:time_unix_nano4:I64?\n10:start_time11:Ts<us,UTC>?\n20:start_time_unix_nano4:I64?\n5:flags4:I32!\n9:value_int4:I64?\n12:value_double4:F64?\n5:count4:I64?\n3:sum4:F64?\n3:min4:F64?\n3:max4:F64?\n13:bucket_counts7:[I64!]?\n15:explicit_bounds7:[F64!]?\n",
+   "fingerprint": "0898a0f9608155f1"
+  },
+  {
+   "name": "logs/values+denormalized",
+   "dataset": "logs/values",
+   "logs_denormalize": [
+    {
+     "path": "resource.service.name",
+     "column": "service_name",
+     "type": "string"
+    },
+    {
+     "path": "attrs.http.status_code",
+     "column": "http_status_code",
+     "type": "int64"
+    },
+    {
+     "path": "attrs.latency",
+     "column": "latency",
+     "type": "double"
+    },
+    {
+     "path": "attrs.cached",
+     "column": "cached",
+     "type": "bool"
+    }
+   ],
+   "rendering": "series-lake-schema/1\n9:series_id8:FSB<16>!\n11:producer_id4:Str!\n4:time11:Ts<us,UTC>?\n14:time_unix_nano4:I64?\n13:observed_time11:Ts<us,UTC>?\n23:observed_time_unix_nano4:I64?\n15:severity_number4:I32!\n13:severity_text4:Str!\n4:body4:Str?\n10:event_name4:Str!\n8:trace_id8:FSB<16>?\n7:span_id7:FSB<8>?\n5:flags4:I32!\n5:attrs15:Map<Str!,Str?>!\n12:service_name4:Str?\n16:http_status_code4:I64?\n7:latency4:F64?\n6:cached4:Bol?\n",
+   "fingerprint": "a4585b65682804bf"
+  }
+ ]
+}

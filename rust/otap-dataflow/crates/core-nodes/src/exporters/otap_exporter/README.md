@@ -103,7 +103,9 @@ channel and is not duplicated by the exporter.
 | --- | --- | --- | --- |
 | `exporter.otap.failures.messages` | `{message}` | `signal`, `error.type` | Failed OTAP exports classified by actionable error type. |
 
-`error.type` is one of `payload_conversion`, `encoding`, `authentication`,
+`error.type` is one of `payload_conversion` (a request the conversion to
+Arrow records refuses, such as one with more than 65,536 resources, scopes or
+records, nacked permanently), `encoding`, `authentication`,
 `authorization`, `timeout`, `throttled`, `unavailable`, `rejected`,
 `server_error`, `transport`, `internal`, `shutdown`, or `other`. Successful
 exports do not emit this metric.

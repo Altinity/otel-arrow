@@ -1,0 +1,19 @@
+# Optional, for the prometheus-operator; not in kustomization.yaml because it
+# needs the PodMonitor CRD. The Alloy alerts select job="series-parquet-alloy".
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: series-parquet-alloy
+  # kube-prometheus-stack loads only monitors whose labels match its
+  # podMonitorSelector, by default `release: <its Helm release>`.
+  # labels:
+  #   release: <release>
+spec:
+  jobLabel: app.kubernetes.io/name
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: series-parquet-alloy
+  podMetricsEndpoints:
+    - port: http-metrics
+      path: /metrics
+      interval: 15s

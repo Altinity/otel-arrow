@@ -93,6 +93,7 @@ use crate::proto::OtlpProtoMessage;
 use crate::views::otlp::bytes::logs::RawLogsData;
 use crate::views::otlp::bytes::metrics::RawMetricsData;
 use crate::views::otlp::bytes::traces::RawTraceData;
+use crate::views::otlp::bytes::validate;
 use crate::{TryFromWithOptions, TryIntoWithOptions};
 use bytes::BytesMut;
 use otel_arrow_dfe_config::{ConversionOptions, SignalFormat, SignalType};
@@ -235,6 +236,28 @@ impl OtapPayload {
     /// Consumes this payload and extracts or converts it to OTAP records.
     pub fn into_otap(self) -> Result<OtapArrowRecords, crate::encode::Error> {
         self.try_into_with_default()
+    }
+
+    /// Check the protobuf framing of an OTLP body and of every message nested
+    /// in it, which the conversion to OTAP records reads lazily and never
+    /// refuses; see [`crate::views::otlp::bytes::validate`] for what is
+    /// checked. A payload of Arrow records has no framing and passes.
+    ///
+    /// # Errors
+    /// [`Error::InvalidOtlpWireFormat`] naming the problem, the innermost
+    /// message holding it and its byte offset, or [`Error::OtlpNestingTooDeep`].
+    pub fn validate_otlp_framing(&self) -> Result<(), Error> {
+        let PayloadData::OtlpBytes(bytes) = &self.data else {
+            return Ok(());
+        };
+        let root = match bytes {
+            OtlpProtoBytes::ExportLogsRequest(_) => validate::Message::ExportLogsServiceRequest,
+            OtlpProtoBytes::ExportMetricsRequest(_) => {
+                validate::Message::ExportMetricsServiceRequest
+            }
+            OtlpProtoBytes::ExportTracesRequest(_) => validate::Message::ExportTraceServiceRequest,
+        };
+        validate::validate_request(bytes.as_bytes(), root)
     }
 
     /// Returns the type of signal represented by this `OtapPdata` instance.
@@ -1752,5 +1775,71 @@ mod test {
         let otlp_bytes = OtlpProtoBytes::ExportMetricsRequest(Bytes::from(buf));
 
         assert_eq!(otlp_bytes.num_items(), 11);
+    }
+
+    /// Scenario: an OTLP logs request whose one record carries bytes that are
+    /// not UTF-8 in its `severity_text`, its string body, and an attribute's
+    /// key and string value, converted to OTAP records inside
+    /// `count_utf8_repairs` and back to OTLP.
+    /// Guarantees: the conversion succeeds, stores each of the four strings
+    /// with U+FFFD in place of the invalid bytes, and reports four repairs;
+    /// the same request with valid strings reports none.
+    #[test]
+    fn invalid_utf8_is_replaced_and_counted() {
+        use crate::encode::count_utf8_repairs;
+        use crate::proto::opentelemetry::common::v1::any_value;
+
+        let len_field = |field: u32, payload: &[u8]| {
+            let mut out = Vec::new();
+            prost::encoding::encode_key(
+                field,
+                prost::encoding::WireType::LengthDelimited,
+                &mut out,
+            );
+            prost::encoding::encode_varint(payload.len() as u64, &mut out);
+            out.extend_from_slice(payload);
+            out
+        };
+        let request = |severity: &[u8], body: &[u8], key: &[u8], value: &[u8]| {
+            let attribute = [len_field(1, key), len_field(2, &len_field(1, value))].concat();
+            let record = [
+                len_field(3, severity),
+                len_field(5, &len_field(1, body)),
+                len_field(6, &attribute),
+            ]
+            .concat();
+            let body = len_field(1, &len_field(2, &len_field(2, &record)));
+            OtapPayload::from(OtlpProtoBytes::ExportLogsRequest(body.into()))
+        };
+        let convert = |payload: OtapPayload| {
+            let (records, repaired) =
+                count_utf8_repairs(|| OtapArrowRecords::try_from_with_default(payload));
+            let otlp = OtlpProtoBytes::try_from_with_default(records.expect("converts"))
+                .expect("converts back");
+            let request = ExportLogsServiceRequest::decode(otlp.as_bytes()).expect("decodes");
+            (
+                request.resource_logs[0].scope_logs[0].log_records[0].clone(),
+                repaired,
+            )
+        };
+
+        let (record, repaired) = convert(request(b"\xffX", b"caf\xc3", b"\xfe", b"\x80"));
+        assert_eq!(repaired, 4);
+        assert_eq!(record.severity_text, "\u{FFFD}X");
+        assert_eq!(
+            record.body.and_then(|body| body.value),
+            Some(any_value::Value::StringValue("caf\u{FFFD}".into()))
+        );
+        assert_eq!(record.attributes[0].key, "\u{FFFD}");
+        assert_eq!(
+            record.attributes[0]
+                .value
+                .clone()
+                .and_then(|value| value.value),
+            Some(any_value::Value::StringValue("\u{FFFD}".into()))
+        );
+
+        let (_, repaired) = convert(request(b"INFO", b"cafe", b"k", b"v"));
+        assert_eq!(repaired, 0);
     }
 }

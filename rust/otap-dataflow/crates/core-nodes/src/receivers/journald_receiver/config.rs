@@ -6,8 +6,6 @@
 //! See [`docs/journald-receiver.md`](../../../../../../docs/journald-receiver.md)
 //! for the design document this implementation follows.
 
-use serde::Deserializer;
-use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -228,13 +226,13 @@ pub struct ExtractionConfig {
     /// Maximum copied bytes per journal entry.
     #[serde(
         default = "ExtractionConfig::default_max_entry_bytes",
-        deserialize_with = "deserialize_byte_size"
+        deserialize_with = "otel_arrow_dfe_config::byte_units::deserialize_required_u64"
     )]
     pub max_entry_bytes: u64,
     /// Maximum copied bytes per field value.
     #[serde(
         default = "ExtractionConfig::default_max_field_bytes",
-        deserialize_with = "deserialize_byte_size"
+        deserialize_with = "otel_arrow_dfe_config::byte_units::deserialize_required_u64"
     )]
     pub max_field_bytes: u64,
     /// Maximum copied fields per journal entry.
@@ -481,14 +479,6 @@ impl TryFrom<Config> for RuntimeConfig {
             drain_timeout,
         })
     }
-}
-
-fn deserialize_byte_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    otel_arrow_dfe_config::byte_units::deserialize_u64(deserializer)?
-        .ok_or_else(|| DeError::custom("byte size must not be null"))
 }
 
 fn invalid(msg: &str) -> otel_arrow_dfe_config::error::Error {

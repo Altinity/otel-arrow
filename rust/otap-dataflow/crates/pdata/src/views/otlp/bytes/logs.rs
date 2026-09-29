@@ -52,7 +52,7 @@ use crate::views::otlp::bytes::common::{
     KeyValueIter, RawAnyValue, RawInstrumentationScope, RawKeyValue,
 };
 use crate::views::otlp::bytes::decode::{
-    FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser,
+    FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser, field_range,
     from_option_nonzero_range_to_primitive, read_dropped_count, read_len_delim, read_varint,
     to_nonzero_range, validate_message_wire_format,
 };
@@ -305,6 +305,10 @@ impl<'a> Iterator for ResourceLogsIter<'a> {
                     byte_parser: ProtoBytesParser::new(slice),
                 });
             }
+            // Step over any other field (unknown, or known with another wire
+            // type), so its value is never read as field keys.
+            let (_, end) = field_range(self.buf, tag, self.pos)?;
+            self.pos = end;
         }
 
         None
@@ -381,9 +385,7 @@ impl ResourceLogsView for RawResourceLogs<'_> {
 
     #[inline]
     fn resource(&self) -> Option<Self::Resource<'_>> {
-        let slice = self
-            .byte_parser
-            .advance_to_find_field(RESOURCE_LOGS_RESOURCE)?;
+        let slice = self.byte_parser.message_field(RESOURCE_LOGS_RESOURCE)?;
 
         Some(RawResource::new(ProtoBytesParser::new(slice)))
     }
@@ -439,7 +441,7 @@ impl ScopeLogsView for RawScopeLogs<'_> {
 
     #[inline]
     fn scope(&self) -> Option<Self::Scope<'_>> {
-        let slice = self.byte_parser.advance_to_find_field(SCOPE_LOG_SCOPE)?;
+        let slice = self.byte_parser.message_field(SCOPE_LOG_SCOPE)?;
         Some(RawInstrumentationScope::new(ProtoBytesParser::new(slice)))
     }
 }
@@ -472,7 +474,7 @@ impl LogRecordView for RawLogRecord<'_> {
     #[inline]
     fn body(&self) -> Option<Self::Body<'_>> {
         self.bytes_parser
-            .advance_to_find_field(LOG_RECORD_BODY)
+            .message_field(LOG_RECORD_BODY)
             .map(RawAnyValue::new)
     }
 

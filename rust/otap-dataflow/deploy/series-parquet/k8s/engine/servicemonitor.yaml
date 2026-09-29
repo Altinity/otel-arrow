@@ -1,0 +1,21 @@
+# Optional, for the prometheus-operator; not in kustomization.yaml because it
+# needs the ServiceMonitor CRD. The engine alerts and the dashboard select
+# job="series-parquet", the Service's app.kubernetes.io/name.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: series-parquet
+  # kube-prometheus-stack loads only monitors whose labels match its
+  # serviceMonitorSelector, by default `release: <its Helm release>`.
+  # labels:
+  #   release: <release>
+spec:
+  jobLabel: app.kubernetes.io/name
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: series-parquet
+      app.kubernetes.io/component: admin
+  endpoints:
+    - port: admin
+      path: /api/v1/metrics
+      interval: 15s

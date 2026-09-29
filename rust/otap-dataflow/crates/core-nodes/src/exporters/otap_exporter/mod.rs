@@ -57,6 +57,7 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::{
     arrow_metrics_service_client::ArrowMetricsServiceClient,
     arrow_traces_service_client::ArrowTracesServiceClient,
 };
+use otel_arrow_dfe_pdata::{OtapPayload, PayloadData};
 use otel_arrow_dfe_telemetry::common_attributes::SignalAttributes;
 use otel_arrow_dfe_telemetry::error::Error as TelemetryError;
 use otel_arrow_dfe_telemetry::instrument::HistogramNormal;
@@ -735,17 +736,25 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                         let signal_type = pdata.signal_type();
 
                         let payload = pdata.take_payload();
-
+                        // OTLP bytes are kept (a reference count) so a refusal returns them.
+                        let original = matches!(payload.data(), PayloadData::OtlpBytes(_))
+                            .then(|| payload.clone());
                         let message: OtapArrowRecords = match payload.try_into_with_default() {
                             Ok(m) => m,
-                            Err(e) => {
+                            Err(_) => {
                                 self.metrics.record_failure(
                                     signal_type,
                                     OtapExporterErrorType::PayloadConversion,
                                     export_started_at.elapsed(),
                                 );
-                                effect_handler.notify_nack(NackMsg::new("payload conversion failed", pdata)).await?;
-                                return Err(e.into());
+                                // The conversion is deterministic, so a retry fails the same way.
+                                let (context, _) = pdata.into_parts();
+                                let refused = OtapPdata::new(
+                                    context,
+                                    original.unwrap_or_else(|| OtapPayload::empty(signal_type)),
+                                );
+                                effect_handler.notify_nack(NackMsg::new_permanent("payload conversion failed", refused)).await?;
+                                continue;
                             }
                         };
 
@@ -1463,6 +1472,7 @@ mod tests {
     use otel_arrow_dfe_engine::context::ControllerContext;
     use otel_arrow_dfe_engine::control::CallData;
     use otel_arrow_dfe_engine::control::Controllable;
+    use otel_arrow_dfe_engine::control::NackCause;
     use otel_arrow_dfe_engine::control::NodeControlMsg;
     use otel_arrow_dfe_engine::control::PipelineCompletionMsg;
     use otel_arrow_dfe_engine::control::PipelineCompletionMsgReceiver;
@@ -2922,6 +2932,217 @@ mod tests {
                 Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)) as Self::ArrowLogsStream,
             ))
         }
+    }
+
+    /// How the exporter decided one OTLP logs request sent by
+    /// `export_otlp_logs`.
+    #[derive(Debug)]
+    enum Decision {
+        Ack(u64),
+        Nack {
+            id: u64,
+            permanent: bool,
+            cause: NackCause,
+            reason: String,
+            /// The OTLP bytes the refused request carried back.
+            refused: Vec<u8>,
+        },
+    }
+
+    /// Send each OTLP logs body to an exporter, subscribed with its id, and
+    /// return the decisions in order and the batches `server`, when set,
+    /// received; without a server nothing listens on the endpoint.
+    fn export_otlp_logs(
+        bodies: Vec<(u64, Vec<u8>)>,
+        server: bool,
+    ) -> (Vec<Decision>, Vec<OtapPdata>) {
+        let grpc_addr = "127.0.0.1";
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let grpc_endpoint = format!("http://{grpc_addr}:{grpc_port}");
+        let tokio_rt = Runtime::new().unwrap();
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(16);
+        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        if server {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let listening_addr: SocketAddr = format!("{grpc_addr}:{grpc_port}").parse().unwrap();
+            _ = tokio_rt.spawn(async move {
+                let tcp_listener = TcpListener::bind(listening_addr).await.unwrap();
+                let _ = ready_tx.send(());
+                Server::builder()
+                    .add_service(ArrowLogsServiceServer::new(ArrowLogsServiceMock::new(
+                        received_tx,
+                    )))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(tcp_listener), async {
+                        let _ = server_shutdown_rx.await;
+                    })
+                    .await
+                    .expect("test gRPC server failed");
+            });
+            tokio_rt.block_on(ready_rx).expect("server started");
+        }
+
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(OTAP_EXPORTER_URN));
+        let controller_ctx = ControllerContext::new(TelemetryRegistryHandle::new());
+        let node_id = test_node(test_runtime.config().name.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let mut exporter = ExporterWrapper::local(
+            OTAPExporter::from_config(
+                pipeline_ctx,
+                &json!({
+                    "grpc_endpoint": grpc_endpoint,
+                    "compression_method": "none",
+                    "streams_per_signal": 1,
+                    "stream_queue_capacity": 4
+                }),
+            )
+            .unwrap(),
+            node_id.clone(),
+            node_config,
+            test_runtime.config(),
+        );
+        let control_sender = exporter.control_sender();
+        let (pdata_tx, pdata_rx) = create_not_send_channel::<OtapPdata>(1);
+        let pdata_tx = Sender::Local(LocalSender::mpsc(pdata_tx));
+        let pdata_rx = Receiver::Local(LocalReceiver::mpsc(pdata_rx));
+        let (runtime_ctrl_msg_tx, _runtime_ctrl_msg_rx) = runtime_ctrl_msg_channel(16);
+        let (pipeline_completion_msg_tx, mut pipeline_completion_msg_rx) =
+            pipeline_completion_msg_channel(16);
+        exporter
+            .set_pdata_receiver(node_id.clone(), pdata_rx)
+            .expect("Failed to set PData Receiver");
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+
+        let decisions = tokio_rt.block_on(async move {
+            let local_set = tokio::task::LocalSet::new();
+            let _exporter_fut = local_set.spawn_local(async move {
+                let _ = exporter
+                    .start(
+                        runtime_ctrl_msg_tx,
+                        pipeline_completion_msg_tx,
+                        metrics_reporter,
+                        Interests::empty(),
+                        otel_arrow_dfe_engine::testing::test_pipeline_runtime_services(),
+                    )
+                    .await;
+            });
+            let ((), decisions) = tokio::join!(local_set, async {
+                let mut decisions = Vec::new();
+                for (id, body) in bodies {
+                    let request =
+                        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+                    let pdata = OtapPdata::new_default(request.into()).test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        calldata_with_id(id),
+                        0,
+                    );
+                    pdata_tx.send(pdata).await.expect("send pdata");
+                    let decision =
+                        match timeout(Duration::from_secs(5), pipeline_completion_msg_rx.recv())
+                            .await
+                            .expect("a decision for the request")
+                        {
+                            Ok(PipelineCompletionMsg::DeliverAck { ack }) => {
+                                Decision::Ack(calldata_id(&ack.accepted))
+                            }
+                            Ok(PipelineCompletionMsg::DeliverNack { nack }) => {
+                                let refused = match nack.refused.payload_ref().data() {
+                                    otel_arrow_dfe_pdata::PayloadData::OtlpBytes(bytes) => {
+                                        bytes.as_bytes().to_vec()
+                                    }
+                                    other => panic!("refused a non-OTLP payload: {other:?}"),
+                                };
+                                Decision::Nack {
+                                    id: calldata_id(&nack.refused),
+                                    permanent: nack.permanent,
+                                    cause: nack.cause,
+                                    reason: nack.reason,
+                                    refused,
+                                }
+                            }
+                            Err(_) => panic!("pipeline result channel closed"),
+                        };
+                    decisions.push(decision);
+                }
+                control_sender
+                    .send(NodeControlMsg::Shutdown {
+                        deadline: Instant::now().add(Duration::from_millis(10)),
+                        reason: "test done".into(),
+                    })
+                    .await
+                    .unwrap();
+                decisions
+            });
+            decisions
+        });
+        let _ = server_shutdown_tx.send(());
+        let mut received = Vec::new();
+        while let Ok(pdata) = received_rx.try_recv() {
+            received.push(pdata);
+        }
+        (decisions, received)
+    }
+
+    /// One length-delimited field: its key, its length and `payload`.
+    fn len_field(field: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// An OTLP logs request holding one record with this severity text and
+    /// body, an encoded `AnyValue`; encoded by hand so either may hold bytes
+    /// that are not UTF-8 or a broken frame.
+    fn logs_request(severity: &[u8], body: &[u8]) -> Vec<u8> {
+        let record = [len_field(3, severity), len_field(5, body)].concat();
+        len_field(1, &len_field(2, &len_field(2, &record)))
+    }
+
+    /// `logs_request` with a string body.
+    fn logs_body(severity: &[u8], body: &[u8]) -> Vec<u8> {
+        logs_request(severity, &len_field(1, body))
+    }
+
+    /// Scenario: a well-framed OTLP logs request holding 65,537 empty
+    /// `ResourceLogs`, one more than the OTAP conversion's u16 ids can
+    /// number, followed by a valid request, with a destination that
+    /// acknowledges every batch.
+    /// Guarantees: the first is nacked permanently, as upstream #4168 nacks a
+    /// conversion failure, with its original bytes, and the exporter keeps
+    /// running: the second is sent and acknowledged.
+    #[test]
+    fn a_request_the_conversion_refuses_is_nacked_permanently() {
+        let too_many = [0x0a, 0x00].repeat(65_537);
+        let (decisions, received) = export_otlp_logs(
+            vec![
+                (61, too_many.clone()),
+                (62, logs_body(b"INFO", b"payment accepted")),
+            ],
+            true,
+        );
+        match &decisions[..] {
+            [
+                Decision::Nack {
+                    id: 61,
+                    permanent: true,
+                    cause: NackCause::Unspecified,
+                    reason,
+                    refused,
+                },
+                Decision::Ack(62),
+            ] => {
+                assert_eq!(reason, "payload conversion failed");
+                assert!(
+                    refused == &too_many,
+                    "the nack must carry the original bytes"
+                );
+            }
+            other => panic!("unexpected decisions: {other:?}"),
+        }
+        assert_eq!(received.len(), 1);
     }
 
     /// Scenario: Exporter shutdown races with an OTAP stream-open request after

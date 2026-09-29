@@ -1,0 +1,10 @@
+# One engine down at a time; its producers retry and queue until it returns.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: series-parquet
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: series-parquet

@@ -245,6 +245,90 @@ OTLP receiver with performance metrics:
 - Measures and exports performance metrics
 - View metrics at: `http://127.0.0.1:8080/telemetry/metrics?format=prometheus&reset=false`
 
+### `series-parquet-local.yaml`
+
+OTLP/gRPC receiver writing a local series/values Parquet lake:
+
+- Receives OTLP logs on `127.0.0.1:4317` with `wait_for_result: true`
+- Writes series and values Parquet datasets under
+  `/var/lib/otap/series-parquet`
+- Takes about 7k records/s per worker in requests of 512 records: each OK
+  waits on average half a 15s window plus the flush, and the receiver holds at
+  most 128 requests
+- View metrics at: `http://127.0.0.1:8080/api/v1/telemetry/metrics?format=prometheus&reset=false`
+
+Requires a binary built with `--features series-parquet`. Create the base
+directory, owned by the engine's user, before starting. An OK OTLP response
+means the request's files are in place under the base directory; the local
+backend does not `fsync`, so they survive a crash of the engine, not necessarily
+of the host. Clients should retry timeouts and transient failures and tolerate
+duplicates. Logs and metric number and histogram points are stored; traces are
+refused, and exponential histogram and summary points are dropped and counted
+(`unsupported: drop`, the default) or, under `unsupported: reject`, refuse their
+whole request.
+
+### `series-parquet-s3.yaml`
+
+The same pipeline writing to an S3-compatible object store:
+
+- Receives OTLP on `127.0.0.1:4317` with `wait_for_result: true`
+- Writes the series and values datasets under `s3://series-test/otel`
+- Retries object-store operations with an explicit backoff schedule
+- View metrics at: `http://127.0.0.1:8080/api/v1/telemetry/metrics?format=prometheus&reset=false`
+
+Requires a binary built with `--features series-parquet,aws` and an existing
+bucket with a lifecycle rule that aborts incomplete multipart uploads
+(`AbortIncompleteMultipartUpload`, for example after one day). The static
+credentials come from `SERIES_S3_ACCESS_KEY_ID` and
+`SERIES_S3_SECRET_ACCESS_KEY` in the environment, without which the engine
+refuses to start, and must name the
+credentials of a local MinIO or RustFS container; production deployments use
+the shared AWS auth provider configuration. An OK OTLP response means the
+request's objects are in the bucket. Receiver concurrency is sized for 100k
+records/s in requests of about 512 records; the file shows the formula, and
+its `pdata` channel capacity of 2048 keeps the receiver from lowering that
+limit.
+
+### `series-parquet-buffered.yaml`
+
+The reference deployment for Grafana Alloy producers: the S3 pipeline with a
+`processor:durable_buffer` between the receiver and the exporter.
+
+- Receives OTLP on `127.0.0.1:4317`; an OK means the request is in the WAL
+  under `/var/lib/otap/series-wal`, which gets its own device
+- Refuses with UNAVAILABLE while the WAL is at its 32GiB cap; the buffer
+  retries failed blocks, so the exporter's flush deadline is 15s
+- A SIGTERM drain ends by the 60s deadline plus `upload.abort_timeout`, 65s
+  in all; give the supervisor a longer grace period (90s in the deployment
+  example)
+
+Requires a binary built with `--features series-parquet,aws,durable-buffer`,
+an existing bucket with the same lifecycle rule, and the WAL directory. Metrics
+are served as for `series-parquet-s3.yaml`. Sizing, alerts and failure behaviour:
+the series_parquet exporter README, "Deploying with Alloy".
+
+### `series-parquet.alloy`
+
+The Grafana Alloy producer of `series-parquet-buffered.yaml`: it tails the
+file named by `SERIES_LOG_PATH` (default `/var/log/app/app.log`), sets
+`service.name` from `SERIES_SERVICE_NAME` and `host.id` from
+`SERIES_PRODUCER_ID` or the hostname, and exports OTLP logs to the endpoint
+named by the `OTLP_ENDPOINT` environment variable, with a file-backed sending
+queue that splits exports at 2MiB; lines above 512KiB are truncated. Run it
+with `alloy run --stability.level=public-preview
+--storage.path=<persistent dir>`.
+
+### `series-parquet-strict.alloy`
+
+The producer of the strict `series-parquet-s3.yaml`: the same pipeline with a
+180s attempt timeout, since each response waits for its block in the bucket,
+and an in-memory queue sized for that hold.
+
+Both Alloy files send plaintext OTLP (`tls { insecure = true }`) to an engine on
+the same host or a private network, and the producer id they set in `host.id`
+is not authenticated by the engine: see "Deploying with Alloy" in the
+series_parquet exporter README.
+
 ### `syslog-perf.yaml`
 
 Syslog/CEF receiver with performance metrics:

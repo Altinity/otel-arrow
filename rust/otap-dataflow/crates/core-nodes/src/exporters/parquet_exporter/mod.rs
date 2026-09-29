@@ -35,6 +35,7 @@ pub mod metrics;
 pub mod partition;
 pub mod records;
 pub mod schema;
+mod warn_limit;
 pub mod writer;
 
 use self::idgen::PartitionSequenceIdGenerator;
@@ -47,7 +48,6 @@ use futures_timer::Delay;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_engine::ExporterFactory;
-use otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::control::NodeControlMsg;
@@ -79,6 +79,8 @@ pub struct ParquetExporter {
     >,
     pdata_metrics: Option<MeasurementMetricSet<ExporterExportMetrics>>,
     io_metrics: Option<MetricSet<metrics::ParquetExporterMetrics>>,
+    /// The rate limit of the `parquet_exporter.conversion_failed` WARN.
+    conversion_log: warn_limit::WarnLimit,
 }
 
 /// Declares the Parquet exporter as a local exporter factory
@@ -96,15 +98,10 @@ pub static PARQUET_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              exporter_config: &ExporterConfig,
              capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities| {
         let mut exporter = ParquetExporter::from_config(pipeline, &node_config.config)?;
-        if exporter.config.storage.requires_bearer_token_provider() {
-            exporter.token_provider = Some(
-                capabilities
-                    .require_shared::<BearerTokenProvider>()
-                    .map_err(|e| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                        error: e.to_string(),
-                    })?,
-            );
-        }
+        exporter.token_provider = otel_arrow_dfe_otap::object_store::required_token_provider(
+            &exporter.config.storage,
+            capabilities,
+        )?;
         Ok(ExporterWrapper::local(
             exporter,
             node,
@@ -128,6 +125,7 @@ impl ParquetExporter {
             token_provider: None,
             pdata_metrics: None,
             io_metrics: None,
+            conversion_log: warn_limit::WarnLimit::new(),
         }
     }
 
@@ -150,6 +148,7 @@ impl ParquetExporter {
             token_provider: None,
             pdata_metrics: Some(pdata_metrics),
             io_metrics: Some(io_metrics),
+            conversion_log: warn_limit::WarnLimit::new(),
         })
     }
 
@@ -193,21 +192,12 @@ impl Exporter<OtapPdata> for ParquetExporter {
                 message = "parquet exporter retry settings are not applied to local file storage (invalid values will still be rejected)"
             );
         }
-        let object_store =
-            otel_arrow_dfe_otap::object_store::from_storage_type_with_retry_and_token_provider(
-                &self.config.storage,
-                self.config.retry.as_ref(),
-                self.token_provider.take(),
-            )
-            .map_err(|e| {
-                let source_detail = format_error_sources(&e);
-                Error::ExporterError {
-                    exporter: exporter_id.clone(),
-                    kind: ExporterErrorKind::Configuration,
-                    error: format!("error initializing object store {e}"),
-                    source_detail,
-                }
-            })?;
+        let object_store = otel_arrow_dfe_otap::object_store::exporter_store(
+            exporter_id.clone(),
+            &self.config.storage,
+            self.config.retry.as_ref(),
+            self.token_provider.take(),
+        )?;
 
         let writer_options = self.config.writer_options.unwrap_or_default();
 
@@ -332,8 +322,20 @@ impl Exporter<OtapPdata> for ParquetExporter {
                     // Note: context is not used
                     let (_context, payload) = pdata.into_parts();
 
-                    let mut otap_batch: OtapArrowRecords =
-                        payload.try_into_with_default().inspect_err(|_| {
+                    // The conversion is deterministic, so a request it refuses (more ids
+                    // than a u16 numbers, an id delta that overflows) is dropped.
+                    let converted =
+                        TryIntoWithOptions::<OtapArrowRecords>::try_into_with_default(payload)
+                            .map_err(|e| e.to_string())
+                            .and_then(|mut batch: OtapArrowRecords| {
+                                batch
+                                    .decode_transport_optimized_ids()
+                                    .map(|()| batch)
+                                    .map_err(|e| e.to_string())
+                            });
+                    let otap_batch = match converted {
+                        Ok(otap_batch) => otap_batch,
+                        Err(error) => {
                             if let Some(metrics) = self.pdata_metrics.as_mut() {
                                 metrics
                                     .with(SignalOutcomeAttributes {
@@ -342,27 +344,17 @@ impl Exporter<OtapPdata> for ParquetExporter {
                                     })
                                     .record(export_start.elapsed());
                             }
-                        })?;
-
-                    // decode the transport optimized IDs before converting
-                    // to unvalidated parquet records
-                    otap_batch.decode_transport_optimized_ids().map_err(|e| {
-                        if let Some(metrics) = self.pdata_metrics.as_mut() {
-                            metrics
-                                .with(SignalOutcomeAttributes {
-                                    signal: signal_type,
-                                    outcome: Outcome::Failure,
-                                })
-                                .record(export_start.elapsed());
+                            if let Some(suppressed) = self.conversion_log.admit(Instant::now()) {
+                                otel_warn!(
+                                    "parquet_exporter.conversion_failed",
+                                    signal = ?signal_type,
+                                    error = %error,
+                                    suppressed = suppressed
+                                );
+                            }
+                            continue;
                         }
-                        let source_detail = format_error_sources(&e);
-                        Error::ExporterError {
-                            exporter: exporter_id.clone(),
-                            kind: ExporterErrorKind::Other,
-                            error: format!("Failed to decode transport optimized IDs: {e}"),
-                            source_detail,
-                        }
-                    })?;
+                    };
 
                     // convert to parquet-local records for unvalidated access
                     let mut otap_batch: records::OtapParquetRecords = otap_batch.into();
@@ -985,6 +977,113 @@ mod test {
                     }
                 })
             });
+    }
+
+    /// The rows of every Parquet file of `table` under `base_dir`.
+    async fn table_batches(base_dir: &str, table: &str) -> Vec<RecordBatch> {
+        let mut batches = Vec::new();
+        let mut dir = tokio::fs::read_dir(format!("{base_dir}/{table}"))
+            .await
+            .expect("a table directory");
+        while let Some(entry) = dir.next_entry().await.expect("read dir") {
+            let file = File::open(entry.path()).await.unwrap();
+            let mut reader = ParquetRecordBatchStreamBuilder::new(file)
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            while let Some(batch) = reader.next().await {
+                batches.push(batch.unwrap());
+            }
+        }
+        batches
+    }
+
+    /// Run a file-storage parquet exporter over `requests`, OTLP logs bodies,
+    /// and return the rows it wrote to the logs table.
+    fn write_otlp_logs(requests: Vec<Vec<u8>>) -> Vec<RecordBatch> {
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_dir: String = temp_dir.path().to_str().unwrap().into();
+        let exporter = ParquetExporter::new(config::Config {
+            storage: object_store::StorageType::File {
+                base_uri: base_dir.clone(),
+            },
+            retry: None,
+            partitioning_strategies: None,
+            writer_options: None,
+        });
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(PARQUET_EXPORTER_URN));
+        let exporter = ExporterWrapper::<OtapPdata>::local::<ParquetExporter>(
+            exporter,
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+        let (batches_tx, batches_rx) = std::sync::mpsc::channel();
+        test_runtime
+            .set_exporter(exporter)
+            .run_test(move |ctx| {
+                Box::pin(async move {
+                    for body in requests {
+                        let request =
+                            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+                        ctx.send_pdata(OtapPdata::new_default(request.into()))
+                            .await
+                            .expect("send the request");
+                    }
+                    ctx.send_shutdown(Instant::now().add(Duration::from_secs(1)), "done")
+                        .await
+                        .unwrap();
+                })
+            })
+            .run_validation(move |_ctx, exporter_result| {
+                Box::pin(async move {
+                    exporter_result.unwrap();
+                    batches_tx
+                        .send(table_batches(&base_dir, "logs").await)
+                        .unwrap();
+                })
+            });
+        batches_rx.recv().unwrap()
+    }
+
+    /// A logs request of three records, the last with the string attribute
+    /// `k = "abc"`.
+    fn three_records() -> Vec<u8> {
+        let record = |attributes| otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogRecord {
+            time_unix_nano: 1,
+            attributes,
+            ..Default::default()
+        };
+        let attribute = KeyValue {
+            key: "k".into(),
+            value: Some(AnyValue::new_string("abc")),
+        };
+        prost::Message::encode_to_vec(
+            &otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest {
+                resource_logs: vec![otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ResourceLogs {
+                    scope_logs: vec![otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ScopeLogs {
+                        log_records: vec![record(vec![]), record(vec![]), record(vec![attribute])],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            },
+        )
+    }
+
+    /// Scenario: a well-framed OTLP logs request holding 65,537 empty
+    /// `ResourceLogs`, one more than the OTAP conversion's u16 ids can
+    /// number, then the well-formed request of three records.
+    /// Guarantees: the first is dropped, the exporter keeps running instead
+    /// of ending with an error, and exactly the three rows are written.
+    #[test]
+    fn a_request_the_conversion_refuses_is_dropped() {
+        let too_many = [0x0a, 0x00].repeat(65_537);
+        let batches = write_otlp_logs(vec![too_many, three_records()]);
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 3, "only the well-formed request is written");
     }
 
     #[test]

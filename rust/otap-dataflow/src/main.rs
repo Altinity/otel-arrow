@@ -45,6 +45,21 @@ fn memory_allocator_name() -> &'static str {
     }
 }
 
+/// The allocator and the state of jemalloc's background purging thread.
+fn memory_allocator_description() -> String {
+    format!(
+        "{}, background_thread {}",
+        memory_allocator_name(),
+        otel_arrow_dfe_engine::memory_limiter::jemalloc_background_thread()
+            .map_or("not applicable", |on| if on { "on" } else { "off" })
+    )
+}
+
+/// The system information df_engine prints at startup.
+fn startup_banner() -> String {
+    startup::system_info(&OTAP_PIPELINE_FACTORY, &memory_allocator_description())
+}
+
 // -----------------------------------------------------------------------------
 // Feature guard: jemalloc + mimalloc + dhat-heap any two together should fail.
 // -----------------------------------------------------------------------------
@@ -109,6 +124,31 @@ cfg_if! {
     }
 }
 
+/// jemalloc's compiled-in options: its background purging thread.
+///
+/// Without it, jemalloc returns freed pages to the kernel only while the
+/// process keeps allocating, so a quiet engine holds an unpredictable amount
+/// of retained memory (the quiet resident set of identical runs spread by 15
+/// to 34 percent without the thread, 1.4 to 6.6 percent with it). jemalloc
+/// reads this weak symbol before the `MALLOC_CONF` environment variable, so
+/// the environment still overrides or extends it. The symbol is `malloc_conf`
+/// because the `unprefixed_malloc_on_supported_platforms` feature leaves
+/// jemalloc's symbols unprefixed on Linux. It is set on glibc Linux only:
+/// tikv-jemalloc-sys lists musl among the targets where jemalloc's
+/// background threads do not work, so a musl build keeps jemalloc's own
+/// default (no background thread, and the startup line says `off`), as does
+/// every other target.
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    not(feature = "dhat-heap"),
+    not(feature = "mimalloc"),
+    feature = "jemalloc"
+))]
+#[allow(non_upper_case_globals, unsafe_code)]
+#[unsafe(export_name = "malloc_conf")]
+static malloc_conf: &[u8; 23] = b"background_thread:true\0";
+
 // Crypto provider features are mutually exclusive.
 // The `not(any(test, doc))` and `not(clippy)` guards mirror the jemalloc/mimalloc
 // pattern so that `cargo test --all-features` (used in CI) does not fail.
@@ -163,7 +203,7 @@ compile_error!(
     version,
     about,
     long_about = None,
-    after_help = startup::system_info(&OTAP_PIPELINE_FACTORY, memory_allocator_name()),
+    after_help = startup_banner(),
     after_long_help = concat!(
         "EXAMPLES:\n",
         "  ", env!("CARGO_BIN_NAME"), " --config file:/etc/config.yaml\n",
@@ -280,10 +320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    println!(
-        "{}",
-        startup::system_info(&OTAP_PIPELINE_FACTORY, memory_allocator_name())
-    );
+    println!("{}", startup_banner());
 
     let resolved = resolve_config(config.as_deref())?;
     let mut engine_cfg = match resolved.format {
@@ -329,6 +366,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: a default glibc Linux build, whose global allocator is
+    /// jemalloc, asks jemalloc whether its background thread is enabled, in
+    /// a test process started without `MALLOC_CONF`.
+    /// Guarantees: the compiled-in configuration was read, so jemalloc
+    /// runs with its background purging thread on. `MALLOC_CONF` is read
+    /// after it and may legitimately turn the thread off, so a process that
+    /// inherited one cannot observe the default and says so instead of
+    /// asserting.
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        not(feature = "dhat-heap"),
+        not(feature = "mimalloc"),
+        feature = "jemalloc"
+    ))]
+    #[test]
+    fn jemalloc_starts_with_its_background_thread() {
+        assert_eq!(memory_allocator_name(), "jemalloc");
+        if let Some(conf) = std::env::var_os("MALLOC_CONF") {
+            eprintln!(
+                "skipped: MALLOC_CONF={conf:?} overrides the compiled-in default, which this \
+                 process therefore cannot observe"
+            );
+            return;
+        }
+        assert_eq!(
+            otel_arrow_dfe_engine::memory_limiter::jemalloc_background_thread(),
+            Some(true)
+        );
+    }
+
+    /// Scenario: the banner df_engine prints at startup.
+    /// Guarantees: it names the allocator on exactly one line, and that line
+    /// also reports jemalloc's background thread state.
+    #[test]
+    fn startup_banner_names_the_allocator_once() {
+        let banner = startup_banner();
+        let lines: Vec<&str> = banner
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains("allocator"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("background_thread"), "{lines:?}");
+    }
 
     #[test]
     fn parse_core_range_ok() {

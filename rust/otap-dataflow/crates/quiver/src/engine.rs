@@ -694,6 +694,21 @@ impl QuiverEngine {
         map.into_iter().collect()
     }
 
+    /// When the oldest bundle not yet resolved by every subscriber was
+    /// ingested, to segment granularity: the earliest ingestion time of the
+    /// oldest incomplete segment or of the open segment, which a bundle
+    /// replayed from the WAL keeps from its first write; `None` when nothing
+    /// is pending. A segment found on disk at startup counts from its
+    /// finalization.
+    #[must_use]
+    pub fn oldest_pending_since(&self) -> Option<SystemTime> {
+        let finalized = self
+            .registry
+            .oldest_incomplete_with(|seq| self.segment_store.segment_oldest_ingestion(seq));
+        let open = self.open_segment.lock().oldest_ingestion();
+        finalized.into_iter().chain(open).min()
+    }
+
     /// Returns a snapshot of the open segment's bundle summaries.
     ///
     /// This method acquires a brief lock on the open segment to capture the current
@@ -1336,6 +1351,8 @@ impl QuiverEngine {
         // Assign a segment sequence number
         let seq = SegmentSeq::new(self.next_segment_seq.fetch_add(1, Ordering::SeqCst));
 
+        let oldest_ingestion = segment.oldest_ingestion();
+
         // Write the segment file (streaming serialization - no intermediate buffer)
         let segment_path = self.segment_path(seq);
         let writer = SegmentWriter::new(seq, self.set_permissions_supported);
@@ -1420,7 +1437,9 @@ impl QuiverEngine {
         // Step 6: Register segment with store (triggers subscriber notification).
         // Budget was already recorded above, so register_segment will skip
         // duplicate accounting (the file size was already added).
-        let _ = self.segment_store.register_new_segment(seq);
+        let _ = self
+            .segment_store
+            .register_new_segment(seq, oldest_ingestion);
 
         Ok(())
     }
@@ -3874,6 +3893,60 @@ mod tests {
         // when the soft cap is exceeded -- this test verifies the mechanism works.)
     }
 
+    /// Scenario: an engine with one subscriber, empty, then holding one
+    /// bundle in its open segment, then finalized, then acked and cleaned up.
+    /// Guarantees: `oldest_pending_since` is `None` with nothing pending, the
+    /// bundle's ingestion time (between the moments before and after the
+    /// ingest) while it waits in either segment, and `None` again once it is
+    /// resolved.
+    #[tokio::test]
+    async fn oldest_pending_since_tracks_the_oldest_unresolved_bundle() {
+        let temp_dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::builder()
+            .data_dir(temp_dir.path())
+            .wal(small_wal_config())
+            .build()
+            .expect("config valid");
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine created");
+        let sub_id = SubscriberId::new("test-sub").expect("valid id");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+        assert_eq!(engine.oldest_pending_since(), None);
+
+        let before = SystemTime::now();
+        engine
+            .ingest(&DummyBundle::with_rows(10))
+            .await
+            .expect("ingest");
+        let after = SystemTime::now();
+        let open = engine.oldest_pending_since().expect("open segment pending");
+        assert!(
+            before <= open && open <= after,
+            "{open:?} outside [{before:?}, {after:?}]"
+        );
+
+        engine.flush().await.expect("flush");
+        let finalized = engine.oldest_pending_since().expect("segment pending");
+        // The segment file's modification time can trail the system clock
+        // by a filesystem timestamp tick.
+        assert!(
+            before - Duration::from_secs(1) <= finalized && finalized <= open,
+            "{finalized:?} outside [{before:?} - 1s, {open:?}]"
+        );
+
+        engine
+            .poll_next_bundle(&sub_id)
+            .expect("poll")
+            .expect("bundle")
+            .ack();
+        let _ = engine.cleanup_completed_segments().expect("cleanup");
+        assert_eq!(engine.oldest_pending_since(), None);
+    }
+
     /// Scenario: DropOldest removes one pending segment without active readers.
     /// Guarantees: The loss snapshot reports its exact segment, bundle, and persisted-byte totals.
     #[tokio::test]
@@ -5973,6 +6046,109 @@ mod tests {
                 bundles_ingested, open_segment_bundles
             );
         }
+    }
+
+    /// Scenario: a bundle ingested an hour ago stays in the open segment
+    /// when the engine stops without finalizing it; the engine reopens,
+    /// replays it from the WAL, and then finalizes it.
+    /// Guarantees: `oldest_pending_since` reports the bundle's recorded
+    /// ingestion time, not the restart, both while the replayed bundle is in
+    /// the open segment and once its segment is finalized.
+    #[tokio::test]
+    async fn oldest_pending_since_survives_wal_replay() {
+        let dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::builder()
+            .data_dir(dir.path())
+            .segment(SegmentConfig {
+                target_size_bytes: NonZeroU64::new(100 * 1024 * 1024).unwrap(),
+                max_open_duration: Duration::from_secs(3600),
+                ..Default::default()
+            })
+            .build()
+            .expect("config");
+        let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        {
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("engine");
+            engine
+                .ingest(&TimestampedBundle::with_rows_and_time(10, hour_ago))
+                .await
+                .expect("ingest");
+            assert_eq!(engine.total_segments_written(), 0);
+        }
+
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine reopen");
+        let sub_id = SubscriberId::new("test-sub").expect("valid id");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+        let near =
+            |since: SystemTime| since <= hour_ago && hour_ago <= since + Duration::from_secs(1);
+        let since = engine
+            .oldest_pending_since()
+            .expect("replayed bundle pending");
+        assert!(near(since), "{since:?} is not {hour_ago:?}");
+
+        engine.flush().await.expect("flush");
+        assert_eq!(engine.total_segments_written(), 1);
+        let since = engine.oldest_pending_since().expect("segment pending");
+        assert!(near(since), "{since:?} is not {hour_ago:?}");
+    }
+
+    /// Scenario: a bundle ingested an hour ago is finalized into a segment and
+    /// never acknowledged; the engine stops and reopens with the segment on
+    /// disk.
+    /// Guarantees: `oldest_pending_since` reports the segment's finalization
+    /// time, between the moments before the flush and after the reopen.
+    #[tokio::test]
+    async fn oldest_pending_since_counts_a_segment_on_disk_from_its_finalization() {
+        let dir = tempdir().expect("tempdir");
+        let config = QuiverConfig::builder()
+            .data_dir(dir.path())
+            .build()
+            .expect("config");
+        let sub_id = SubscriberId::new("test-sub").expect("valid id");
+        let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        let before_flush;
+        {
+            let engine = QuiverEngine::open(config.clone(), test_budget())
+                .await
+                .expect("engine");
+            engine
+                .register_subscriber(sub_id.clone())
+                .expect("register");
+            engine.activate_subscriber(&sub_id).expect("activate");
+            engine
+                .ingest(&TimestampedBundle::with_rows_and_time(10, hour_ago))
+                .await
+                .expect("ingest");
+            before_flush = SystemTime::now();
+            engine.flush().await.expect("flush");
+            assert_eq!(engine.total_segments_written(), 1);
+            engine.shutdown().await.expect("shutdown");
+        }
+
+        let engine = QuiverEngine::open(config, test_budget())
+            .await
+            .expect("engine reopen");
+        engine
+            .register_subscriber(sub_id.clone())
+            .expect("register");
+        engine.activate_subscriber(&sub_id).expect("activate");
+        let after_reopen = SystemTime::now();
+        let since = engine
+            .oldest_pending_since()
+            .expect("finalized segment pending");
+        // The segment file's modification time can trail the system clock
+        // by a filesystem timestamp tick.
+        assert!(
+            before_flush - Duration::from_secs(1) <= since && since <= after_reopen,
+            "{since:?} outside [{before_flush:?} - 1s, {after_reopen:?}]"
+        );
     }
 
     #[tokio::test]

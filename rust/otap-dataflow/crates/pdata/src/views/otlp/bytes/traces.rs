@@ -31,7 +31,7 @@ use crate::{
     views::{
         otlp::bytes::common::{KeyValueIter, RawInstrumentationScope, RawKeyValue},
         otlp::bytes::decode::{
-            FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser,
+            FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser, field_range,
             from_option_nonzero_range_to_primitive, read_dropped_count, read_len_delim,
             read_varint, to_nonzero_range, validate_message_wire_format,
         },
@@ -242,12 +242,15 @@ impl FieldRanges for SpanFieldRanges {
                     self.first_link.set(range)
                 }
             }
-            _ => {
+            // A field number past the table is unknown (a newer OTLP field):
+            // skipped, never indexed, so it cannot panic the view.
+            _ if field_num < WIRE_TYPES.len() as u64 => {
                 let idx = field_num as usize;
                 if wire_type == WIRE_TYPES[idx] {
                     self.scalar_fields[idx].set(range)
                 }
             }
+            _ => {}
         }
     }
 }
@@ -445,6 +448,10 @@ impl<'a> Iterator for ResourceSpansIter<'a> {
                     byte_parser: ProtoBytesParser::new(slice),
                 });
             }
+            // Step over any other field (unknown, or known with another wire
+            // type), so its value is never read as field keys.
+            let (_, end) = field_range(self.buf, tag, self.pos)?;
+            self.pos = end;
         }
 
         None
@@ -562,9 +569,7 @@ impl ResourceSpansView for RawResourceSpans<'_> {
 
     #[inline]
     fn resource(&self) -> Option<Self::Resource<'_>> {
-        let slice = self
-            .byte_parser
-            .advance_to_find_field(RESOURCE_SPANS_RESOURCE)?;
+        let slice = self.byte_parser.message_field(RESOURCE_SPANS_RESOURCE)?;
 
         Some(RawResource::new(ProtoBytesParser::new(slice)))
     }
@@ -611,7 +616,7 @@ impl ScopeSpansView for RawScopeSpans<'_> {
 
     #[inline]
     fn scope(&self) -> Option<Self::Scope<'_>> {
-        let slice = self.byte_parser.advance_to_find_field(SCOPE_SPANS_SCOPE)?;
+        let slice = self.byte_parser.message_field(SCOPE_SPANS_SCOPE)?;
         Some(RawInstrumentationScope::new(ProtoBytesParser::new(slice)))
     }
 
@@ -773,7 +778,7 @@ impl SpanView for RawSpan<'_> {
 
     #[inline]
     fn status(&self) -> Option<Self::Status<'_>> {
-        let slice = self.bytes_parser.advance_to_find_field(SPAN_STATUS)?;
+        let slice = self.bytes_parser.message_field(SPAN_STATUS)?;
         Some(RawSpanStatus {
             bytes_parser: ProtoBytesParser::new(slice),
         })

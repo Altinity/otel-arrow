@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The label goes on every object and pod template; the selectors name it in
+# each file, so kustomize leaves the NetworkPolicy's Prometheus peer alone.
+labels:
+  - pairs:
+      app.kubernetes.io/name: series-parquet
+    includeTemplates: true
+resources:
+  - statefulset.yaml
+  - service.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+configMapGenerator:
+  - name: series-parquet-engine
+    files:
+      - engine.yaml
+  - name: series-parquet-site
+    envs:
+      - site.env

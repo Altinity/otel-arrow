@@ -15,6 +15,7 @@ use crate::error::Error;
 use crate::node::NodeId;
 use crate::node_local_scheduler::NodeLocalSchedulerHandle;
 use crate::runtime_services::PipelineRuntimeServices;
+use crate::shared::message::SharedPermit;
 use crate::{WakeupError, WakeupSetOutcome};
 use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_telemetry::error::Error as TelemetryError;
@@ -355,6 +356,20 @@ impl<PData> EffectHandlerCore<PData> {
         })
     }
 
+    /// Reserve a slot in the pipeline-completion channel, waiting for room.
+    /// Cancel safe: dropping the future gives the place up.
+    pub async fn reserve_completion(&self) -> Result<CompletionPermit<PData>, Error> {
+        let sender = self.pipeline_completion_msg_sender.as_ref()
+            .expect("[Internal Error] Node return sender not set. This is a bug in the pipeline engine implementation.");
+        let permit = sender.reserve().await.map_err(|e| Error::RuntimeMsgError {
+            error: e.to_string(),
+        })?;
+        Ok(CompletionPermit {
+            permit,
+            metrics: self.completion_emission_metrics.clone(),
+        })
+    }
+
     /// Send an AckMsg to the runtime control manager for context unwinding.
     /// This will skip if there are no frames.
     ///
@@ -524,5 +539,58 @@ impl<PData> TelemetryTimerCancelHandle<PData> {
                 _temp: std::marker::PhantomData,
             })
             .await
+    }
+}
+
+/// A slot reserved in the pipeline-completion channel (see
+/// [`crate::local::exporter::EffectHandler::reserve_completion`]); dropping
+/// it gives the slot back.
+///
+/// Like the effect handlers' Ack and Nack routing, its routing methods skip a message
+/// with no frames to unwind. Callers use the timing-stamping wrappers of
+/// their pdata type rather than these methods directly.
+#[must_use = "A reserved completion slot is held until the permit is used or dropped."]
+pub struct CompletionPermit<PData> {
+    permit: SharedPermit<PipelineCompletionMsg<PData>>,
+    metrics: Option<CompletionEmissionMetricsHandle>,
+}
+
+impl<PData: crate::Unwindable> CompletionPermit<PData> {
+    /// Route `ack` through the reserved slot, without waiting.
+    pub fn route_ack(self, ack: AckMsg<PData>) -> Result<(), Error> {
+        if !ack.accepted.has_frames() {
+            return Ok(());
+        }
+        let metrics = self.metrics.clone();
+        self.send(PipelineCompletionMsg::DeliverAck { ack })?;
+        if let Some(metrics) = metrics {
+            metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_notify_ack_routed();
+        }
+        Ok(())
+    }
+
+    /// Route `nack` through the reserved slot, without waiting.
+    pub fn route_nack(self, nack: NackMsg<PData>) -> Result<(), Error> {
+        if !nack.refused.has_frames() {
+            return Ok(());
+        }
+        let metrics = self.metrics.clone();
+        self.send(PipelineCompletionMsg::DeliverNack { nack })?;
+        if let Some(metrics) = metrics {
+            metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_notify_nack_routed();
+        }
+        Ok(())
+    }
+
+    fn send(self, msg: PipelineCompletionMsg<PData>) -> Result<(), Error> {
+        self.permit.send(msg).map_err(|e| Error::RuntimeMsgError {
+            error: e.to_string(),
+        })
     }
 }

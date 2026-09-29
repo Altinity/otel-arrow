@@ -107,6 +107,13 @@ impl<S: Clone> OutputRouter<S> {
     pub fn default_port(&self) -> Option<PortName> {
         self.default.as_ref().map(|(name, _, _)| name.clone())
     }
+
+    /// Drops every sender, so a downstream input no other node feeds closes;
+    /// a later send fails as it does for an unconnected port.
+    pub(crate) fn close(&mut self) {
+        self.ports.clear();
+        self.default = None;
+    }
 }
 
 impl<S: OutputSend> OutputRouter<S> {

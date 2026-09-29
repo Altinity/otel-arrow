@@ -3407,6 +3407,12 @@ groups: {}
         assert!(error.to_string().contains("context"));
     }
 
+    /// Scenario: every YAML file under `configs/`, including subdirectories, is read
+    /// as an engine config, with a placeholder for each `${env:VAR}` that has no
+    /// default.
+    /// Guarantees: each bundled config parses, so a shipped example cannot drift
+    /// from the config schema, and a required variable is the only thing it needs
+    /// from the site.
     #[test]
     fn bundled_configs_parse_as_engine_configs() {
         let mut dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs")];
@@ -3428,7 +3434,17 @@ groups: {}
                     continue;
                 }
 
-                let parsed = OtelDataflowSpec::from_file(&path);
+                // A `${env:VAR}` without a default names a site value, such as a
+                // credential, that must be set at startup; it gets a placeholder here.
+                let mut yaml = fs::read_to_string(&path).expect("failed to read config");
+                let parsed = loop {
+                    match OtelDataflowSpec::from_yaml(&yaml) {
+                        Err(Error::EnvVarNotFound { var }) => {
+                            yaml = yaml.replace(&format!("${{env:{var}}}"), "placeholder");
+                        }
+                        parsed => break parsed,
+                    }
+                };
                 assert!(
                     parsed.is_ok(),
                     "failed to parse engine config {}: {parsed:?}",
@@ -3436,6 +3452,65 @@ groups: {}
                 );
             }
         }
+    }
+
+    /// Scenario: the Kubernetes engine config of the series_parquet deployment
+    /// example is read next to `configs/series-parquet-buffered.yaml`.
+    /// Guarantees: it is a valid engine config, and it differs from the buffered
+    /// config only in the site lines its header names: the receiver address, the
+    /// exporter storage and writer_id, and the process memory limiter.
+    #[test]
+    fn series_parquet_deploy_config_differs_only_in_site_lines() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |path: &str| {
+            fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("read {path}: {e}"))
+        };
+        let deploy_text = read("deploy/series-parquet/k8s/engine/engine.yaml");
+        // Parsed without env substitution: the site values are `${env:...}` placeholders.
+        let spec: OtelDataflowSpec =
+            serde_yaml::from_str(&deploy_text).expect("the deploy config parses");
+        spec.validate().expect("the deploy config validates");
+
+        let deploy: serde_yaml::Value = serde_yaml::from_str(&deploy_text).expect("yaml");
+        let mut buffered: serde_yaml::Value =
+            serde_yaml::from_str(&read("configs/series-parquet-buffered.yaml")).expect("yaml");
+        let nodes = ["groups", "default", "pipelines", "main", "nodes"];
+        let site_lines: [&[&str]; 4] = [
+            &["policies", "resources", "memory_limiter"],
+            &[
+                &nodes[..],
+                &["receiver", "config", "protocols", "grpc", "listening_addr"],
+            ]
+            .concat(),
+            &[&nodes[..], &["exporter", "config", "storage"]].concat(),
+            &[&nodes[..], &["exporter", "config", "writer_id"]].concat(),
+        ];
+        for path in site_lines {
+            let (last, parents) = path.split_last().expect("non-empty path");
+            let lookup = |mut value: &serde_yaml::Value| {
+                for key in parents {
+                    value = &value[*key];
+                }
+                value.get(*last).cloned()
+            };
+            let site = lookup(&deploy);
+            let mut parent = &mut buffered;
+            for key in parents {
+                parent = &mut parent[*key];
+            }
+            let parent = parent
+                .as_mapping_mut()
+                .expect("site line parent is a mapping");
+            match site {
+                Some(value) => _ = parent.insert((*last).into(), value),
+                None => _ = parent.remove(*last),
+            }
+        }
+        assert_eq!(
+            buffered, deploy,
+            "deploy/series-parquet/k8s/engine/engine.yaml differs from \
+             configs/series-parquet-buffered.yaml beyond its site lines"
+        );
     }
 
     /// Kubernetes CRD compatibility tests.

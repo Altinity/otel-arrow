@@ -144,9 +144,12 @@ relaxed implementation can return the same strict decoder for both policies.
 The built-in OTLP codec uses allocation-free borrowed protobuf views in
 best-effort mode. Those views validate outer framing, but their nested
 iterators currently cannot distinguish malformed content from normal
-exhaustion. Strict OTLP decoding therefore uses Prost to validate the complete
-nested message before Arrow conversion. Encoded pass-through performs no
-decoding or validation under either policy.
+exhaustion. Strict OTLP decoding therefore first checks the protobuf framing
+of the complete nested message against the OTLP schema, refusing what Prost
+refuses, then converts it with the same views, which read a checked body as
+Prost decodes it. AnyValue nesting is limited to 256 levels, where Prost stops
+at 100 message levels. Encoded pass-through performs no decoding or validation
+under either policy.
 
 The function-style macro is intentionally thin. It hides the link-time inventory
 and required unsafe-lint exemption, so an extension crate does not need a direct

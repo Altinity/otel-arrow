@@ -1,0 +1,6 @@
+type: series-lake
+status:
+  class: library
+  codeowners:
+    active:
+      - filimonov
