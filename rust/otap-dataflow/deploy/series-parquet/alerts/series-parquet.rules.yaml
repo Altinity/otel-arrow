@@ -1,0 +1,372 @@
+# Prometheus rules for the buffered series_parquet deployment: the exporter
+# README "Alerts" table, plus a rule per scrape job for a target that is down
+# and rules for WAL volume errors. The engine names a metric by its instrument
+# alone (`block.write_failures` -> `block_write_failures_total`) and puts its set in
+# `otel_scope_name`, so every selector names the set. Selectors also name the
+# job the ServiceMonitor and PodMonitor set (`series-parquet`,
+# `series-parquet-alloy`), so other engines and Alloys are not matched; with
+# plain Prometheus, give the scrape jobs these names. A labelled counter is
+# not exposed until its first increment; "any" rules therefore also fire on a
+# series that is new within the range, which `increase` alone misses.
+# Thresholds use window.interval = 15s from engine.yaml. The restart rules
+# read kube-state-metrics.
+groups:
+  - name: series-parquet-engine
+    rules:
+      - alert: SeriesParquetEngineDown
+        expr: up{job="series-parquet"} == 0 or absent(up{job="series-parquet"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: Prometheus cannot scrape the engine, or has no engine target"
+          runbook: "Every other engine rule needs this scrape. Check the pod's status and restarts (an OOM kill or a crash loop), the Service and the ServiceMonitor."
+
+      - alert: SeriesParquetPipelineRestarted
+        # runtime_recovery replaces a failed core pipeline with a new
+        # deployment generation, a new `pipeline` series, while the process
+        # and its scrape stay up.
+        expr: |
+          count by (namespace, pod, otel_scope_pipeline_group_id, otel_scope_pipeline_id, otel_scope_core_id) (
+            count_over_time(uptime{job="series-parquet", otel_scope_name="pipeline"}[15m])
+          ) > 1
+          or max by (namespace, pod, otel_scope_pipeline_group_id, otel_scope_pipeline_id, otel_scope_core_id) (
+            resets(uptime{job="series-parquet", otel_scope_name="pipeline"}[15m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: pipeline {{ $labels.otel_scope_pipeline_id }} on core {{ $labels.otel_scope_core_id }} was replaced"
+          runbook: "A node failed and runtime recovery restarted the core pipeline (or the pipeline was reconfigured): producers were disconnected and in-flight WAL bundles are sent again, so some rows are stored twice. Read the otelcol.pipeline.recovery.* log events for the failure."
+
+      - alert: SeriesParquetEngineRestarted
+        expr: |
+          sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total{container="engine", pod=~"series-parquet-[0-9]+"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: the engine container restarted"
+          runbook: "The WAL replays what was not stored, and exports in flight at a crash may be stored twice. kubectl describe pod names the last termination reason; SeriesParquetEngineOOMKilled fires for an OOM kill."
+
+      - alert: SeriesParquetEngineOOMKilled
+        expr: |
+          max by (namespace, pod) (kube_pod_container_status_last_terminated_reason{container="engine", pod=~"series-parquet-[0-9]+", reason="OOMKilled"}) > 0
+          and on (namespace, pod)
+          sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total{container="engine", pod=~"series-parquet-[0-9]+"}[15m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: the kernel killed the engine for memory"
+          runbook: "The pod limit is below what the load needs: compare it with the Sizing formula per worker (README), which assumes requests of at most the receiver's max_decoding_message_size (4MiB) and max_in_flight bundles in memory, and check SeriesParquetMemoryNearLimit before the kill. The restart replays up to max_in_flight bundles at once whatever the memory pressure, so the replay can be killed again and hold acknowledged data in the WAL: raise the memory limit, or lower max_in_flight, before it restarts."
+
+      - alert: SeriesParquetFreshness
+        expr: |
+          max by (namespace, pod, otel_scope_core_id) (
+            oldest_pending_age_seconds{job="series-parquet", otel_scope_name="processor.durable_buffer"}
+          ) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: the oldest WAL segment not yet stored is {{ $value | humanizeDuration }} old"
+          runbook: "Healthy it stays below window.interval plus the flush. Check the flush failures and the object store; the WAL keeps the data meanwhile."
+
+      - alert: SeriesParquetWalFill
+        expr: |
+          max by (namespace, pod, otel_scope_core_id) (
+            storage_bytes_used_bytes{job="series-parquet", otel_scope_name="processor.durable_buffer"}
+            / storage_bytes_cap_bytes{job="series-parquet", otel_scope_name="processor.durable_buffer"}
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: WAL {{ $value | humanizePercentage }} full"
+          runbook: "The exporter is not keeping up or the store is down; at 100 percent producers get UNAVAILABLE. Check SeriesParquetFlushFailing and the store."
+
+      - alert: SeriesParquetWalBackpressure
+        expr: |
+          sum by (namespace, pod) (increase(failures_total{job="series-parquet", otel_scope_name="processor.durable_buffer.ingest", failure="backpressure"}[10m])) > 0
+          or sum by (namespace, pod) (
+            failures_total{job="series-parquet", otel_scope_name="processor.durable_buffer.ingest", failure="backpressure"} > 0
+            unless failures_total{job="series-parquet", otel_scope_name="processor.durable_buffer.ingest", failure="backpressure"} offset 10m
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: WAL full, requests refused with UNAVAILABLE"
+          runbook: "Producers retry and keep their data in their queue and log files; a log rotation that removes an unread file loses it. Restore the store or add WAL capacity."
+
+      - alert: SeriesParquetWalWriteErrors
+        expr: |
+          sum by (namespace, pod) (increase(failures_total{job="series-parquet", otel_scope_name="processor.durable_buffer.ingest", failure="error"}[10m])) > 0
+          or sum by (namespace, pod) (
+            failures_total{job="series-parquet", otel_scope_name="processor.durable_buffer.ingest", failure="error"} > 0
+            unless failures_total{job="series-parquet", otel_scope_name="processor.durable_buffer.ingest", failure="error"} offset 10m
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: the WAL fails to take requests, refused with UNAVAILABLE"
+          runbook: "A write error on the WAL volume: a full file system, an I/O error or a read-only remount. Producers retry and keep their data. Read the durable_buffer.ingest.failed log events and check the volume."
+
+      - alert: SeriesParquetWalSegmentErrors
+        expr: |
+          sum by (namespace, pod) (increase(flush_failures_total{job="series-parquet", otel_scope_name="processor.durable_buffer"}[10m])) > 0
+          or sum by (namespace, pod) (increase(read_errors_total{job="series-parquet", otel_scope_name="processor.durable_buffer"}[10m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: the WAL fails to finalize or read its segments"
+          runbook: "Acknowledged data stays in the WAL but may not reach the exporter. Read the durable_buffer.flush.failed, durable_buffer.poll.failed and durable_buffer.bundle.conversion_failed log events and check the volume."
+
+      - alert: SeriesParquetBufferGrowing
+        # `queued` is a sawtooth with the window's period: it grows through a
+        # window and drops when the block commits. The rule fires when the
+        # lowest value of the last five minutes stays above the highest of
+        # the five before, so the backlog grew by more than one window's swing.
+        expr: |
+          sum by (namespace, pod) (min_over_time(queued{job="series-parquet", otel_scope_name="processor.durable_buffer.items"}[5m]))
+          > sum by (namespace, pod) (max_over_time(queued{job="series-parquet", otel_scope_name="processor.durable_buffer.items"}[5m] offset 5m))
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: items waiting in the WAL keep growing"
+          runbook: "The store stalls or the worker is at its rate; compare the intake and stored rates on the dashboard."
+
+      - alert: SeriesParquetNoIntake
+        # Every other engine rule watches data that reached the engine, so a
+        # producer side that went silent pages nowhere else.
+        expr: |
+          sum by (namespace, pod) (rate(consumed_total{job="series-parquet", otel_scope_name="processor.durable_buffer.items"}[10m])) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: no request reached the WAL for 25 minutes"
+          runbook: "The producers are silent or cannot reach the engine: check SeriesParquetAlloyDown, Alloy's log for export errors and its file targets, the producer namespaces' series-parquet/producer label (NetworkPolicy) and the Service. A site with idle periods drops this rule or lengthens its for."
+
+      - alert: SeriesParquetOldestUnacked
+        expr: |
+          max by (namespace, pod, otel_scope_core_id) (
+            oldest_unacked_age_seconds{job="series-parquet", otel_scope_name="exporter.series_parquet"}
+          ) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: the exporter owes the buffer a request {{ $value | humanizeDuration }} old"
+          runbook: "Healthy it stays below window.interval plus the flush (19s measured). Check the flush duration and failures."
+
+      - alert: SeriesParquetFlushFailing
+        expr: |
+          sum by (namespace, pod) (rate(block_write_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type=~"deadline|cancelled"}[5m])) > 0
+          or sum by (namespace, pod) (rate(retries_scheduled_total{job="series-parquet", otel_scope_name="processor.durable_buffer"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: blocks keep failing to reach the store in time"
+          runbook: "The buffer retries them; see series_parquet.flush.failed and flush.attempt_failed logs for the store error."
+
+      - alert: SeriesParquetStoreRefuses
+        expr: |
+          sum by (namespace, pod) (increase(block_write_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type="permanent_storage"}[10m])) > 0
+          or sum by (namespace, pod) (
+            block_write_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type="permanent_storage"} > 0
+            unless block_write_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type="permanent_storage"} offset 10m
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: the store refuses blocks for good (for example HTTP 403)"
+          runbook: "Check the credentials, the bucket policy (bucket/iam-policy.json) and unsigned_payload; the buffer retries and the WAL fills."
+
+      - alert: SeriesParquetExporterInternal
+        expr: |
+          sum by (namespace, pod) (increase(block_write_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type=~"encode|internal"}[10m])) > 0
+          or sum by (namespace, pod) (
+            block_write_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type=~"encode|internal"} > 0
+            unless block_write_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type=~"encode|internal"} offset 10m
+          )
+          or sum by (namespace, pod) (increase(nacks_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type="internal"}[10m])) > 0
+          or sum by (namespace, pod) (
+            nacks_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type="internal"} > 0
+            unless nacks_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type="internal"} offset 10m
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: the exporter failed blocks or requests itself"
+          runbook: "Read the series_parquet.flush.failed and series_parquet.request.failed logs and report them."
+
+      - alert: SeriesParquetNotifyFailures
+        expr: |
+          sum by (namespace, pod) (increase(notify_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet"}[10m])) > 0
+          or sum by (namespace, pod) (increase(notify_lost_acks_total{job="series-parquet", otel_scope_name="exporter.series_parquet"}[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: the engine refused completions"
+          runbook: "The buffer keeps those bundles in flight until a restart replays them; restart the pod if in_flight stays high. A lost Ack (notify_lost_acks_total) means a written block is stored again after the restart."
+
+      - alert: SeriesParquetAbortFailures
+        expr: sum by (namespace, pod) (increase(flush_abort_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet"}[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: multipart uploads possibly left to the lifecycle rule"
+          runbook: "Confirm the bucket has the AbortIncompleteMultipartUpload rule (bucket/lifecycle.json); the abort_failed WARN event names the key."
+
+      - alert: SeriesParquetLateCommits
+        expr: |
+          sum by (namespace, pod, outcome) (increase(flush_late_commits_total{job="series-parquet", otel_scope_name="exporter.series_parquet", outcome=~"stored|partial|unknown"}[10m])) > 0
+          or sum by (namespace, pod, outcome) (
+            flush_late_commits_total{job="series-parquet", otel_scope_name="exporter.series_parquet", outcome=~"stored|partial|unknown"} > 0
+            unless flush_late_commits_total{job="series-parquet", otel_scope_name="exporter.series_parquet", outcome=~"stored|partial|unknown"} offset 10m
+          )
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.pod }}: a failed flush left objects ({{ $labels.outcome }})"
+          runbook: "stored means a nacked block's rows may be stored twice; read the series_parquet.flush.cleanup events for the keys."
+
+      - alert: SeriesParquetDroppedAfterAck
+        expr: |
+          sum by (namespace, pod, outcome) (increase(resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome=~"permanently_rejected|conversion_failed"}[10m])) > 0
+          or sum by (namespace, pod, outcome) (
+            resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome=~"permanently_rejected|conversion_failed"} > 0
+            unless resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome=~"permanently_rejected|conversion_failed"} offset 10m
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: acknowledged data dropped ({{ $labels.outcome }})"
+          runbook: "The producer never sees this loss. series_parquet.request.failed names the reason and the producer_id (traces, a record above ingress.max_row_bytes, a damaged body)."
+
+      - alert: SeriesParquetRetentionLoss
+        expr: |
+          sum by (namespace, pod, reason) (increase(bundles_total{job="series-parquet", otel_scope_name="processor.durable_buffer.loss"}[10m])) > 0
+          or sum by (namespace, pod, reason) (
+            bundles_total{job="series-parquet", otel_scope_name="processor.durable_buffer.loss"} > 0
+            unless bundles_total{job="series-parquet", otel_scope_name="processor.durable_buffer.loss"} offset 10m
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: WAL retention dropped acknowledged data ({{ $labels.reason }})"
+          runbook: "Only drop_oldest or max_age drop data; the shipped config sets neither. Check the deployed engine.yaml."
+
+      - alert: SeriesParquetReceiverSaturated
+        expr: |
+          sum by (namespace, pod, error_type) (rate(rejected_total{job="series-parquet", otel_scope_name="receiver.otlp.requests", error_type=~"concurrency_limit|rate_limit|memory_pressure"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: requests refused RESOURCE_EXHAUSTED ({{ $labels.error_type }})"
+          runbook: "Producers retry and slow down. Keep the producers' num_consumers per worker at most max_concurrent_requests, or add workers."
+
+      - alert: SeriesParquetPayloadTooLarge
+        expr: |
+          sum by (namespace, pod) (increase(rejected_total{job="series-parquet", otel_scope_name="receiver.otlp.requests", error_type="payload_too_large"}[10m])) > 0
+          or sum by (namespace, pod) (
+            rejected_total{job="series-parquet", otel_scope_name="receiver.otlp.requests", error_type="payload_too_large"} > 0
+            unless rejected_total{job="series-parquet", otel_scope_name="receiver.otlp.requests", error_type="payload_too_large"} offset 10m
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: requests above max_decoding_message_size refused INVALID_ARGUMENT"
+          runbook: "The producer drops these batches. Check that every producer splits exports at 2MiB (the Alloy sending_queue batch block)."
+
+      - alert: SeriesParquetMemoryOverBudget
+        expr: |
+          max by (namespace, pod, otel_scope_core_id) (
+            memory_accounted_bytes{job="series-parquet", otel_scope_name="exporter.series_parquet"}
+            - memory_budget_bytes{job="series-parquet", otel_scope_name="exporter.series_parquet"}
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: the exporter holds more than its memory budget"
+          runbook: "The budget bounds the exporter by construction; record the memory panels of the dashboard and the exporter's log events and report them."
+
+      - alert: SeriesParquetMemoryNearLimit
+        # The memory limiter's sample and soft limit (90 percent of the pod
+        # limit in engine.yaml), so the rule follows the limit and the core
+        # count; a process without a limiter exports a soft limit of 0.
+        expr: |
+          max by (namespace, pod) (
+            process_memory_usage_bytes{job="series-parquet", otel_scope_name="engine"}
+            / (process_memory_soft_limit_bytes{job="series-parquet", otel_scope_name="engine"} > 0)
+          ) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: memory at {{ $value | humanizePercentage }} of the memory limiter's soft limit"
+          runbook: "Above its hard limit (95 percent of the pod limit) the limiter refuses requests with RESOURCE_EXHAUSTED and a RetryInfo delay, before the kernel kills the pod. Check buffer in_flight, the line length and receiver slots against the Sizing formula; the pod limit scales with the core count."
+
+      - alert: SeriesParquetDataAlteredOnStore
+        # Acknowledged data stored in another form: the exporter README, "The
+        # v1 acknowledgement contract". Each branch names its counter in the
+        # `altered` label.
+        expr: |
+          label_replace(sum by (namespace, pod) (increase(timestamp_out_of_range_total{job="series-parquet", otel_scope_name="exporter.series_parquet"}[10m])) > 0, "altered", "timestamp_out_of_range", "", "")
+          or label_replace(sum by (namespace, pod, kind) (increase(dropped_unsupported_total{job="series-parquet", otel_scope_name="exporter.series_parquet", kind=~"exp_histogram|summary"}[10m])) > 0, "altered", "dropped_unsupported", "", "")
+          or label_replace(sum by (namespace, pod, kind) (dropped_unsupported_total{job="series-parquet", otel_scope_name="exporter.series_parquet", kind=~"exp_histogram|summary"} > 0 unless dropped_unsupported_total{job="series-parquet", otel_scope_name="exporter.series_parquet", kind=~"exp_histogram|summary"} offset 10m), "altered", "dropped_unsupported", "", "")
+          or label_replace(sum by (namespace, pod) (increase(dropped_exemplars_total{job="series-parquet", otel_scope_name="exporter.series_parquet"}[10m])) > 0, "altered", "dropped_exemplars", "", "")
+          or label_replace(sum by (namespace, pod) (dropped_exemplars_total{job="series-parquet", otel_scope_name="exporter.series_parquet"} > 0 unless dropped_exemplars_total{job="series-parquet", otel_scope_name="exporter.series_parquet"} offset 10m), "altered", "dropped_exemplars", "", "")
+          or label_replace(sum by (namespace, pod, signal) (increase(repaired_invalid_utf8_total{job="series-parquet", otel_scope_name="exporter.series_parquet"}[10m])) > 0, "altered", "repaired_invalid_utf8", "", "")
+          or label_replace(sum by (namespace, pod, signal) (repaired_invalid_utf8_total{job="series-parquet", otel_scope_name="exporter.series_parquet"} > 0 unless repaired_invalid_utf8_total{job="series-parquet", otel_scope_name="exporter.series_parquet"} offset 10m), "altered", "repaired_invalid_utf8", "", "")
+          or label_replace(sum by (namespace, pod, column) (increase(denormalize_type_mismatch_total{job="series-parquet", otel_scope_name="exporter.series_parquet"}[10m])) > 0, "altered", "denormalize_type_mismatch", "", "")
+          or label_replace(sum by (namespace, pod, column) (denormalize_type_mismatch_total{job="series-parquet", otel_scope_name="exporter.series_parquet"} > 0 unless denormalize_type_mismatch_total{job="series-parquet", otel_scope_name="exporter.series_parquet"} offset 10m), "altered", "denormalize_type_mismatch", "", "")
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.pod }}: acknowledged data stored altered or in part ({{ $labels.altered }})"
+          runbook: "For investigation: the request was acknowledged and stored, but not as sent. The README loss table names what each counter changes; set unsupported or metrics.exemplars to reject to refuse such requests instead."
+
+  - name: series-parquet-alloy
+    rules:
+      - alert: SeriesParquetAlloyDown
+        expr: up{job="series-parquet-alloy"} == 0 or absent(up{job="series-parquet-alloy"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}: Prometheus cannot scrape Alloy, or has no Alloy target"
+          runbook: "The other Alloy rules need this scrape. Check the DaemonSet's pods and the PodMonitor; a stopped Alloy leaves its node's lines in the log files."
+
+      - alert: SeriesParquetAlloyDropped
+        expr: |
+          sum by (namespace, pod) (increase(otelcol_exporter_send_failed_log_records_total{job="series-parquet-alloy", component_id="otelcol.exporter.otlp.series"}[10m])) > 0
+          or sum by (namespace, pod) (otelcol_exporter_send_failed_log_records_total{job="series-parquet-alloy", component_id="otelcol.exporter.otlp.series"} > 0 unless otelcol_exporter_send_failed_log_records_total{job="series-parquet-alloy", component_id="otelcol.exporter.otlp.series"} offset 10m)
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: Alloy gave up on log records"
+          runbook: "A permanent status such as INVALID_ARGUMENT; find the \"Dropping data\" log line in Alloy."
+
+      - alert: SeriesParquetAlloyQueueFull
+        expr: |
+          sum by (namespace, pod) (increase(otelcol_exporter_enqueue_failed_log_records_total{job="series-parquet-alloy", component_id="otelcol.exporter.otlp.series"}[10m])) > 0
+          or sum by (namespace, pod) (otelcol_exporter_enqueue_failed_log_records_total{job="series-parquet-alloy", component_id="otelcol.exporter.otlp.series"} > 0 unless otelcol_exporter_enqueue_failed_log_records_total{job="series-parquet-alloy", component_id="otelcol.exporter.otlp.series"} offset 10m)
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}: Alloy's queue refused records"
+          runbook: "Stays zero with block_on_overflow; check the deployed Alloy config."
+
+      - alert: SeriesParquetAlloyTruncated
+        expr: |
+          sum by (namespace, pod) (increase(loki_process_truncated_fields_total{job="series-parquet-alloy", component_id="loki.process.series", field="line"}[10m])) > 0
+          or sum by (namespace, pod) (loki_process_truncated_fields_total{job="series-parquet-alloy", component_id="loki.process.series", field="line"} > 0 unless loki_process_truncated_fields_total{job="series-parquet-alloy", component_id="loki.process.series", field="line"} offset 10m)
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.pod }}: lines cut to 512KiB"
+          runbook: "For investigation: the truncation changes data. Find the producer writing lines above 512KiB."

@@ -1,0 +1,115 @@
+# One engine per pod, each with its own WAL volume: the WAL does not lock its
+# directory, so a volume is never shared between pods.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: series-parquet
+spec:
+  serviceName: series-parquet-headless
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: series-parquet
+  replicas: 1
+  # Pods are independent; none waits for another to become ready.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  # Keep the WAL volumes on scale-down and delete: a removed pod's volume may
+  # still hold acknowledged data that only that pod's return will store.
+  persistentVolumeClaimRetentionPolicy:
+    whenScaled: Retain
+    whenDeleted: Retain
+  template:
+    spec:
+      # SIGTERM grants the engine 60s; the exporter then needs up to
+      # upload.abort_timeout (5s) more, and the process its exit. 90s leaves a
+      # margin above that 65s, and the buffer keeps whatever the drain did not
+      # store for the next start.
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: engine
+          # Site value: the image built as in the README, "Image".
+          image: df_engine:series-parquet
+          args:
+            - --config
+            - /etc/series-parquet/engine.yaml
+            - --http-admin-bind
+            - 0.0.0.0:8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: series-parquet-site
+            # Static credentials; optional so IRSA can replace it.
+            - secretRef:
+                name: series-parquet-s3
+                optional: true
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: admin
+              containerPort: 8080
+          # One worker (core_allocation count 1). Memory per worker, README
+          # "Sizing", at the receiver's 4MiB request limit: memory.budget +
+          # max_in_flight x 4MiB + 128 slots x 4MiB = 1.64 + 2.68 + 0.54 =
+          # 4.86 GB live bytes; RSS at 1.25 times that is 6.1 GB, 81% of the
+          # 7Gi limit (3.25 GB live, 4.1 GB RSS with Alloy's 2MiB exports),
+          # below the memory limiter's 90% soft limit. The memory
+          # limiter refuses requests at 95% of the limit, before the kernel
+          # kills the pod, but not the WAL replay after a restart, which the
+          # max_in_flight term bounds. Scale both with the core count.
+          resources:
+            requests:
+              cpu: "1"
+              memory: 7Gi
+            limits:
+              memory: 7Gi
+          readinessProbe:
+            httpGet:
+              path: /api/v1/readyz
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/v1/livez
+              port: admin
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/series-parquet
+              readOnly: true
+            - name: wal
+              mountPath: /var/lib/otap/series-wal
+      volumes:
+        - name: config
+          configMap:
+            name: series-parquet-engine
+  volumeClaimTemplates:
+    - metadata:
+        name: wal
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # Use a local NVMe class; the WAL syncs every 25ms.
+        # storageClassName: local-nvme
+        resources:
+          # retention_size_cap (32GiB) plus room for the file system.
+          requests:
+            storage: 40Gi

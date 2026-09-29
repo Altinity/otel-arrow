@@ -11,6 +11,7 @@ on:
       - "rust/otap-dataflow/crates/core-nodes/src/processors/durable_buffer_processor/**"
       - "rust/otap-dataflow/crates/validation/tests/series_parquet/**"
       - "rust/otap-dataflow/configs/series-parquet*"
+      - "rust/otap-dataflow/deploy/series-parquet/**"
       - ".github/workflows/series-parquet-e2e.yml"
   workflow_dispatch:
 
@@ -68,6 +69,11 @@ jobs:
           python3 -m venv /tmp/series-parquet-venv
           /tmp/series-parquet-venv/bin/pip install --require-hashes \
             -r crates/validation/tests/series_parquet/requirements.lock.txt
+      - name: Deployment example check.py and the PrometheusRule it generates
+        run: |
+          /tmp/series-parquet-venv/bin/python3 -m unittest discover -s deploy/series-parquet -p test_check.py
+          /tmp/series-parquet-venv/bin/python3 deploy/series-parquet/check.py \
+            --write-crd "$RUNNER_TEMP/prometheusrule.yaml" --crd "$RUNNER_TEMP/prometheusrule.yaml"
       - name: Build the engine
         run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer
       - name: End-to-end tests on local files and MinIO

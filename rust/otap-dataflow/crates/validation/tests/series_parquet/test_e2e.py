@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -25,6 +26,8 @@ from opentelemetry.proto.collector.metrics.v1 import metrics_service_pb2 as metr
 from opentelemetry.proto.collector.metrics.v1 import (
     metrics_service_pb2_grpc as metrics_rpc,
 )
+from opentelemetry.proto.collector.trace.v1 import trace_service_pb2 as trace_pb
+from opentelemetry.proto.collector.trace.v1 import trace_service_pb2_grpc as trace_rpc
 
 WORKSPACE = Path(__file__).resolve().parents[4]
 MINIO_IMAGE = os.environ.get(
@@ -37,6 +40,16 @@ ALLOY_IMAGE = os.environ.get("SERIES_ALLOY_IMAGE", "grafana/alloy:v1.19.2")
 ALLOY_CONFIGS = Path(
     os.environ.get("SERIES_ALLOY_CONFIGS", str(WORKSPACE / "configs"))
 )
+
+# The deployment example's check of its alert rules and dashboard.
+DEPLOY_CHECK = WORKSPACE / "deploy/series-parquet/check.py"
+# Metrics those select that no engine file carries: Alloy's own counters,
+# which appear only after their first increment.
+ALLOY_UNEXPOSED = [
+    "loki_process_truncated_fields_total",
+    "otelcol_exporter_enqueue_failed_log_records_total",
+    "otelcol_exporter_send_failed_log_records_total",
+]
 
 # One metrics request carries a gauge point and two histogram points, all
 # stored in the `signal=metrics/dataset=values` dataset.
@@ -160,6 +173,7 @@ class Engine:
             raise
         self.logs = logs_rpc.LogsServiceStub(self.channel)
         self.metrics = metrics_rpc.MetricsServiceStub(self.channel)
+        self.traces = trace_rpc.TraceServiceStub(self.channel)
 
     def wait_ready(self, seconds):
         """Poll the admin API's readiness probe until it answers 200."""
@@ -208,6 +222,21 @@ class Engine:
             for line in text.splitlines()
             if line.startswith(name + "{") and all(label in line for label in wanted)
         )
+
+    def scrape(self):
+        """The Prometheus text of the admin API's metrics endpoint."""
+        url = f"http://127.0.0.1:{self.admin_port}/api/v1/metrics"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return response.read().decode()
+
+    def schema(self):
+        """Every registered metric with every label value, as JSON text."""
+        url = (
+            f"http://127.0.0.1:{self.admin_port}/api/v1/telemetry/metrics"
+            "?format=json&keep_all_zeroes=true"
+        )
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return response.read().decode()
 
     def engine_log(self):
         """Everything the engine has written to its log."""
@@ -390,6 +419,62 @@ class MinioStore:
 
     def __exit__(self, *exc):
         self.remove()
+
+
+def trace_request():
+    """A traces request with one span, a signal the exporter refuses."""
+    req = trace_pb.ExportTraceServiceRequest()
+    resource = req.resource_spans.add()
+    resource.resource.attributes.add(key="host.id").value.string_value = "producer-1"
+    span = resource.scope_spans.add().spans.add(name="families")
+    span.trace_id = bytes(range(16))
+    span.span_id = bytes(range(8))
+    return req
+
+
+def altered_metric_request():
+    """A metrics request the exporter stores altered: a summary point it
+    drops, a gauge point whose exemplar it drops and whose timestamp does
+    not fit i64 nanoseconds."""
+    req = metrics_pb.ExportMetricsServiceRequest()
+    resource = req.resource_metrics.add()
+    resource.resource.attributes.add(key="host.id").value.string_value = "producer-1"
+    scope = resource.scope_metrics.add()
+    summary = scope.metrics.add(name="families_summary", unit="s")
+    summary.summary.data_points.add(time_unix_nano=1789960500000000000, count=1, sum=1.0)
+    gauge = scope.metrics.add(name="families_gauge", unit="1")
+    point = gauge.gauge.data_points.add(time_unix_nano=(1 << 64) - 1, as_int=1)
+    point.exemplars.add(time_unix_nano=1789960500000000000, as_int=1)
+    return req
+
+
+def invalid_utf8_log_request():
+    """The bytes of a logs request whose body holds invalid UTF-8, which
+    protobuf libraries refuse to build."""
+    body = log_request("families-invalid-XXXX").SerializeToString()
+    assert body.count(b"XXXX") == 1
+    return body.replace(b"XXXX", b"\xff\xfe\xfd\xfc")
+
+
+def export_raw_logs(engine, body):
+    """Send already-serialized logs request bytes and wait for the answer."""
+    export = engine.channel.unary_unary(
+        "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+        request_serializer=lambda raw: raw,
+        response_deserializer=logs_pb.ExportLogsServiceResponse.FromString,
+    )
+    return export(body, timeout=30)
+
+
+def has_series(scrape, name, scope, positive=False, **labels):
+    """Whether `scrape` has a `name` series of set `scope` carrying `labels`,
+    with a value above zero when `positive`."""
+    wanted = [f'otel_scope_name="{scope}"'] + [f'{k}="{v}"' for k, v in labels.items()]
+    for line in scrape.splitlines():
+        if line.startswith(name + "{") and all(w in line for w in wanted):
+            if not positive or float(line.rsplit(" ", 2)[1]) > 0:
+                return True
+    return False
 
 
 def parquet_files(root, signal, dataset):
@@ -924,6 +1009,98 @@ class Minio(unittest.TestCase, LakeAssertions):
                 wait_stored_at_least_once(store, directory, bodies, metric_ids, 90)
                 engine.shutdown()
 
+    # Scenario: the shipped buffered configuration on MinIO takes a request
+    # above max_decoding_message_size, a traces request, a metrics request
+    # with a summary point, an exemplar and a timestamp beyond i64
+    # nanoseconds, a logs request with invalid UTF-8, and a logs request
+    # while MinIO is paused past the flush deadline, which is stored once
+    # MinIO returns.
+    # Guarantees: the scrape carries each series the alert rules watch for
+    # these failures, by name, scope and label value, and the deployment
+    # example's check.py, given the scrape and the engine's JSON of every
+    # registered metric, finds every metric, label and label value its rules
+    # and dashboard select; only Alloy's counters are absent. The
+    # PrometheusRule it generates carries the rules file's groups.
+    def test_alert_families_exposed(self):
+        with MinioStore() as store, tempfile.TemporaryDirectory() as directory:
+            wal = Path(directory) / "wal"
+            wal.mkdir()
+            name = "series-parquet-buffered.yaml"
+            with Engine(directory, name, store.storage, buffer_path=wal) as engine:
+                export_all(engine, ["families-ok"], [])
+                with self.assertRaises(grpc.RpcError) as refused:
+                    engine.logs.Export(log_request("x" * (17 << 20)), timeout=30)
+                self.assertEqual(refused.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
+                engine.traces.Export(trace_request(), timeout=30)
+                engine.metrics.Export(altered_metric_request(), timeout=30)
+                export_raw_logs(engine, invalid_utf8_log_request())
+
+                before = store.keys()
+                store.pause()
+                try:
+                    engine.logs.Export(log_request("families-outage"), timeout=30)
+                    wait_for(
+                        lambda: has_series(
+                            engine.scrape(),
+                            "block_write_failures_total",
+                            "exporter.series_parquet",
+                            error_type="deadline",
+                        ),
+                        90,
+                        "a block write to fail at the flush deadline",
+                    )
+                finally:
+                    store.unpause()
+                wait_for(
+                    lambda: any(
+                        "/signal=logs/dataset=values/" in key
+                        for key in store.keys() - before
+                    ),
+                    90,
+                    "the blocks to be stored after the outage",
+                )
+                # Counters, each with a value above zero once provoked.
+                expected = [
+                    ("rejected_total", "receiver.otlp.requests", {"error_type": "payload_too_large"}),
+                    ("resolved_total", "processor.durable_buffer.bundles", {"outcome": "permanently_rejected"}),
+                    ("nacks_total", "exporter.series_parquet", {"error_type": "unsupported"}),
+                    ("block_write_failures_total", "exporter.series_parquet", {"error_type": "deadline"}),
+                    ("retries_scheduled_total", "processor.durable_buffer", {}),
+                    ("dropped_unsupported_total", "exporter.series_parquet", {"kind": "summary"}),
+                    ("dropped_exemplars_total", "exporter.series_parquet", {"signal": "metrics"}),
+                    ("repaired_invalid_utf8_total", "exporter.series_parquet", {"signal": "logs"}),
+                    ("timestamp_out_of_range_total", "exporter.series_parquet", {}),
+                ]
+
+                def missing():
+                    scrape = engine.scrape()
+                    return [
+                        f"{metric}{labels} of {scope}"
+                        for metric, scope, labels in expected
+                        if not has_series(scrape, metric, scope, positive=True, **labels)
+                    ]
+
+                deadline = time.monotonic() + 60
+                while missing() and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                self.assertEqual(missing(), [], "provoked families not in the scrape")
+                self.assert_deploy_check(engine, directory)
+                engine.shutdown()
+
+    def assert_deploy_check(self, engine, directory):
+        """Run the deployment example's check.py on `engine`'s scrape and
+        registered metrics, and on the PrometheusRule it generates."""
+        scrape = Path(directory) / "engine.prom"
+        scrape.write_text(engine.scrape())
+        schema = Path(directory) / "engine.json"
+        schema.write_text(engine.schema())
+        crd = Path(directory) / "prometheusrule.yaml"
+        command = [sys.executable, str(DEPLOY_CHECK), "--write-crd", str(crd)]
+        command += ["--crd", str(crd), "--schema", str(schema), str(scrape)]
+        for name in ALLOY_UNEXPOSED:
+            command += ["--absent", name]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

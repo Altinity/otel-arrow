@@ -1,0 +1,37 @@
+# Takes effect only with a CNI that enforces NetworkPolicy. OTLP is admitted
+# only from namespaces labelled as producers: every producer that reaches the
+# receiver writes into one lake, and the lake trusts the producer's own
+# identity (README, "Trust boundary"). The admin port, which also takes
+# unauthenticated shutdown and reconfiguration calls, admits only the
+# Prometheus pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: series-parquet
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: series-parquet
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: otlp-grpc
+      from:
+        # Site value: label each producer namespace, the Alloy one included,
+        # with `kubectl label namespace <ns> series-parquet/producer=true`.
+        # Producers outside the cluster need an ipBlock peer here.
+        - namespaceSelector:
+            matchLabels:
+              series-parquet/producer: "true"
+    - ports:
+        - port: admin
+      from:
+        # Site values: the namespace Prometheus runs in and the label of its
+        # pods (the prometheus-operator's). One peer with both selectors
+        # admits only pods that match both.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus

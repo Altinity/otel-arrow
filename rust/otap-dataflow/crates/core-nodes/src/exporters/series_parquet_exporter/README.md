@@ -343,7 +343,8 @@ transit: set it only with an `https://` endpoint whose certificate is
 verified. The value in the storage section wins, then `AWS_UNSIGNED_PAYLOAD`;
 with neither set every payload is signed, as in every exporter that shares
 the S3 storage section. The shipped S3 configurations name a plain-HTTP
-loopback endpoint and leave it unset. The
+loopback endpoint and leave it unset; the deployment example takes it from
+`AWS_UNSIGNED_PAYLOAD`, true for its HTTPS endpoint. The
 start event reports the effective value as `unsigned_payload`. Some
 S3-compatible stores and bucket policies refuse `UNSIGNED-PAYLOAD`; every
 upload then fails with HTTP 403 (`block.write_failures` rises, nothing is stored).
@@ -499,7 +500,9 @@ milliseconds; the buffer then retries every failed block until the store
 takes it. The strict alternative, `series-parquet-s3.yaml` with
 `series-parquet-strict.alloy`, answers only once the block is in the bucket
 (see "Attempt timeouts"). Each setting of both files carries its reason in a
-comment.
+comment. Kubernetes manifests, bucket policy, alerts and a dashboard for the
+reference deployment are in
+[`deploy/series-parquet`](../../../../../deploy/series-parquet/README.md).
 
 Run Alloy with `--stability.level=public-preview` (the file-backed sending
 queue) and `--storage.path` on a persistent volume: it holds the file
@@ -879,7 +882,9 @@ exactly as sent.
   `resolved{outcome=permanently_rejected}`). These alterations are counted:
   `timestamp.out_of_range`, `dropped.unsupported{kind}`, `dropped.exemplars`,
   `repaired.invalid_utf8{signal}` and `denormalize.type_mismatch{column}`;
-  the ones the table below marks "no counter" are not.
+  the ones the table below marks "no counter" are not. The deployment
+  example alerts on the counters with
+  `SeriesParquetDataAlteredOnStore` (info) and shows them in its dashboard.
 
 ## What this exporter does not keep
 

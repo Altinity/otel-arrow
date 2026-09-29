@@ -1,0 +1,17 @@
+# Uses configs/series-parquet.alloy unchanged, which lies outside this
+# directory: build with `kubectl kustomize --load-restrictor LoadRestrictionsNone`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The label goes on every object and pod template; the selectors name it in
+# each file, so kustomize leaves the NetworkPolicy's Prometheus peer alone.
+labels:
+  - pairs:
+      app.kubernetes.io/name: series-parquet-alloy
+    includeTemplates: true
+resources:
+  - daemonset.yaml
+  - networkpolicy.yaml
+configMapGenerator:
+  - name: series-parquet-alloy
+    files:
+      - config.alloy=../../../../configs/series-parquet.alloy
