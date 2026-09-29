@@ -1,0 +1,57 @@
+[package]
+name = "otel-arrow-dfe-series-lake"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+publish = true
+rust-version.workspace = true
+description = "Series/values normalization and Parquet sink for OTAP telemetry"
+keywords = ["telemetry", "opentelemetry", "otap", "parquet", "arrow"]
+categories = ["database-implementations"]
+
+[dependencies]
+otel-arrow-dfe-pdata.workspace = true
+arrow.workspace = true
+parquet = { workspace = true, features = ["zstd"] }
+object_store.workspace = true
+chrono.workspace = true
+base64.workspace = true
+ciborium-io.workspace = true
+ciborium-ll.workspace = true
+hex.workspace = true
+xxhash-rust.workspace = true
+# Unicode format characters, escaped with control characters in log lines.
+unicode-general-category.workspace = true
+# `HashTable` and its default per-process-seeded hasher for the series memos.
+hashbrown.workspace = true
+lru.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+# The sink wraps the object store it writes through (see `sink::CreationWatch`).
+async-trait.workspace = true
+futures.workspace = true
+# The Parquet writer hands the sink's upload its buffers as `Bytes`.
+bytes.workspace = true
+
+[features]
+# Test clocks for tests of dependent crates; never enabled in a release build.
+testing = []
+
+[dev-dependencies]
+otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
+ciborium.workspace = true
+object_store = { workspace = true, features = ["fs"] }
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile.workspace = true
+dhat.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,52 @@
+{
+ "format": "identity_config_v1",
+ "vectors": [
+  {
+   "name": "logs_default",
+   "signal": "logs",
+   "series_attributes": [],
+   "identity_config": "{\"series_attributes\":[]}",
+   "identity_config_hash": "cf4bcd6fd2861d7a"
+  },
+  {
+   "name": "logs_sorted_and_deduplicated",
+   "signal": "logs",
+   "series_attributes": [
+    "user",
+    "b\"q",
+    "user",
+    "a"
+   ],
+   "identity_config": "{\"series_attributes\":[\"a\",\"b\\\"q\",\"user\"]}",
+   "identity_config_hash": "6d1aa3224e97c81d"
+  },
+  {
+   "name": "logs_unicode",
+   "signal": "logs",
+   "series_attributes": [
+    "\u00e9",
+    "z"
+   ],
+   "identity_config": "{\"series_attributes\":[\"z\",\"\u00e9\"]}",
+   "identity_config_hash": "213094f247543903"
+  },
+  {
+   "name": "logs_control_characters",
+   "signal": "logs",
+   "series_attributes": [
+    "a\tb",
+    "c\u0001d",
+    "e\\f"
+   ],
+   "identity_config": "{\"series_attributes\":[\"a\\tb\",\"c\\u0001d\",\"e\\\\f\"]}",
+   "identity_config_hash": "c343a82dca0ab83c"
+  },
+  {
+   "name": "metrics",
+   "signal": "metrics",
+   "series_attributes": [],
+   "identity_config": "{}",
+   "identity_config_hash": "1349cde127705c16"
+  }
+ ]
+}
