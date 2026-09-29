@@ -9,3 +9,4 @@ pub mod logs;
 pub mod metrics;
 pub mod resource;
 pub mod traces;
+pub mod validate;

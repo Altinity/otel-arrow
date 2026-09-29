@@ -50,6 +50,11 @@ pub mod field_num {
         pub const INSTRUMENTATION_SCOPE_VERSION: u64 = 2;
         pub const INSTRUMENTATION_SCOPE_ATTRIBUTES: u64 = 3;
         pub const INSTRUMENTATION_DROPPED_ATTRIBUTES_COUNT: u64 = 4;
+
+        pub const ENTITY_REF_SCHEMA_URL: u64 = 1;
+        pub const ENTITY_REF_TYPE: u64 = 2;
+        pub const ENTITY_REF_ID_KEYS: u64 = 3;
+        pub const ENTITY_REF_DESCRIPTION_KEYS: u64 = 4;
     }
 
     #[allow(missing_docs)]
@@ -174,6 +179,7 @@ pub mod field_num {
     pub mod resource {
         pub const RESOURCE_ATTRIBUTES: u64 = 1;
         pub const RESOURCE_DROPPED_ATTRIBUTES_COUNT: u64 = 2;
+        pub const RESOURCE_ENTITY_REFS: u64 = 3;
     }
 
     #[allow(missing_docs)]
