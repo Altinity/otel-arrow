@@ -14,6 +14,9 @@ The Parquet exporter writes OTAP batches as Parquet files through the shared
 object-store abstraction. It can partition output using schema metadata and can
 flush files by approximate row count or age.
 
+For series/values datasets keyed by a stable series_id with ack-after-land, see
+[`exporter:parquet_lake`](../parquet_lake_exporter/README.md).
+
 ## Getting Started
 
 Write Parquet files to a local directory with a file storage backend:

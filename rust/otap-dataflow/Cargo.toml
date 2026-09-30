@@ -370,7 +370,11 @@ oauth2-client-auth = ["otel-arrow-dfe-contrib-extensions/oauth2-client-auth"]
 # Cloud integration support layered onto the features above.
 # Azure Blob Storage for the Parquet exporter authenticates through a bound
 # bearer token provider, so enabling it pulls in that extension.
-aws = ["otel-arrow-dfe-otap/aws", "otel-arrow-dfe-contrib-nodes/aws"]
+aws = [
+    "otel-arrow-dfe-otap/aws",
+    "otel-arrow-dfe-core-nodes/aws",
+    "otel-arrow-dfe-contrib-nodes/aws",
+]
 azure = [
     "otel-arrow-dfe-otap/azure",
     "otel-arrow-dfe-core-nodes/azure",

@@ -7517,6 +7517,7 @@ dependencies = [
  "byte-unit",
  "bytes",
  "chrono",
+ "ciborium",
  "criterion",
  "csv-core",
  "dhat",
@@ -8224,6 +8225,7 @@ dependencies = [
  "thrift",
  "tokio",
  "twox-hash 2.1.4",
+ "zstd 0.13.3",
 ]
 
 [[package]]

@@ -1,0 +1,67 @@
+version: otel_dataflow/v1
+engine: { }
+groups:
+  default:
+    pipelines:
+      main:
+        # OTLP + OTAP receivers -> batch -> series/values Parquet datasets on object storage.
+        #
+        # Delivery: at-least-once, acknowledged only after the block holding the data
+        # has landed (both Parquet objects written). Receivers answer producers only then
+        # (wait_for_result: true), so:
+        #   - receiver `timeout` must exceed the worst-case ack delay, about
+        #     max_block_age + check_interval + 2 x upload_deadline + encode time
+        #     (a tick can flush logs and then metrics back to back);
+        #   - receiver concurrency must cover the in-flight requests
+        #     (~ requests/s x (max_block_age + upload p99));
+        #   - producers need matching timeouts, retries and queue sizes.
+        # Do not place a durable_buffer processor on this path: it acks after its
+        # local WAL write, which would bypass ack-after-land.
+        # See crates/core-nodes/src/exporters/parquet_lake_exporter/README.md#memory.
+        nodes:
+          otlp:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+                  wait_for_result: true
+                  timeout: "200s"
+                  max_concurrent_requests: 20000
+                http:
+                  listening_addr: "127.0.0.1:4318"
+                  wait_for_result: true
+                  timeout: "200s"
+          otap:
+            type: receiver:otap
+            config:
+              listening_addr: "127.0.0.1:4327"
+              wait_for_result: true
+              timeout: "200s"
+              max_concurrent_requests: 20000
+              max_concurrent_requests_per_stream: 256
+              response_stream_channel_size: 256 # Required: channel buffer capacity (number of messages)
+          batch:
+            type: processor:batch
+            config:
+              max_batch_duration: 200ms
+              otap:
+                min_size: 8192
+                sizer: items
+          parquet:
+            type: exporter:parquet_lake
+            config:
+              storage:
+                file:
+                  base_uri: "/tmp/otap-parquet-lake"
+              max_block_bytes: 67108864
+              max_block_age: 60s
+              upload_deadline: 60s
+
+        connections:
+          - from: otlp
+            to: batch
+          - from: otap
+            to: batch
+          - from: batch
+            to: parquet

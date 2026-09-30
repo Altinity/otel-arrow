@@ -19,6 +19,10 @@ pub mod topic_exporter;
 #[cfg(feature = "parquet")]
 pub mod parquet_exporter;
 
+/// Parquet lake exporter (series/values datasets keyed by a stable series_id).
+#[cfg(feature = "parquet")]
+pub mod parquet_lake_exporter;
+
 /// OTAP exporter.
 #[cfg(feature = "otap")]
 pub mod otap_exporter;

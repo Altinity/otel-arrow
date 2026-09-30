@@ -106,6 +106,7 @@ Exporters send data out of a pipeline.
 | [`exporter:otlp_grpc`](src/exporters/otlp_grpc_exporter/README.md) | `otlp` | experimental | Sends telemetry as unary OTLP/gRPC export requests. |
 | [`exporter:otlp_http`](src/exporters/otlp_http_exporter/README.md) | `otlp` | experimental | Sends telemetry to OTLP/HTTP endpoints. |
 | [`exporter:parquet`](src/exporters/parquet_exporter/README.md) | `parquet` | experimental | Writes OTAP batches as Parquet files. |
+| [`exporter:parquet_lake`](src/exporters/parquet_lake_exporter/README.md) | `parquet` | experimental | Writes series/values Parquet datasets keyed by a stable series_id; acks after the block lands. |
 | [`exporter:topic`](src/exporters/topic_exporter/README.md) | `topic` | experimental | Publishes data to a named in-process topic. |
 
 ## Feature Aggregates
