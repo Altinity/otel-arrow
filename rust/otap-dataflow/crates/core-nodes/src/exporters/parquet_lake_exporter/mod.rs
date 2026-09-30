@@ -1,14 +1,17 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parquet lake exporter: writes `series` and `values` Parquet datasets per signal keyed by a
-//! stable series_id, and acknowledges each batch once every block holding its rows has landed.
-//! See docs/FORMAT.md.
+//! Parquet lake exporter: writes Series Lake Format v1 (`series` and `values` Parquet datasets per
+//! signal, keyed by a stable series_id) and acknowledges each request once every block holding its
+//! rows has landed. See docs/FORMAT.md.
 //!
-//! Every admitted batch resolves exactly once: by `release_admission` once all its blocks landed,
-//! by `block_failed` when a block holding its rows failed (later events are ignored), or by
-//! `drain_nack` at shutdown. `Block::take` removes a block's batch set before encoding, so no
-//! later flush can see it again.
+//! One ACTIVE generation (the logs and metrics blocks of the current window) accepts input while
+//! at most one generation occupies the flush slot. Its blocks are flushed one after the other, each
+//! in a local task. Admission closes only when ACTIVE must rotate and the slot is busy.
+//!
+//! Every admitted request resolves exactly once in `PendingAcks`: by `release_admission` once all
+//! its blocks landed, by `block_failed` when a block holding its rows failed (later events are
+//! ignored), or by `drain_nack` at shutdown.
 
 otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = PARQUET_LAKE_EXPORTER_URN,
@@ -18,14 +21,18 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
 mod anyvalue;
 mod attrs;
 mod block;
+mod cache;
+mod canonical;
 mod columns;
 pub mod config;
 mod error;
 mod extract;
-mod identity;
+mod flush;
+mod limits;
 pub mod metrics;
 mod pending;
 mod schema;
+mod sort;
 #[cfg(test)]
 mod test_fixtures;
 #[cfg(test)]
@@ -33,21 +40,26 @@ mod test_store;
 #[cfg(test)]
 mod tests;
 mod upload;
+mod value;
+mod window;
 
 // Public surface: config, metrics, and the block probe (with the id types it takes). Everything
 // else is private, so no public item exposes a private type.
 pub use block::BlockId;
-pub use identity::Signal;
+pub use canonical::Signal;
 pub use upload::probe_block;
 
+use std::collections::{BTreeSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use object_store::ObjectStore;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider;
+use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::control::{AckMsg, NackCause, NackMsg, NodeControlMsg};
@@ -67,13 +79,17 @@ use otel_arrow_dfe_pdata::otlp::OtlpProtoBytes;
 use otel_arrow_dfe_pdata::{PayloadData, TryIntoWithOptions};
 use otel_arrow_dfe_telemetry::common_attributes::{Outcome, SignalOutcomeAttributes};
 use otel_arrow_dfe_telemetry::metrics::{MeasurementMetricSet, MetricSet, MetricSetHandler};
+use tokio::task::JoinError;
 
-use self::block::{Block, EncodeLimits, TakenBlock, date_of, encode_block};
+use self::block::{Block, EncodeLimits, FileMeta, SealedBlock, prune_committed};
+use self::cache::{CacheStats, SeriesCache};
 use self::config::LakeConfig;
-use self::error::LakeError;
+use self::error::{LakeError, Refusal};
+use self::extract::{Chunk, Extracted};
+use self::flush::{FlushTask, Landed, Uploader};
 use self::pending::{Completion, PendingAcks};
 use self::schema::Schemas;
-use self::upload::{sync_local, upload_block};
+use self::window::{PartitionId, SystemWallClock, WallClock, Window};
 
 /// URN of the Parquet lake exporter.
 pub const PARQUET_LAKE_EXPORTER_URN: &str = "urn:otel:exporter:parquet_lake";
@@ -86,13 +102,119 @@ pub struct ParquetLakeExporter {
     >,
     pdata_metrics: Option<MeasurementMetricSet<ExporterExportMetrics>>,
     metrics: Option<MetricSet<metrics::LakeMetrics>>,
-    /// Writer id: unique per exporter start (core + random nonce).
-    writer: String,
+    /// Random id of this exporter start: 32 lowercase hexadecimal digits.
+    boot_id: String,
+    /// Wall clock (windows, partitions, `emitted_at`).
+    wall: Rc<dyn WallClock>,
     /// Whether the "no upstream waits for acks" warning was already logged.
     warned_unacked: bool,
+    /// Last time a refusal was logged (at most one line per second).
+    refusal_logged: Option<Instant>,
     /// Test hook: use this store instead of building one from `config.storage`.
     #[cfg(test)]
     store_override: Option<Arc<dyn ObjectStore>>,
+    /// Test hook: a sub-second window interval (the config accepts whole seconds only).
+    #[cfg(test)]
+    interval_override: Option<Duration>,
+}
+
+/// Why a generation was rotated.
+#[derive(Clone, Copy, Debug)]
+enum FlushReason {
+    Time,
+    Bytes,
+    Shutdown,
+}
+
+/// The generation that accepts input: the logs and metrics blocks of the current window.
+#[derive(Default)]
+struct Active {
+    logs: Block,
+    metrics: Block,
+    /// Wall time (Unix nanoseconds) of the first push; `None` while empty.
+    opened_nanos: Option<i64>,
+}
+
+impl Active {
+    const fn block(&mut self, signal: Signal) -> &mut Block {
+        match signal {
+            Signal::Logs => &mut self.logs,
+            Signal::Metrics => &mut self.metrics,
+        }
+    }
+
+    const fn bytes(&self) -> usize {
+        self.logs.bytes() + self.metrics.bytes()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.logs.is_empty() && self.metrics.is_empty()
+    }
+}
+
+/// The block whose flush task is running.
+struct InFlight {
+    id: BlockId,
+    /// Requests with rows in the block.
+    batches: BTreeSet<u64>,
+    /// Series whose rows the block carries; marked committed once it has landed.
+    series_ids: Vec<u128>,
+    started: Instant,
+    /// The flush task; dropping it aborts the task.
+    task: FlushTask,
+}
+
+/// The generation in the flush slot: the block being flushed and those waiting for their turn.
+struct Flushing {
+    current: InFlight,
+    queued: VecDeque<SealedBlock>,
+    /// Deadline of the whole generation.
+    deadline: Instant,
+    meta: FileMeta,
+}
+
+/// A request whose remaining chunks wait for room in ACTIVE. It enters the next generation
+/// before anything newer, because admission stays closed while it is parked.
+struct Parked {
+    seq: u64,
+    signal: Signal,
+    chunks: VecDeque<Chunk>,
+}
+
+/// Loop state.
+struct State {
+    uploader: Uploader,
+    schemas: Schemas,
+    cache: SeriesCache,
+    window: Window,
+    active: Active,
+    flushing: Option<Flushing>,
+    parked: Option<Parked>,
+    /// ACTIVE must rotate as soon as the flush slot is free.
+    rotation_due: Option<FlushReason>,
+    pending: PendingAcks,
+    next_seq: u64,
+    /// When admission closed, while it is closed.
+    closed_since: Option<Instant>,
+    /// Cache counters already reported.
+    reported: CacheStats,
+}
+
+impl State {
+    /// Whether pdata may be read: no request is parked and ACTIVE is not waiting for the slot.
+    const fn accepting(&self) -> bool {
+        self.parked.is_none() && !(self.rotation_due.is_some() && self.flushing.is_some())
+    }
+}
+
+/// The result of the task in the flush slot; never resolves while the slot is free.
+async fn flush_result(
+    flushing: &mut Option<Flushing>,
+) -> Result<Result<Landed, LakeError>, JoinError> {
+    match flushing {
+        Some(f) => f.current.task.join().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Declares the Parquet lake exporter as a local exporter factory.
@@ -131,37 +253,6 @@ pub static PARQUET_LAKE_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     validate_config: |value| LakeConfig::parse(value).map(|_| ()),
 };
 
-/// Loop state.
-struct State {
-    store: Arc<dyn ObjectStore>,
-    schemas: Schemas,
-    logs: Block,
-    metrics: Block,
-    pending: PendingAcks,
-    next_block: u64,
-}
-
-impl State {
-    const fn block(&mut self, signal: Signal) -> &mut Block {
-        match signal {
-            Signal::Logs => &mut self.logs,
-            Signal::Metrics => &mut self.metrics,
-        }
-    }
-}
-
-/// The signal to flush on a timer tick: the oldest block at least `max_age` old. One flush per
-/// tick keeps the time the node spends away from its inbox (and a pending Shutdown) to one upload.
-fn due_signal(logs: &Block, metrics: &Block, now: Instant, max_age: Duration) -> Option<Signal> {
-    let (l, m) = (logs.age(now), metrics.age(now));
-    let (signal, age) = if l >= m {
-        (Signal::Logs, l)
-    } else {
-        (Signal::Metrics, m)
-    };
-    (age >= max_age && !age.is_zero()).then_some(signal)
-}
-
 /// True when `raw` is not a valid OTLP request (strict protobuf decode). Used only for payloads
 /// that converted to zero rows: pdata's lenient conversion turns garbage into an empty batch,
 /// which must be refused rather than acknowledged unwritten.
@@ -194,11 +285,54 @@ impl ParquetLakeExporter {
             token_provider: None,
             pdata_metrics: Some(ExporterExportMetrics::register(pipeline)),
             metrics: Some(metrics::LakeMetrics::register(pipeline)),
-            writer: format!("c{}-{:016x}", pipeline.core_id(), rand::random::<u64>()),
+            boot_id: uuid::Uuid::new_v4().simple().to_string(),
+            wall: Rc::new(SystemWallClock),
             warned_unacked: false,
+            refusal_logged: None,
             #[cfg(test)]
             store_override: None,
+            #[cfg(test)]
+            interval_override: None,
         })
+    }
+
+    fn interval(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(interval) = self.interval_override {
+            return interval;
+        }
+        self.config.window.interval
+    }
+
+    /// The loop state of a fresh start, writing to `store`.
+    fn new_state(&self, store: Arc<dyn ObjectStore>) -> State {
+        let schemas = Schemas::new();
+        State {
+            uploader: Uploader {
+                store,
+                schemas: schemas.clone(),
+                local_base: match &self.config.storage {
+                    StorageType::File { base_uri } => Some(base_uri.clone()),
+                    // Object-store variants exist only with the `aws` / `azure` features.
+                    #[allow(unreachable_patterns)]
+                    _ => None,
+                },
+                initial_backoff: self.config.retry_initial_backoff,
+                max_backoff: self.config.retry_max_backoff,
+                limits: EncodeLimits::DEFAULT,
+            },
+            schemas,
+            cache: SeriesCache::new(self.config.series_cache.max_entries),
+            window: Window::new(self.interval()),
+            active: Active::default(),
+            flushing: None,
+            parked: None,
+            rotation_due: None,
+            pending: PendingAcks::default(),
+            next_seq: 0,
+            closed_since: None,
+            reported: CacheStats::default(),
+        }
     }
 
     fn record_export(&mut self, token: &OtapPdata, outcome: Outcome, elapsed: Duration) {
@@ -239,105 +373,100 @@ impl ParquetLakeExporter {
         }
     }
 
-    /// Flush `signal`'s block (if non-empty): encode, upload until `deadline`, then Ack or Nack its
-    /// batches.
-    async fn flush(
+    async fn notify_all(
         &mut self,
         eh: &EffectHandler<OtapPdata>,
-        st: &mut State,
-        signal: Signal,
-        deadline: Instant,
+        done: Vec<Completion>,
         shutdown: bool,
     ) -> Result<(), Error> {
-        if st.block(signal).is_empty() {
-            return Ok(());
-        }
-        let TakenBlock {
-            series,
-            values,
-            batches,
-            created,
-        } = st.block(signal).take();
-        let id = BlockId {
-            signal,
-            date: date_of(created),
-            writer: self.writer.clone(),
-            seq: st.next_block,
-        };
-        st.next_block += 1;
-        let started = Instant::now();
-        let outcome = if started >= deadline {
-            Err("deadline passed before the block was encoded".to_owned())
-        } else {
-            let encoded = encode_block(
-                id,
-                series,
-                values,
-                &st.schemas,
-                SystemTime::now(),
-                EncodeLimits::DEFAULT,
-            )
-            .await;
-            match encoded {
-                Err(e) => Err(format!("encode failed: {e}")),
-                Ok(block) => {
-                    let (init, max) = (
-                        self.config.retry_initial_backoff,
-                        self.config.retry_max_backoff,
-                    );
-                    let mut r = upload_block(st.store.as_ref(), &block, deadline, init, max).await;
-                    if r.is_ok()
-                        && let StorageType::File { base_uri } = &self.config.storage
-                        && let Err(e) = sync_local(base_uri, &block.id).await
-                    {
-                        r = Err(e);
-                    }
-                    if let Some(m) = self.metrics.as_mut() {
-                        m.encoder_peak.record(block.encoder_peak as f64);
-                        if let Ok(retries) = &r {
-                            m.blocks_landed.inc();
-                            m.upload_retries.add(u64::from(*retries));
-                            m.bytes_written.add(
-                                (block.series.content_length() + block.values.content_length())
-                                    as u64,
-                            );
-                            m.rows_written.add(block.rows as u64);
-                            m.series_rows_written.add(block.series_rows as u64);
-                        }
-                    }
-                    r.map(|_| ())
-                }
-            }
-        };
-        if let Some(m) = self.metrics.as_mut() {
-            m.flush_duration.record(started.elapsed().as_secs_f64());
-        }
-        let now = Instant::now();
-        let completions: Vec<Completion> = match outcome {
-            Ok(()) => batches
-                .into_iter()
-                .filter_map(|s| st.pending.block_landed(s, now))
-                .collect(),
-            Err(reason) => {
-                if let Some(m) = self.metrics.as_mut() {
-                    m.blocks_failed.inc();
-                }
-                otel_warn!(
-                    "parquet_lake.block.failed",
-                    error = reason.as_str(),
-                    batches = batches.len()
-                );
-                let reason = format!("parquet_lake: block failed: {reason}");
-                batches
-                    .into_iter()
-                    .filter_map(|s| st.pending.block_failed(s, &reason, now))
-                    .collect()
-            }
-        };
-        for c in completions {
+        for c in done {
             self.notify(eh, c, shutdown).await?;
         }
         Ok(())
+    }
+
+    /// Check the request size, convert the payload and extract its rows.
+    fn extract(
+        &self,
+        token: &mut OtapPdata,
+        schemas: &Schemas,
+    ) -> Result<(Signal, Extracted), LakeError> {
+        let limit = self.config.ingress.max_request_bytes;
+        if let Some(observed) = token.num_bytes()
+            && observed > limit
+        {
+            return Err(LakeError::TooLarge {
+                setting: "ingress.max_request_bytes",
+                observed,
+                limit,
+            });
+        }
+        let payload = token.take_payload();
+        let raw = match payload.data() {
+            PayloadData::OtlpBytes(b) => Some(b.clone()),
+            PayloadData::OtapArrowRecords(_) => None,
+        };
+        let records: Result<OtapArrowRecords, _> = payload.try_into_with_default();
+        let mut records = records.map_err(|e| LakeError::Conversion(e.to_string()))?;
+        records
+            .decode_transport_optimized_ids()
+            .map_err(|e| LakeError::Conversion(e.to_string()))?;
+        let limits = self.config.limits();
+        let producer = self.config.producer_id_attribute.as_str();
+        let (signal, extracted) = match &records {
+            OtapArrowRecords::Logs(_) => (
+                Signal::Logs,
+                extract::extract_logs(&records, schemas, &limits, producer)?,
+            ),
+            OtapArrowRecords::Metrics(_) => (
+                Signal::Metrics,
+                extract::extract_metrics(&records, schemas, &limits, producer)?,
+            ),
+            OtapArrowRecords::Traces(_) => return Err(LakeError::Unsupported("traces")),
+        };
+        // pdata's lenient conversion turns garbage into an empty batch, which must be refused
+        // rather than acknowledged unwritten.
+        if extracted.chunks.is_empty() && raw.as_ref().is_some_and(malformed_otlp) {
+            return Err(LakeError::Conversion("malformed OTLP request".into()));
+        }
+        Ok((signal, extracted))
+    }
+
+    /// Refuse a request permanently: the identical bytes would be refused again.
+    async fn refuse(
+        &mut self,
+        eh: &EffectHandler<OtapPdata>,
+        token: OtapPdata,
+        e: &LakeError,
+    ) -> Result<(), Error> {
+        if let Some(m) = self.metrics.as_mut() {
+            match e.refusal() {
+                Refusal::TooLarge => m.refused_too_large.inc(),
+                Refusal::Invalid => m.refused_invalid.inc(),
+                Refusal::TooDeep => m.refused_too_deep.inc(),
+                Refusal::Unsupported => m.refused_unsupported.inc(),
+                Refusal::Other => m.refused_other.inc(),
+            }
+        }
+        let now = Instant::now();
+        if self
+            .refusal_logged
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+        {
+            self.refusal_logged = Some(now);
+            otel_warn!(
+                "parquet_lake.request.refused",
+                message = "the request was refused permanently; at most one such line per second is logged",
+                error = e.to_string()
+            );
+        }
+        self.record_export(&token, Outcome::Failure, Duration::ZERO);
+        eh.notify_nack(NackMsg::new_permanent_with_cause(
+            format!("parquet_lake: {e}"),
+            token,
+            NackCause::Refused,
+        ))
+        .await
     }
 
     async fn handle_pdata(
@@ -346,6 +475,17 @@ impl ParquetLakeExporter {
         st: &mut State,
         mut token: OtapPdata,
     ) -> Result<(), Error> {
+        if !st.accepting() {
+            // The loop reads pdata only while admission is open, except during the engine's
+            // forced drain at shutdown, which delivers what is already buffered in the channel.
+            self.record_export(&token, Outcome::Failure, Duration::ZERO);
+            return eh
+                .notify_nack(NackMsg::new(
+                    "parquet_lake: admission is closed; retry the request",
+                    token,
+                ))
+                .await;
+        }
         if !self.warned_unacked && !token.has_ack_or_nack_interests() {
             self.warned_unacked = true;
             otel_warn!(
@@ -353,108 +493,352 @@ impl ParquetLakeExporter {
                 message = "a batch arrived without Ack/Nack subscribers: upstream acknowledged it before it landed (set wait_for_result: true on receivers), so a crash or failed block loses it"
             );
         }
-        let payload = token.take_payload();
-        let raw = match payload.data() {
-            PayloadData::OtlpBytes(b) => Some(b.clone()),
-            PayloadData::OtapArrowRecords(_) => None,
-        };
-        let max = self.config.max_chunk_bytes();
-        let records: Result<OtapArrowRecords, _> = payload.try_into_with_default();
-        let extracted = records
-            .map_err(|e| LakeError::Conversion(e.to_string()))
-            .and_then(|mut records: OtapArrowRecords| {
-                records
-                    .decode_transport_optimized_ids()
-                    .map_err(|e| LakeError::Conversion(e.to_string()))?;
-                match &records {
-                    OtapArrowRecords::Logs(_) => Ok((
-                        Signal::Logs,
-                        extract::extract_logs(&records, &st.schemas, max)?,
-                        0,
-                    )),
-                    OtapArrowRecords::Metrics(_) => {
-                        let (chunks, orphans) =
-                            extract::extract_metrics(&records, &st.schemas, max)?;
-                        Ok((Signal::Metrics, chunks, orphans))
-                    }
-                    OtapArrowRecords::Traces(_) => Err(LakeError::UnsupportedSignal),
-                }
-            })
-            .and_then(|(signal, chunks, orphans)| {
-                if chunks.is_empty() && raw.as_ref().is_some_and(malformed_otlp) {
-                    return Err(LakeError::Conversion("malformed OTLP request".into()));
-                }
-                Ok((signal, chunks, orphans))
-            });
-        let (signal, chunks, orphans) = match extracted {
+        let (signal, extracted) = match self.extract(&mut token, &st.schemas) {
             Ok(v) => v,
-            Err(e) => {
-                // Malformed or unsupported input: retrying cannot help.
-                if let Some(m) = self.metrics.as_mut() {
-                    m.batches_rejected.inc();
-                }
-                self.record_export(&token, Outcome::Failure, Duration::ZERO);
-                return eh
-                    .notify_nack(NackMsg::new_permanent_with_cause(
-                        format!("parquet_lake: {e}"),
-                        token,
-                        NackCause::Refused,
-                    ))
-                    .await;
-            }
+            Err(e) => return self.refuse(eh, token, &e).await,
         };
-        if orphans > 0
+        if extracted.timestamps_out_of_range > 0
             && let Some(m) = self.metrics.as_mut()
         {
-            m.points_orphaned.add(orphans);
+            m.timestamps_out_of_range
+                .add(extracted.timestamps_out_of_range);
         }
         let seq = st.pending.admit(token, Instant::now());
-        for chunk in chunks {
-            let block = st.block(signal);
-            if !block.is_empty() && block.bytes() + chunk.bytes() > self.config.max_block_bytes {
-                let deadline = Instant::now() + self.config.upload_deadline;
-                self.flush(eh, st, signal, deadline, false).await?;
+        let done = self.push_chunks(st, seq, signal, extracted.chunks.into());
+        self.notify_all(eh, done, false).await
+    }
+
+    /// Push the chunks of request `seq` into ACTIVE. When a chunk does not fit, ACTIVE is rotated
+    /// if the flush slot is free; otherwise the remaining chunks are parked and admission closes.
+    /// Returns the completions that became due (normally at most the request's own).
+    fn push_chunks(
+        &mut self,
+        st: &mut State,
+        seq: u64,
+        signal: Signal,
+        mut chunks: VecDeque<Chunk>,
+    ) -> Vec<Completion> {
+        let mut done = Vec::new();
+        let budget = self.config.window.max_block_bytes;
+        while let Some(chunk) = chunks.pop_front() {
+            if !st.active.is_empty() && st.active.bytes() + chunk.bytes() > budget {
+                let _ = st.rotation_due.get_or_insert(FlushReason::Bytes);
+                if st.flushing.is_some() {
+                    chunks.push_front(chunk);
+                    st.parked = Some(Parked {
+                        seq,
+                        signal,
+                        chunks,
+                    });
+                    return done;
+                }
+                done.extend(self.rotate(st, None));
                 if !st.pending.contains(seq) {
-                    // The flushed block held rows of `seq` and failed: `seq` is already Nacked.
-                    break;
+                    // A block of this request failed while rotating: it is already Nacked.
+                    return done;
                 }
             }
-            match st.block(signal).push(chunk, seq, Instant::now()) {
+            let opened = *st
+                .active
+                .opened_nanos
+                .get_or_insert_with(|| self.wall.now_unix_nanos());
+            let partition = PartitionId::from_unix_secs(st.window.start_secs(opened));
+            match st
+                .active
+                .block(signal)
+                .push(chunk, seq, &mut st.cache, partition)
+            {
                 Ok(true) => st.pending.add_block(seq),
                 Ok(false) => {}
                 Err(e) => {
-                    let reason = format!("parquet_lake: {e}");
-                    if let Some(c) = st.pending.block_failed(seq, &reason, Instant::now()) {
-                        self.notify(eh, c, false).await?;
+                    // A push leaves the block unchanged; an ACTIVE that stayed empty must not
+                    // keep this window start for a later request.
+                    if st.active.is_empty() {
+                        st.active.opened_nanos = None;
                     }
-                    break;
+                    let reason = format!("parquet_lake: {e}");
+                    done.extend(st.pending.block_failed(seq, &reason, Instant::now()));
+                    return done;
                 }
             }
         }
-        if let Some(c) = st.pending.release_admission(seq, Instant::now()) {
-            self.notify(eh, c, false).await?;
+        done.extend(st.pending.release_admission(seq, Instant::now()));
+        done
+    }
+
+    /// Move ACTIVE into the flush slot, which must be free, and start its first block. During a
+    /// shutdown the generation's deadline is also bounded by the shutdown deadline.
+    fn rotate(&mut self, st: &mut State, shutdown: Option<Instant>) -> Vec<Completion> {
+        let reason = st.rotation_due.take().unwrap_or(FlushReason::Time);
+        let Some(opened) = st.active.opened_nanos.take() else {
+            return Vec::new();
+        };
+        let window_start_secs = st.window.start_secs(opened);
+        let seq = st.next_seq;
+        st.next_seq += 1;
+        let mut queued = VecDeque::new();
+        for signal in [Signal::Logs, Signal::Metrics] {
+            let block = st.active.block(signal);
+            if block.is_empty() {
+                continue;
+            }
+            let taken = block.take();
+            queued.push_back(SealedBlock {
+                id: BlockId {
+                    signal,
+                    window_start_secs,
+                    writer_id: self.config.writer_id.clone(),
+                    boot_id: self.boot_id.clone(),
+                    seq,
+                },
+                series: taken.series,
+                values: taken.values,
+                batches: taken.batches,
+            });
+        }
+        if let Some(m) = self.metrics.as_mut() {
+            match reason {
+                FlushReason::Time => m.flushes_time.inc(),
+                FlushReason::Bytes => m.flushes_bytes.inc(),
+                FlushReason::Shutdown => m.flushes_shutdown.inc(),
+            }
+        }
+        let own = Instant::now() + self.config.window.flush_retry_deadline;
+        let deadline = shutdown.map_or(own, |d| d.min(own));
+        let meta = FileMeta {
+            emitted_at_micros: self.wall.now_unix_nanos() / 1000,
+            window_end_secs: st.window.end_secs(window_start_secs),
+        };
+        self.start_next(st, queued, deadline, meta)
+    }
+
+    /// Start the next queued block of a generation: drop the series rows that landed since they
+    /// were buffered, and spawn the flush task. The previous block of the slot is resolved before
+    /// this runs, so the cache reflects every earlier landing. Frees the slot when nothing is
+    /// left. Returns the completions of blocks that could not be started.
+    fn start_next(
+        &mut self,
+        st: &mut State,
+        mut queued: VecDeque<SealedBlock>,
+        deadline: Instant,
+        meta: FileMeta,
+    ) -> Vec<Completion> {
+        let mut done = Vec::new();
+        while let Some(block) = queued.pop_front() {
+            let SealedBlock {
+                id,
+                series,
+                values,
+                batches,
+            } = block;
+            match prune_committed(series, &mut st.cache, id.partition()) {
+                Ok((series, series_ids)) => {
+                    let task = st
+                        .uploader
+                        .spawn(id.clone(), series, values, meta, deadline);
+                    st.flushing = Some(Flushing {
+                        current: InFlight {
+                            id,
+                            batches,
+                            series_ids,
+                            started: Instant::now(),
+                            task,
+                        },
+                        queued,
+                        deadline,
+                        meta,
+                    });
+                    return done;
+                }
+                Err(e) => {
+                    done.extend(self.fail_block(st, &id, batches, &e.to_string()));
+                }
+            }
+        }
+        st.flushing = None;
+        done
+    }
+
+    /// A block did not land: Nack its requests (retryable).
+    fn fail_block(
+        &mut self,
+        st: &mut State,
+        id: &BlockId,
+        batches: BTreeSet<u64>,
+        reason: &str,
+    ) -> Vec<Completion> {
+        if let Some(m) = self.metrics.as_mut() {
+            m.blocks_failed.inc();
+        }
+        otel_warn!(
+            "parquet_lake.block.failed",
+            block = id.to_string(),
+            error = reason,
+            batches = batches.len()
+        );
+        let reason = format!("parquet_lake: block failed: {reason}");
+        let now = Instant::now();
+        batches
+            .into_iter()
+            .filter_map(|seq| st.pending.block_failed(seq, &reason, now))
+            .collect()
+    }
+
+    /// Resolve the block whose task finished, then start the generation's next block or free the
+    /// slot. A task that panicked or was aborted counts as a failed block.
+    fn on_flush_done(
+        &mut self,
+        st: &mut State,
+        result: Result<Result<Landed, LakeError>, JoinError>,
+    ) -> Vec<Completion> {
+        let Some(Flushing {
+            current,
+            queued,
+            deadline,
+            meta,
+        }) = st.flushing.take()
+        else {
+            return Vec::new();
+        };
+        let outcome = result.unwrap_or_else(|e| Err(LakeError::Task(e.to_string())));
+        if let Some(m) = self.metrics.as_mut() {
+            m.flush_duration
+                .record(current.started.elapsed().as_secs_f64());
+        }
+        let mut done = match outcome {
+            Ok(landed) => {
+                // Only a landed block commits its series rows.
+                let partition = current.id.partition();
+                for id in &current.series_ids {
+                    st.cache.mark_committed(*id, partition);
+                }
+                if let Some(m) = self.metrics.as_mut() {
+                    m.blocks_landed.inc();
+                    m.upload_retries.add(u64::from(landed.retries));
+                    m.bytes_written.add(landed.bytes);
+                    m.rows_written.add(landed.rows);
+                    m.series_rows_written.add(landed.series_rows);
+                    m.encoder_peak.record(landed.encoder_peak as f64);
+                    m.slice_peak.record(landed.slice_peak as f64);
+                }
+                let now = Instant::now();
+                current
+                    .batches
+                    .into_iter()
+                    .filter_map(|seq| st.pending.block_landed(seq, now))
+                    .collect()
+            }
+            Err(e) => self.fail_block(st, &current.id, current.batches, &e.to_string()),
+        };
+        done.extend(self.start_next(st, queued, deadline, meta));
+        done
+    }
+
+    /// After any event: rotate a due generation once the slot is free, then give a parked request
+    /// the room that opened.
+    fn advance(&mut self, st: &mut State) -> Vec<Completion> {
+        let mut done = Vec::new();
+        if st.flushing.is_none() && st.rotation_due.is_some() {
+            if st.active.is_empty() {
+                st.rotation_due = None;
+            } else {
+                done.extend(self.rotate(st, None));
+            }
+        }
+        if (st.rotation_due.is_none() || st.flushing.is_none())
+            && let Some(parked) = st.parked.take()
+            && st.pending.contains(parked.seq)
+        {
+            done.extend(self.push_chunks(st, parked.seq, parked.signal, parked.chunks));
+        }
+        done
+    }
+
+    /// Record how long admission stays closed.
+    fn track_admission(&mut self, st: &mut State, accepting: bool) {
+        match (accepting, st.closed_since) {
+            (false, None) => st.closed_since = Some(Instant::now()),
+            (true, Some(since)) => {
+                st.closed_since = None;
+                if let Some(m) = self.metrics.as_mut() {
+                    m.admission_closed_duration
+                        .record(since.elapsed().as_secs_f64());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Wait for the generation in the flush slot until `deadline`; abort and Nack what is left.
+    async fn drain_slot(
+        &mut self,
+        eh: &EffectHandler<OtapPdata>,
+        st: &mut State,
+        deadline: Instant,
+    ) -> Result<(), Error> {
+        while st.flushing.is_some() {
+            let result = tokio::select! {
+                biased;
+                r = flush_result(&mut st.flushing) => Some(r),
+                () = clock::sleep_until(deadline) => None,
+            };
+            let done = match result {
+                Some(r) => self.on_flush_done(st, r),
+                None => {
+                    let Some(f) = st.flushing.take() else { break };
+                    let InFlight {
+                        id, batches, task, ..
+                    } = f.current;
+                    // Aborts the task at its next await point.
+                    drop(task);
+                    let reason = "shutdown deadline reached";
+                    let mut done = self.fail_block(st, &id, batches, reason);
+                    for b in f.queued {
+                        done.extend(self.fail_block(st, &b.id, b.batches, reason));
+                    }
+                    done
+                }
+            };
+            self.notify_all(eh, done, true).await?;
         }
         Ok(())
     }
 
-    /// Flush both blocks within the deadline, Nack anything left with `NodeShutdown`.
+    /// Let the generation in the slot finish, flush ACTIVE if time remains, Nack anything left
+    /// with `NodeShutdown`. Returns by `deadline` (plus the time the engine takes to accept the
+    /// completions).
     async fn shutdown(
         &mut self,
         eh: &EffectHandler<OtapPdata>,
         st: &mut State,
         deadline: Instant,
     ) -> Result<TerminalState, Error> {
-        let flush_deadline = deadline.min(Instant::now() + self.config.upload_deadline);
-        self.flush(eh, st, Signal::Logs, flush_deadline, true)
-            .await?;
-        self.flush(eh, st, Signal::Metrics, flush_deadline, true)
-            .await?;
+        if let Some(parked) = st.parked.take()
+            && let Some(c) = st.pending.block_failed(
+                parked.seq,
+                "parquet_lake: shutdown before the request was buffered",
+                Instant::now(),
+            )
+        {
+            self.notify(eh, c, true).await?;
+        }
+        self.drain_slot(eh, st, deadline).await?;
+        if !st.active.is_empty() && Instant::now() < deadline {
+            st.rotation_due = Some(FlushReason::Shutdown);
+            let done = self.rotate(st, Some(deadline));
+            self.notify_all(eh, done, true).await?;
+            self.drain_slot(eh, st, deadline).await?;
+        }
         for c in st
             .pending
             .drain_nack("parquet_lake: shutdown before upload", Instant::now())
         {
             self.notify(eh, c, true).await?;
         }
+        // The terminal snapshot carries the final cache and admission values; a closed admission
+        // period ends here, with the node.
+        self.track_admission(st, true);
+        self.observe(st);
         let mut snapshots = Vec::new();
         if let Some(m) = self.pdata_metrics.as_mut() {
             snapshots.extend(m.terminal_snapshots());
@@ -466,6 +850,28 @@ impl ParquetLakeExporter {
         }
         Ok(TerminalState::new(deadline, snapshots))
     }
+
+    /// Report the cache and admission gauges with the rest of the metric set.
+    fn observe(&mut self, st: &mut State) {
+        let Some(m) = self.metrics.as_mut() else {
+            return;
+        };
+        let stats = st.cache.stats();
+        m.cache_entries.set(st.cache.len() as u64);
+        m.cache_hits.add(stats.hits - st.reported.hits);
+        m.cache_misses.add(stats.misses - st.reported.misses);
+        m.cache_evictions
+            .add(stats.evictions - st.reported.evictions);
+        m.admission_closed.set(u64::from(st.closed_since.is_some()));
+        st.reported = stats;
+    }
+}
+
+/// What the node loop woke up for.
+enum Event {
+    Flushed(Result<Result<Landed, LakeError>, JoinError>),
+    Window,
+    Inbox(Message<OtapPdata>),
 }
 
 #[async_trait(?Send)]
@@ -499,40 +905,46 @@ impl Exporter<OtapPdata> for ParquetLakeExporter {
                 })?
             }
         };
+        // No `message`: the log encoder gives every field half of the remaining record buffer,
+        // and a sentence here would push the numeric fields out of the record.
         otel_info!(
             "parquet_lake.start",
-            writer = self.writer.as_str(),
-            max_block_bytes = self.config.max_block_bytes as u64,
-            worst_case_flush_bytes = self.config.worst_case_flush_bytes() as u64,
-            message = "receivers must use wait_for_result and a timeout above max_block_age plus upload_deadline"
+            writer_id = self.config.writer_id.as_str(),
+            boot_id = self.boot_id.as_str(),
+            window_interval_secs = self.config.window.interval.as_secs(),
+            max_block_bytes = self.config.window.max_block_bytes as u64,
+            worst_case_flush_bytes = self.config.worst_case_flush_bytes() as u64
         );
-        let mut st = State {
-            store,
-            schemas: Schemas::new(),
-            logs: Block::default(),
-            metrics: Block::default(),
-            pending: PendingAcks::default(),
-            next_block: 0,
-        };
-        let _timer = effect_handler
-            .start_periodic_timer(self.config.check_interval)
-            .await?;
+        let mut st = self.new_state(store);
+        // The exporter's own sleep, not an engine periodic timer: the engine cancels periodic
+        // timers before it drains a node.
+        let mut wake = clock::sleep(st.window.until_boundary(self.wall.now_unix_nanos()));
         loop {
-            // Backpressure: the loop does not read its inbox while it flushes a block.
-            match inbox.recv().await? {
-                Message::Control(NodeControlMsg::TimerTick { .. }) => {
-                    let now = Instant::now();
-                    if let Some(signal) =
-                        due_signal(&st.logs, &st.metrics, now, self.config.max_block_age)
-                    {
-                        let deadline = now + self.config.upload_deadline;
-                        self.flush(&effect_handler, &mut st, signal, deadline, false)
-                            .await?;
-                    }
+            // Backpressure: pdata is not read while ACTIVE waits for the flush slot or a request
+            // is parked. Control messages always flow.
+            let accepting = st.accepting();
+            self.track_admission(&mut st, accepting);
+            let event = tokio::select! {
+                biased;
+                r = flush_result(&mut st.flushing) => Event::Flushed(r),
+                () = &mut wake => Event::Window,
+                msg = inbox.recv_when(accepting) => Event::Inbox(msg?),
+            };
+            match event {
+                Event::Flushed(result) => {
+                    let done = self.on_flush_done(&mut st, result);
+                    self.notify_all(&effect_handler, done, false).await?;
                 }
-                Message::Control(NodeControlMsg::CollectTelemetry {
+                Event::Window => {
+                    if !st.active.is_empty() {
+                        let _ = st.rotation_due.get_or_insert(FlushReason::Time);
+                    }
+                    wake = clock::sleep(st.window.until_boundary(self.wall.now_unix_nanos()));
+                }
+                Event::Inbox(Message::Control(NodeControlMsg::CollectTelemetry {
                     mut metrics_reporter,
-                }) => {
+                })) => {
+                    self.observe(&mut st);
                     if let Some(m) = self.pdata_metrics.as_mut() {
                         let _ = metrics_reporter.report_measurement(m);
                     }
@@ -540,14 +952,16 @@ impl Exporter<OtapPdata> for ParquetLakeExporter {
                         let _ = metrics_reporter.report(m);
                     }
                 }
-                Message::Control(NodeControlMsg::Shutdown { deadline, .. }) => {
+                Event::Inbox(Message::Control(NodeControlMsg::Shutdown { deadline, .. })) => {
                     return self.shutdown(&effect_handler, &mut st, deadline).await;
                 }
-                Message::Control(_) => {}
-                Message::PData(pdata) => {
+                Event::Inbox(Message::Control(_)) => {}
+                Event::Inbox(Message::PData(pdata)) => {
                     self.handle_pdata(&effect_handler, &mut st, pdata).await?;
                 }
             }
+            let done = self.advance(&mut st);
+            self.notify_all(&effect_handler, done, false).await?;
         }
     }
 }

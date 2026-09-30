@@ -8,7 +8,7 @@ change_type: new_component
 component: pipeline
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: Add exporter:parquet_lake, which writes series/values Parquet datasets keyed by a stable series_id and acks after each block lands.
+note: Add exporter:parquet_lake, which writes Series Lake Format v1 series/values Parquet datasets and acks a request after its block lands.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 issues: []
@@ -18,4 +18,6 @@ issues: []
 # Use pipe (|) for multiline entries. Breaking entries must include a `Migration:`
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
-subtext: Each distinct resource/scope/metric identity is written once per block to the series dataset; values rows carry only its series_id. Memory is bounded by max_block_bytes.
+subtext: |
+  A series row is written once per writer and hour. One block accepts while another is flushed. Requests above
+  the ingress limits and invalid content are refused. Receivers need wait_for_result.

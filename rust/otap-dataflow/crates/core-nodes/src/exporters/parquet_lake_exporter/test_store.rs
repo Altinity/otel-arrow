@@ -1,8 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Test-only object store with fault injection on puts: failing, ambiguous (stored, then an error)
-//! and gated puts, plus a record of every attempted put. Wraps `LocalFileSystem`.
+//! Test-only object store with fault injection on puts: failing, ambiguous (stored, then an error),
+//! panicking and gated puts, plus a record of every attempted put. Wraps `LocalFileSystem`.
 
 use std::fmt;
 use std::ops::Range;
@@ -31,6 +31,8 @@ pub struct Faults {
     pub fail_puts: PutFault,
     /// Store matching puts, then return an error (the response was "lost").
     pub ambiguous_puts: PutFault,
+    /// Panic inside matching puts (the flush task dies).
+    pub panic_puts: PutFault,
     /// When set, every put waits for one permit (`add_permits` releases puts).
     pub commit_gate: Option<Arc<Semaphore>>,
     /// When set, `commit_gate` applies only to paths containing this string.
@@ -131,6 +133,9 @@ impl ObjectStore for TestStore {
         };
         if let Some(gate) = gate {
             gate.acquire().await.expect("gate open").forget();
+        }
+        if hit(&self.faults.panic_puts, location) {
+            panic!("injected put panic");
         }
         if hit(&self.faults.fail_puts, location) {
             return Err(injected("put"));

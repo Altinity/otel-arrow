@@ -1,9 +1,12 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! OTAP AnyValue columns: rendering to strings for `Map<Utf8, Utf8>` output and canonical
-//! identity encoding. Both treat a typed row with a null value column as the type default, like the
-//! pdata views (OTAP encoders omit all-default value columns).
+//! OTAP AnyValue columns: the v1 rendering for `MAP<STRING, STRING>` cells and bodies, and the
+//! canonical identity encoding (docs/FORMAT.md sections 1 and 2). A typed row with an absent or
+//! null value column reads as the type default, because OTAP encoders omit all-default value
+//! columns. Map and slice values are decoded once, when the columns are built.
+
+use std::collections::HashMap;
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray,
@@ -13,11 +16,13 @@ use arrow::datatypes::DataType;
 use otel_arrow_dfe_pdata::otlp::attributes::AttributeValueType;
 use otel_arrow_dfe_pdata::schema::consts;
 
-use super::columns::cast_or_null;
+use super::canonical::{encode_value, put_bool, put_bytes, put_double, put_int, put_null, put_str};
+use super::columns::{cast_cost, cast_or_null};
 use super::error::LakeError;
-use super::identity::{put_bin, put_bool, put_cbor, put_double, put_int, put_str, tag};
+use super::limits::{Budget, Limits};
+use super::value::{Value, decode_cbor, render_v1, write_bytes_v1, write_double};
 
-/// Canonicalized AnyValue columns of one table (attrs table or `body` struct).
+/// AnyValue columns of one table (attrs table or `body` struct).
 pub struct AnyValueColumns {
     ty: UInt8Array,
     str_: StringArray,
@@ -25,56 +30,89 @@ pub struct AnyValueColumns {
     double: Float64Array,
     bool_: BooleanArray,
     bytes: BinaryArray,
-    ser: BinaryArray,
+    /// Decoded `ser` cells of the Map and Slice rows.
+    nested: HashMap<usize, Value>,
 }
 
 impl AnyValueColumns {
-    /// Build from a lookup function returning each column by its OTAP name.
-    pub fn new(len: usize, get: impl Fn(&str) -> Option<ArrayRef>) -> Result<Self, LakeError> {
+    /// Build from a lookup function returning each column by its OTAP name, and validate every
+    /// row for which `valid` is true.
+    ///
+    /// # Errors
+    /// Invalid content for a missing type column, an unknown type code, a map or slice without a
+    /// `ser` cell or with an undecodable one; too deep for nesting beyond the limit; too large
+    /// for a cell above `max_row_bytes` or when the budget is exhausted.
+    pub fn new(
+        len: usize,
+        get: impl Fn(&str) -> Option<ArrayRef>,
+        valid: impl Fn(usize) -> bool,
+        limits: &Limits,
+        budget: &mut Budget,
+    ) -> Result<Self, LakeError> {
+        if len > 0 && get(consts::ATTRIBUTE_TYPE).is_none() {
+            return Err(LakeError::Invalid("missing type column".into()));
+        }
+        for (name, plain) in [
+            (consts::ATTRIBUTE_STR, DataType::Utf8),
+            (consts::ATTRIBUTE_BYTES, DataType::Binary),
+            (consts::ATTRIBUTE_SER, DataType::Binary),
+        ] {
+            if let Some(a) = get(name) {
+                budget.charge(cast_cost(&a, &plain))?;
+            }
+        }
         let c = |name: &str, dt: &DataType| cast_or_null(get(name).as_ref(), dt, len);
+        let ty = downcast::<UInt8Array>(&c(consts::ATTRIBUTE_TYPE, &DataType::UInt8)?);
+        let str_ = downcast::<StringArray>(&c(consts::ATTRIBUTE_STR, &DataType::Utf8)?);
+        let bytes = downcast::<BinaryArray>(&c(consts::ATTRIBUTE_BYTES, &DataType::Binary)?);
+        let ser = downcast::<BinaryArray>(&c(consts::ATTRIBUTE_SER, &DataType::Binary)?);
+        let mut nested = HashMap::new();
+        for i in (0..len).filter(|&i| valid(i) && !ty.is_null(i)) {
+            let code = ty.value(i);
+            match AttributeValueType::try_from(code) {
+                Err(_) => return Err(LakeError::Invalid(format!("attribute type {code}"))),
+                Ok(AttributeValueType::Str) if !str_.is_null(i) => {
+                    limits.check_cell(str_.value(i).len())?;
+                }
+                Ok(AttributeValueType::Bytes) if !bytes.is_null(i) => {
+                    limits.check_cell(bytes.value(i).len())?;
+                }
+                Ok(AttributeValueType::Map | AttributeValueType::Slice) => {
+                    if ser.is_null(i) {
+                        return Err(LakeError::Invalid(
+                            "map or slice attribute without a ser payload".into(),
+                        ));
+                    }
+                    let cell = ser.value(i);
+                    limits.check_cell(cell.len())?;
+                    let value = decode_cbor(cell, limits.max_nesting_depth, budget)?;
+                    let _ = nested.insert(i, value);
+                }
+                Ok(_) => {}
+            }
+        }
         Ok(Self {
-            ty: downcast::<UInt8Array>(&c(consts::ATTRIBUTE_TYPE, &DataType::UInt8)?),
-            str_: downcast::<StringArray>(&c(consts::ATTRIBUTE_STR, &DataType::Utf8)?),
+            ty,
+            str_,
             int: downcast::<Int64Array>(&c(consts::ATTRIBUTE_INT, &DataType::Int64)?),
             double: downcast::<Float64Array>(&c(consts::ATTRIBUTE_DOUBLE, &DataType::Float64)?),
             bool_: downcast::<BooleanArray>(&c(consts::ATTRIBUTE_BOOL, &DataType::Boolean)?),
-            bytes: downcast::<BinaryArray>(&c(consts::ATTRIBUTE_BYTES, &DataType::Binary)?),
-            ser: downcast::<BinaryArray>(&c(consts::ATTRIBUTE_SER, &DataType::Binary)?),
+            bytes,
+            nested,
         })
     }
 
-    /// Render all rows into a Utf8 array (null for Empty / null type).
+    /// Columns of an absent table.
     #[must_use]
-    pub fn render_all(&self) -> StringArray {
-        self.render_where(|_| true)
-    }
-
-    /// Render all rows, emitting null where `valid(i)` is false (e.g. a null parent struct).
-    #[must_use]
-    pub fn render_where(&self, valid: impl Fn(usize) -> bool) -> StringArray {
-        let mut out = StringBuilder::with_capacity(self.ty.len(), self.ty.len() * 16);
-        for i in 0..self.ty.len() {
-            if valid(i) {
-                self.render_into(&mut out, i);
-            } else {
-                out.append_null();
-            }
-        }
-        out.finish()
-    }
-
-    /// Append row `i` to `out` without an intermediate `String` for the common `Str` case.
-    pub fn render_into(&self, out: &mut StringBuilder, i: usize) {
-        if !self.ty.is_null(i)
-            && self.ty.value(i) == AttributeValueType::Str as u8
-            && !self.str_.is_null(i)
-        {
-            out.append_value(self.str_.value(i));
-            return;
-        }
-        match self.render(i) {
-            Some(s) => out.append_value(s),
-            None => out.append_null(),
+    pub fn empty() -> Self {
+        Self {
+            ty: UInt8Array::from(Vec::<u8>::new()),
+            str_: StringArray::from(Vec::<&str>::new()),
+            int: Int64Array::from(Vec::<i64>::new()),
+            double: Float64Array::from(Vec::<f64>::new()),
+            bool_: BooleanArray::from(Vec::<bool>::new()),
+            bytes: BinaryArray::from(Vec::<&[u8]>::new()),
+            nested: HashMap::new(),
         }
     }
 
@@ -86,65 +124,105 @@ impl AnyValueColumns {
         }
     }
 
-    /// True when row `i` is a Map/Slice with a non-empty serialized value.
-    fn has_ser(&self, i: usize) -> bool {
-        !self.ser.is_null(i) && !self.ser.value(i).is_empty()
+    /// Render every row for which `valid` is true as its map cell or body string (null for an
+    /// unset value and for the other rows), charging the rendered bytes to `budget`.
+    pub fn render_where(
+        &self,
+        valid: impl Fn(usize) -> bool,
+        budget: &mut Budget,
+    ) -> Result<StringArray, LakeError> {
+        let mut out = StringBuilder::with_capacity(self.ty.len(), 0);
+        let mut scratch = String::new();
+        for i in 0..self.ty.len() {
+            if !valid(i) {
+                out.append_null();
+                continue;
+            }
+            match self.value_type(i) {
+                None | Some(AttributeValueType::Empty) => out.append_null(),
+                Some(AttributeValueType::Str) => {
+                    let s = if self.str_.is_null(i) {
+                        ""
+                    } else {
+                        self.str_.value(i)
+                    };
+                    budget.charge(s.len())?;
+                    out.append_value(s);
+                }
+                Some(other) => {
+                    scratch.clear();
+                    self.render_into(other, i, &mut scratch);
+                    budget.charge(scratch.len())?;
+                    out.append_value(&scratch);
+                }
+            }
+        }
+        Ok(out.finish())
     }
 
-    /// Render row `i` (None for the EMPTY class; a typed null renders as the type default, like
-    /// `canonical_into`).
-    #[must_use]
-    pub fn render(&self, i: usize) -> Option<String> {
-        match self.value_type(i) {
-            Some(AttributeValueType::Str) => Some(if self.str_.is_null(i) {
-                String::new()
-            } else {
-                self.str_.value(i).to_owned()
-            }),
-            Some(AttributeValueType::Int) => Some(
-                if self.int.is_null(i) {
-                    0
-                } else {
-                    self.int.value(i)
-                }
-                .to_string(),
-            ),
-            Some(AttributeValueType::Double) => Some(
+    /// The compact JSON of `render_v1` for a non-string, non-null value.
+    fn render_into(&self, ty: AttributeValueType, i: usize, out: &mut String) {
+        use std::fmt::Write as _;
+        let _ = match ty {
+            AttributeValueType::Int => {
+                write!(
+                    out,
+                    "{}",
+                    if self.int.is_null(i) {
+                        0
+                    } else {
+                        self.int.value(i)
+                    }
+                )
+            }
+            AttributeValueType::Double => write_double(
                 if self.double.is_null(i) {
                     0.0
                 } else {
                     self.double.value(i)
-                }
-                .to_string(),
-            ),
-            Some(AttributeValueType::Bool) => {
-                Some((!self.bool_.is_null(i) && self.bool_.value(i)).to_string())
-            }
-            Some(AttributeValueType::Bytes) => Some(if self.bytes.is_null(i) {
-                String::new()
-            } else {
-                hex::encode(self.bytes.value(i))
-            }),
-            Some(AttributeValueType::Map | AttributeValueType::Slice) if self.has_ser(i) => {
-                Some(cbor_to_json_string(self.ser.value(i)))
-            }
-            _ => None,
-        }
-    }
-
-    /// Canonical encoding of row `i` (FORMAT.md "Identity grammar"). A typed row with a null value
-    /// column encodes as the type default; a null type, the Empty type, an unknown type code, or a
-    /// Map/Slice with a null or empty `ser` encodes as EMPTY.
-    pub fn canonical_into(&self, i: usize, out: &mut Vec<u8>) {
-        match self.value_type(i) {
-            Some(AttributeValueType::Str) => put_str(
+                },
                 out,
-                if self.str_.is_null(i) {
+            ),
+            AttributeValueType::Bool => {
+                out.write_str(if !self.bool_.is_null(i) && self.bool_.value(i) {
+                    "true"
+                } else {
+                    "false"
+                })
+            }
+            AttributeValueType::Bytes => write_bytes_v1(
+                if self.bytes.is_null(i) {
                     b""
                 } else {
-                    self.str_.value(i).as_bytes()
+                    self.bytes.value(i)
                 },
+                out,
             ),
+            AttributeValueType::Map | AttributeValueType::Slice => {
+                // `new` decoded every valid map and slice row.
+                match self.nested.get(&i) {
+                    Some(v) => out.write_str(&render_v1(v)),
+                    None => out.write_str("null"),
+                }
+            }
+            AttributeValueType::Str | AttributeValueType::Empty => Ok(()),
+        };
+    }
+
+    /// Canonical encoding of row `i` (FORMAT.md section 1).
+    pub fn canonical_into(&self, i: usize, out: &mut Vec<u8>) {
+        match self.value_type(i) {
+            None | Some(AttributeValueType::Empty) => put_null(out),
+            Some(AttributeValueType::Str) => {
+                put_str(
+                    out,
+                    if self.str_.is_null(i) {
+                        ""
+                    } else {
+                        self.str_.value(i)
+                    },
+                );
+            }
             Some(AttributeValueType::Int) => {
                 put_int(
                     out,
@@ -155,29 +233,35 @@ impl AnyValueColumns {
                     },
                 );
             }
-            Some(AttributeValueType::Double) => put_double(
-                out,
-                if self.double.is_null(i) {
-                    0.0
-                } else {
-                    self.double.value(i)
-                },
-            ),
+            Some(AttributeValueType::Double) => {
+                put_double(
+                    out,
+                    if self.double.is_null(i) {
+                        0.0
+                    } else {
+                        self.double.value(i)
+                    },
+                );
+            }
             Some(AttributeValueType::Bool) => {
                 put_bool(out, !self.bool_.is_null(i) && self.bool_.value(i));
             }
-            Some(AttributeValueType::Bytes) => put_bin(
-                out,
-                if self.bytes.is_null(i) {
-                    b""
-                } else {
-                    self.bytes.value(i)
-                },
-            ),
-            Some(AttributeValueType::Map | AttributeValueType::Slice) if self.has_ser(i) => {
-                put_cbor(out, self.ser.value(i));
+            Some(AttributeValueType::Bytes) => {
+                put_bytes(
+                    out,
+                    if self.bytes.is_null(i) {
+                        b""
+                    } else {
+                        self.bytes.value(i)
+                    },
+                );
             }
-            _ => out.push(tag::EMPTY),
+            Some(AttributeValueType::Map | AttributeValueType::Slice) => {
+                match self.nested.get(&i) {
+                    Some(v) => encode_value(out, v),
+                    None => put_null(out),
+                }
+            }
         }
     }
 }
@@ -189,66 +273,19 @@ fn downcast<T: Array + Clone + 'static>(a: &ArrayRef) -> T {
         .clone()
 }
 
-/// Decode a CBOR-serialized AnyValue (map or slice) into a compact JSON string.
-/// Undecodable bytes are rendered as hex so data is never silently dropped.
-#[must_use]
-pub fn cbor_to_json_string(bytes: &[u8]) -> String {
-    match ciborium::from_reader::<ciborium::Value, _>(bytes) {
-        Ok(v) => cbor_to_json(&v).to_string(),
-        Err(_) => hex::encode(bytes),
-    }
-}
-
-fn cbor_to_json(v: &ciborium::Value) -> serde_json::Value {
-    use ciborium::Value as C;
-    use serde_json::Value as J;
-    match v {
-        C::Null => J::Null,
-        C::Bool(b) => J::Bool(*b),
-        C::Integer(i) => {
-            let i: i128 = (*i).into();
-            i64::try_from(i).map_or_else(|_| J::String(i.to_string()), |v| J::Number(v.into()))
-        }
-        // JSON has no NaN/Infinity: keep them as strings instead of dropping them to null.
-        C::Float(f) => serde_json::Number::from_f64(*f).map_or_else(
-            || {
-                J::String(
-                    if f.is_nan() {
-                        "NaN"
-                    } else if *f > 0.0 {
-                        "Infinity"
-                    } else {
-                        "-Infinity"
-                    }
-                    .to_owned(),
-                )
-            },
-            J::Number,
-        ),
-        C::Text(s) => J::String(s.clone()),
-        C::Bytes(b) => J::String(hex::encode(b)),
-        C::Array(items) => J::Array(items.iter().map(cbor_to_json).collect()),
-        C::Map(entries) => J::Object(
-            entries
-                .iter()
-                .map(|(k, v)| {
-                    let key = match k {
-                        C::Text(s) => s.clone(),
-                        other => cbor_to_json(other).to_string(),
-                    };
-                    (key, cbor_to_json(v))
-                })
-                .collect(),
-        ),
-        C::Tag(_, inner) => cbor_to_json(inner),
-        _ => J::Null,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn limits() -> Limits {
+        Limits {
+            max_extracted_bytes: 1 << 30,
+            max_row_bytes: 1 << 20,
+            max_nesting_depth: 32,
+            max_chunk_bytes: 1 << 30,
+        }
+    }
 
     fn cbor(v: &ciborium::Value) -> Vec<u8> {
         let mut out = Vec::new();
@@ -256,142 +293,140 @@ mod tests {
         out
     }
 
-    fn columns() -> AnyValueColumns {
-        let map = cbor(&ciborium::Value::Map(vec![(
-            ciborium::Value::Text("a".into()),
-            ciborium::Value::Integer(1.into()),
-        )]));
-        let slice = cbor(&ciborium::Value::Array(vec![
-            ciborium::Value::Integer(1.into()),
-            ciborium::Value::Text("x".into()),
-        ]));
-        let t = |v: AttributeValueType| Some(v as u8);
-        let ty: ArrayRef = Arc::new(UInt8Array::from(vec![
-            t(AttributeValueType::Str),
-            t(AttributeValueType::Int),
-            t(AttributeValueType::Double),
-            t(AttributeValueType::Bool),
-            t(AttributeValueType::Bytes),
-            t(AttributeValueType::Map),
-            t(AttributeValueType::Slice),
-            t(AttributeValueType::Empty),
-            t(AttributeValueType::Map),
-        ]));
-        let str_: ArrayRef = Arc::new(StringArray::from(vec![
-            Some("hello"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ]));
-        let int: ArrayRef = Arc::new(Int64Array::from(vec![
-            None,
-            Some(42),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ]));
-        let double: ArrayRef = Arc::new(Float64Array::from(vec![
-            None,
-            None,
-            Some(1.5),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ]));
-        let bool_: ArrayRef = Arc::new(BooleanArray::from(vec![
-            None,
-            None,
-            None,
-            Some(true),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ]));
-        let bytes: ArrayRef = Arc::new(BinaryArray::from(vec![
-            None,
-            None,
-            None,
-            None,
-            Some(&[0xde_u8, 0xad][..]),
-            None,
-            None,
-            None,
-            None,
-        ]));
-        let ser: ArrayRef = Arc::new(BinaryArray::from(vec![
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(map.as_slice()),
-            Some(slice.as_slice()),
-            None,
-            Some(&[0xff_u8, 0xff][..]),
-        ]));
-        AnyValueColumns::new(9, |name| match name {
-            consts::ATTRIBUTE_TYPE => Some(ty.clone()),
-            consts::ATTRIBUTE_STR => Some(str_.clone()),
-            consts::ATTRIBUTE_INT => Some(int.clone()),
-            consts::ATTRIBUTE_DOUBLE => Some(double.clone()),
-            consts::ATTRIBUTE_BOOL => Some(bool_.clone()),
-            consts::ATTRIBUTE_BYTES => Some(bytes.clone()),
-            consts::ATTRIBUTE_SER => Some(ser.clone()),
-            _ => None,
-        })
-        .expect("columns")
+    /// One AnyValue row of the fixture table.
+    enum Cell {
+        Str(String),
+        Int(i64),
+        Double(f64),
+        Bool(bool),
+        Bytes(Vec<u8>),
+        /// A Map row with this `ser` payload (`None`: a null `ser` cell).
+        Map(Option<Vec<u8>>),
+        /// A Slice row with this `ser` payload.
+        Slice(Vec<u8>),
+        /// A type code with every value column null.
+        Typed(u8),
     }
 
-    /// Scenario: One row of every AnyValue type, plus an invalid CBOR payload, is rendered.
-    /// Guarantees: Scalars render as text, bytes as hex, maps/slices as compact JSON, Empty as null, and invalid CBOR as hex instead of panicking.
-    #[test]
-    fn every_any_value_type_renders() {
-        let c = columns();
-        let expected = [
-            Some("hello"),
-            Some("42"),
-            Some("1.5"),
-            Some("true"),
-            Some("dead"),
-            Some("{\"a\":1}"),
-            Some("[1,\"x\"]"),
-            None,
-            Some("ffff"),
-        ];
-        for (i, want) in expected.iter().enumerate() {
-            assert_eq!(c.render(i).as_deref(), *want, "row {i}");
+    /// The columns of an attrs table, row by row.
+    #[derive(Default)]
+    struct Rows {
+        ty: Vec<Option<u8>>,
+        str_: Vec<Option<String>>,
+        int: Vec<Option<i64>>,
+        double: Vec<Option<f64>>,
+        bool_: Vec<Option<bool>>,
+        bytes: Vec<Option<Vec<u8>>>,
+        ser: Vec<Option<Vec<u8>>>,
+    }
+
+    impl Rows {
+        fn of(cells: Vec<Cell>) -> Self {
+            let mut rows = Self::default();
+            for cell in cells {
+                rows.push(cell);
+            }
+            rows
         }
-        let all = c.render_all();
-        for (i, want) in expected.iter().enumerate() {
-            let got = (!all.is_null(i)).then(|| all.value(i));
-            assert_eq!(got, *want, "render_into row {i}");
+
+        fn push(&mut self, cell: Cell) {
+            let t = |v: AttributeValueType| v as u8;
+            let (mut s, mut i, mut d, mut b, mut by, mut ser) =
+                (None, None, None, None, None, None);
+            let ty = match cell {
+                Cell::Str(v) => {
+                    s = Some(v);
+                    t(AttributeValueType::Str)
+                }
+                Cell::Int(v) => {
+                    i = Some(v);
+                    t(AttributeValueType::Int)
+                }
+                Cell::Double(v) => {
+                    d = Some(v);
+                    t(AttributeValueType::Double)
+                }
+                Cell::Bool(v) => {
+                    b = Some(v);
+                    t(AttributeValueType::Bool)
+                }
+                Cell::Bytes(v) => {
+                    by = Some(v);
+                    t(AttributeValueType::Bytes)
+                }
+                Cell::Map(v) => {
+                    ser = v;
+                    t(AttributeValueType::Map)
+                }
+                Cell::Slice(v) => {
+                    ser = Some(v);
+                    t(AttributeValueType::Slice)
+                }
+                Cell::Typed(code) => code,
+            };
+            self.ty.push(Some(ty));
+            self.str_.push(s);
+            self.int.push(i);
+            self.double.push(d);
+            self.bool_.push(b);
+            self.bytes.push(by);
+            self.ser.push(ser);
+        }
+
+        fn build_where(
+            &self,
+            valid: impl Fn(usize) -> bool,
+            limits: &Limits,
+            budget: &mut Budget,
+        ) -> Result<AnyValueColumns, LakeError> {
+            let binary = |cells: &[Option<Vec<u8>>]| -> ArrayRef {
+                Arc::new(BinaryArray::from_iter(cells.iter().map(|c| c.as_deref())))
+            };
+            let ty: ArrayRef = Arc::new(UInt8Array::from(self.ty.clone()));
+            let str_: ArrayRef = Arc::new(StringArray::from_iter(
+                self.str_.iter().map(|c| c.as_deref()),
+            ));
+            let int: ArrayRef = Arc::new(Int64Array::from(self.int.clone()));
+            let double: ArrayRef = Arc::new(Float64Array::from(self.double.clone()));
+            let bool_: ArrayRef = Arc::new(BooleanArray::from(self.bool_.clone()));
+            let (bytes, ser) = (binary(&self.bytes), binary(&self.ser));
+            AnyValueColumns::new(
+                self.ty.len(),
+                |name| match name {
+                    consts::ATTRIBUTE_TYPE => Some(ty.clone()),
+                    consts::ATTRIBUTE_STR => Some(str_.clone()),
+                    consts::ATTRIBUTE_INT => Some(int.clone()),
+                    consts::ATTRIBUTE_DOUBLE => Some(double.clone()),
+                    consts::ATTRIBUTE_BOOL => Some(bool_.clone()),
+                    consts::ATTRIBUTE_BYTES => Some(bytes.clone()),
+                    consts::ATTRIBUTE_SER => Some(ser.clone()),
+                    _ => None,
+                },
+                valid,
+                limits,
+                budget,
+            )
+        }
+
+        fn build(&self) -> AnyValueColumns {
+            self.build_where(|_| true, &limits(), &mut Budget::new(1 << 30))
+                .unwrap_or_else(|e| panic!("columns: {e}"))
+        }
+
+        fn refusal(&self, limits: &Limits) -> LakeError {
+            self.build_where(|_| true, limits, &mut Budget::new(1 << 30))
+                .err()
+                .expect("refused")
         }
     }
 
-    /// Scenario: An attrs table has only the `type` column (OTAP omits all-default value columns).
-    /// Guarantees: The missing value column reads as the type default ("0" for Int) rather than an error or null.
-    #[test]
-    fn absent_optional_columns_render_type_defaults() {
-        let ty: ArrayRef = Arc::new(UInt8Array::from(vec![AttributeValueType::Int as u8]));
-        let c = AnyValueColumns::new(1, |name| {
-            (name == consts::ATTRIBUTE_TYPE).then(|| ty.clone())
-        })
-        .expect("columns");
-        assert_eq!(c.render(0).as_deref(), Some("0"));
+    fn rendered(c: &AnyValueColumns) -> Vec<Option<String>> {
+        let out = c
+            .render_where(|_| true, &mut Budget::new(1 << 30))
+            .expect("render");
+        (0..out.len())
+            .map(|i| (!out.is_null(i)).then(|| out.value(i).to_owned()))
+            .collect()
     }
 
     fn canonical(c: &AnyValueColumns, i: usize) -> Vec<u8> {
@@ -400,83 +435,175 @@ mod tests {
         out
     }
 
-    /// Scenario: Typed rows have null value columns (Int, Str, Double, Bool, Bytes), next to explicit default values, plus a Map with a null `ser`.
-    /// Guarantees: Each typed null encodes and renders exactly like its explicit default, and the null Map encodes as EMPTY and renders as null.
+    fn map_cbor() -> Vec<u8> {
+        cbor(&ciborium::Value::Map(vec![(
+            ciborium::Value::Text("a".into()),
+            ciborium::Value::Integer(1.into()),
+        )]))
+    }
+
+    /// Scenario: One row of every AnyValue type is rendered: a string, 42, 1.5, true, bytes de ad, a map {a: 1}, a slice [1, "x"] and an Empty value.
+    /// Guarantees: Strings are stored raw, scalars as their JSON text, bytes as quoted padded base64, maps and slices as compact JSON, and Empty as SQL null, as Series Lake Format v1 renders them.
+    #[test]
+    fn every_any_value_type_renders_as_v1() {
+        let slice = cbor(&ciborium::Value::Array(vec![
+            ciborium::Value::Integer(1.into()),
+            ciborium::Value::Text("x".into()),
+        ]));
+        let c = Rows::of(vec![
+            Cell::Str("hello".into()),
+            Cell::Int(42),
+            Cell::Double(1.5),
+            Cell::Bool(true),
+            Cell::Bytes(vec![0xde, 0xad]),
+            Cell::Map(Some(map_cbor())),
+            Cell::Slice(slice),
+            Cell::Typed(AttributeValueType::Empty as u8),
+        ])
+        .build();
+        let want = [
+            Some("hello"),
+            Some("42"),
+            Some("1.5"),
+            Some("true"),
+            Some("\"3q0=\""),
+            Some("{\"a\":1}"),
+            Some("[1,\"x\"]"),
+            None,
+        ];
+        let got = rendered(&c);
+        for (i, want) in want.iter().enumerate() {
+            assert_eq!(got[i].as_deref(), *want, "row {i}");
+        }
+    }
+
+    /// Scenario: The doubles 3.0, NaN, +Infinity, -Infinity and -0.0 are rendered.
+    /// Guarantees: A whole double keeps its fraction, the non-finite ones are the quoted strings of the format, and negative zero keeps its sign.
+    #[test]
+    fn doubles_render_like_the_format() {
+        let c = Rows::of(
+            [3.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0]
+                .into_iter()
+                .map(Cell::Double)
+                .collect(),
+        )
+        .build();
+        let got: Vec<String> = rendered(&c)
+            .into_iter()
+            .map(|s| s.expect("value"))
+            .collect();
+        assert_eq!(
+            got,
+            ["3.0", "\"NaN\"", "\"Infinity\"", "\"-Infinity\"", "-0.0"]
+        );
+    }
+
+    /// Scenario: Typed rows have null value columns (Int, Str, Double, Bool, Bytes) next to rows holding the explicit defaults, plus an Empty row.
+    /// Guarantees: Each typed null encodes and renders exactly like its explicit default, so an encoder that omits default values gives the same series id; Empty encodes as the null value and renders as null.
     #[test]
     fn typed_null_equals_default() {
-        let t = |v: AttributeValueType| v as u8;
-        let types = [
+        let t = |v: AttributeValueType| Cell::Typed(v as u8);
+        let c = Rows::of(vec![
             t(AttributeValueType::Int),
             t(AttributeValueType::Str),
             t(AttributeValueType::Double),
             t(AttributeValueType::Bool),
             t(AttributeValueType::Bytes),
-        ];
-        let ty: ArrayRef = Arc::new(UInt8Array::from(
-            types
-                .iter()
-                .chain(types.iter())
-                .copied()
-                .chain([t(AttributeValueType::Map), t(AttributeValueType::Empty)])
-                .collect::<Vec<u8>>(),
-        ));
-        // Rows 0..5 have null values; rows 5..10 hold the explicit defaults.
-        let n = 12;
-        let int: ArrayRef = Arc::new(Int64Array::from_iter((0..n).map(|i| (i == 5).then_some(0))));
-        let str_: ArrayRef = Arc::new(StringArray::from_iter(
-            (0..n).map(|i| (i == 6).then_some("")),
-        ));
-        let double: ArrayRef = Arc::new(Float64Array::from_iter(
-            (0..n).map(|i| (i == 7).then_some(0.0)),
-        ));
-        let bool_: ArrayRef = Arc::new(BooleanArray::from_iter(
-            (0..n).map(|i| (i == 8).then_some(false)),
-        ));
-        let bytes: ArrayRef = Arc::new(BinaryArray::from_iter(
-            (0..n).map(|i| (i == 9).then_some(b"".as_slice())),
-        ));
-        let c = AnyValueColumns::new(n, |name| match name {
-            consts::ATTRIBUTE_TYPE => Some(ty.clone()),
-            consts::ATTRIBUTE_INT => Some(int.clone()),
-            consts::ATTRIBUTE_STR => Some(str_.clone()),
-            consts::ATTRIBUTE_DOUBLE => Some(double.clone()),
-            consts::ATTRIBUTE_BOOL => Some(bool_.clone()),
-            consts::ATTRIBUTE_BYTES => Some(bytes.clone()),
-            _ => None,
-        })
-        .expect("columns");
+            Cell::Int(0),
+            Cell::Str(String::new()),
+            Cell::Double(0.0),
+            Cell::Bool(false),
+            Cell::Bytes(Vec::new()),
+            t(AttributeValueType::Empty),
+        ])
+        .build();
+        let got = rendered(&c);
         for i in 0..5 {
             assert_eq!(canonical(&c, i), canonical(&c, i + 5), "canonical row {i}");
-            assert_eq!(c.render(i), c.render(i + 5), "render row {i}");
+            assert_eq!(got[i], got[i + 5], "render row {i}");
         }
-        assert_eq!(c.render(0).as_deref(), Some("0"));
-        assert_eq!(c.render(1).as_deref(), Some(""));
-        assert_eq!(canonical(&c, 10), vec![tag::EMPTY]);
-        assert_eq!(canonical(&c, 11), vec![tag::EMPTY]);
-        assert_eq!(c.render(10), None);
+        let text: Vec<&str> = got[..5]
+            .iter()
+            .map(|s| s.as_deref().expect("value"))
+            .collect();
+        assert_eq!(text, ["0", "", "0.0", "false", "\"\""]);
+        assert_eq!(canonical(&c, 10), [0x06, 0, 0, 0, 0]);
+        assert_eq!(got[10], None);
     }
 
-    /// Scenario: A serialized array holds NaN, +Infinity and -Infinity doubles.
-    /// Guarantees: They render as the strings "NaN", "Infinity" and "-Infinity" instead of being dropped to JSON null.
+    /// Scenario: An attrs table has only the `type` column (OTAP omits all-default value columns).
+    /// Guarantees: The missing value column reads as the type default ("0" for Int) rather than an error or null.
     #[test]
-    fn non_finite_nested_doubles_are_kept() {
-        let arr = ciborium::Value::Array(vec![
-            ciborium::Value::Float(f64::NAN),
-            ciborium::Value::Float(f64::INFINITY),
-            ciborium::Value::Float(f64::NEG_INFINITY),
-        ]);
-        assert_eq!(
-            cbor_to_json_string(&cbor(&arr)),
-            "[\"NaN\",\"Infinity\",\"-Infinity\"]"
+    fn absent_optional_columns_render_type_defaults() {
+        let ty: ArrayRef = Arc::new(UInt8Array::from(vec![AttributeValueType::Int as u8]));
+        let c = AnyValueColumns::new(
+            1,
+            |name| (name == consts::ATTRIBUTE_TYPE).then(|| ty.clone()),
+            |_| true,
+            &limits(),
+            &mut Budget::new(1 << 30),
+        )
+        .unwrap_or_else(|e| panic!("columns: {e}"));
+        assert_eq!(rendered(&c), [Some("0".to_owned())]);
+    }
+
+    /// Scenario: A table holds (a) type code 99, (b) a Map row with a null `ser`, (c) a Map row whose `ser` is not CBOR, (d) a slice nested 3 deep with a depth limit of 2, (e) a 2 KiB string with a 1 KiB row limit, (f) rows but no type column.
+    /// Guarantees: (a), (b), (c) and (f) are invalid content, (d) is too deep and carries the limit, (e) is too large and names `ingress.max_row_bytes`; none is rendered as a fallback string.
+    #[test]
+    fn invalid_values_are_refused() {
+        let invalid = |cell: Cell| {
+            let err = Rows::of(vec![cell]).refusal(&limits());
+            assert!(matches!(err, LakeError::Invalid(_)), "{err}");
+        };
+        invalid(Cell::Typed(99));
+        invalid(Cell::Map(None));
+        invalid(Cell::Map(Some(vec![0xff, 0xff])));
+
+        let one = ciborium::Value::Array(vec![ciborium::Value::Integer(1.into())]);
+        let deep = ciborium::Value::Array(vec![ciborium::Value::Array(vec![one])]);
+        let mut l = limits();
+        l.max_nesting_depth = 2;
+        let err = Rows::of(vec![Cell::Slice(cbor(&deep))]).refusal(&l);
+        assert!(matches!(err, LakeError::TooDeep(2)), "{err}");
+
+        let mut l = limits();
+        l.max_row_bytes = 1024;
+        let err = Rows::of(vec![Cell::Str("x".repeat(2048))]).refusal(&l);
+        assert!(matches!(err, LakeError::TooLarge { .. }), "{err}");
+        assert!(err.to_string().contains("ingress.max_row_bytes"), "{err}");
+
+        let err = AnyValueColumns::new(1, |_| None, |_| true, &limits(), &mut Budget::new(1 << 30))
+            .err()
+            .expect("refused");
+        assert!(matches!(err, LakeError::Invalid(_)), "{err}");
+    }
+
+    /// Scenario: 100 rows of a 1 KiB string are rendered with a 50 KiB request budget.
+    /// Guarantees: Rendering charges every cell it writes and is refused by `ingress.max_extracted_bytes` instead of building the whole column.
+    #[test]
+    fn rendering_is_charged_to_the_budget() {
+        let rows = Rows::of((0..100).map(|_| Cell::Str("x".repeat(1024))).collect());
+        let mut budget = Budget::new(50 * 1024);
+        let c = rows
+            .build_where(|_| true, &limits(), &mut budget)
+            .unwrap_or_else(|e| panic!("columns: {e}"));
+        let err = c.render_where(|_| true, &mut budget).expect_err("refused");
+        assert!(
+            err.to_string().contains("ingress.max_extracted_bytes"),
+            "{err}"
         );
     }
 
-    /// Scenario: A row is rendered with a validity predicate that marks it null.
-    /// Guarantees: render_where emits null for rows whose parent struct is null.
+    /// Scenario: Row 0 holds the unknown type code 99 and is masked out by the validity predicate (its parent struct is null); row 1 holds 42.
+    /// Guarantees: The masked row is not validated and renders as null; the other row renders normally.
     #[test]
     fn render_where_masks_invalid_rows() {
-        let c = columns();
-        let out = c.render_where(|i| i != 0);
+        let rows = Rows::of(vec![Cell::Typed(99), Cell::Int(42)]);
+        let mut budget = Budget::new(1 << 30);
+        let c = rows
+            .build_where(|i| i != 0, &limits(), &mut budget)
+            .unwrap_or_else(|e| panic!("columns: {e}"));
+        let out = c.render_where(|i| i != 0, &mut budget).expect("render");
         assert!(out.is_null(0));
         assert_eq!(out.value(1), "42");
     }

@@ -35,7 +35,8 @@ blake3.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
 chrono.workspace = true
-ciborium = { workspace = true, optional = true }
+ciborium-io = { workspace = true, optional = true }
+ciborium-ll = { workspace = true, optional = true }
 csv-core.workspace = true
 hashbrown.workspace = true
 otel-arrow-contrib-data-engine-expressions = { workspace = true, optional = true }
@@ -45,6 +46,7 @@ futures-timer.workspace = true
 hex.workspace = true
 humantime-serde.workspace = true
 linkme.workspace = true
+lru = { workspace = true, optional = true }
 object_store = { workspace = true, features = ["fs"], optional = true }
 # `zstd`: the Parquet lake exporter writes ZSTD-compressed column chunks.
 parquet = { workspace = true, optional = true, features = ["zstd"] }
@@ -131,7 +133,9 @@ transform = [
 # Exporters.
 file = []
 parquet = [
-    "dep:ciborium",
+    "dep:ciborium-io",
+    "dep:ciborium-ll",
+    "dep:lru",
     "dep:object_store",
     "dep:parquet",
 ]
@@ -148,6 +152,8 @@ bench = []
 dev-tools = []
 
 [dev-dependencies]
+# The Parquet lake exporter tests build CBOR fixtures with the high-level crate.
+ciborium.workspace = true
 serde_yaml.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
