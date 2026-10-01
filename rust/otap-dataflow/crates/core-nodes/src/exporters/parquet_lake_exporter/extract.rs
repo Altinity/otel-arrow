@@ -30,8 +30,9 @@ use super::anyvalue::AnyValueColumns;
 use super::attrs::AttrIndex;
 use super::canonical::{MetricKind, Signal, Temporality, key_prefix, put_bool, put_str};
 use super::columns::{
-    as_u32, cast_or_null, col, flags_i32, i32_or_zero, ids_u32, list_f64, list_u64_as_i64,
-    opt_ids_u32, row_bytes, struct_field, take_charged, timestamp_pair, u64_as_i64, utf8_or_empty,
+    as_u32, cast_or_null, col, f64_or_zero, flags_i32, i32_or_zero, ids_u32, list_f64,
+    list_u64_as_i64, opt_ids_u32, row_bytes, struct_field, take_charged, timestamp_pair,
+    u64_as_i64, utf8_or_empty,
 };
 use super::error::LakeError;
 use super::limits::{Budget, Limits};
@@ -691,13 +692,12 @@ fn kind_columns(
                 ("sum", double(consts::HISTOGRAM_SUM)?),
                 ("min", double(consts::HISTOGRAM_MIN)?),
                 ("max", double(consts::HISTOGRAM_MAX)?),
+                // scale, zero_count and zero_threshold are plain (non-optional) OTLP fields that a
+                // point always sets; OTAP omits the column only when every point has the default,
+                // so an absent or null cell reads as 0, not null (see docs/FORMAT.md deviations).
                 (
                     "scale",
-                    cast_or_null(
-                        col(points, consts::EXP_HISTOGRAM_SCALE),
-                        &DataType::Int32,
-                        n,
-                    )?,
+                    i32_or_zero(col(points, consts::EXP_HISTOGRAM_SCALE), n)?,
                 ),
                 (
                     "zero_count",
@@ -705,12 +705,12 @@ fn kind_columns(
                         col(points, consts::EXP_HISTOGRAM_ZERO_COUNT),
                         n,
                         "zero count",
-                        false,
+                        true,
                     )?,
                 ),
                 (
                     "zero_threshold",
-                    double(consts::EXP_HISTOGRAM_ZERO_THRESHOLD)?,
+                    f64_or_zero(col(points, consts::EXP_HISTOGRAM_ZERO_THRESHOLD), n)?,
                 ),
                 ("positive_offset", offset(consts::EXP_HISTOGRAM_POSITIVE)?),
                 (
@@ -1057,7 +1057,7 @@ mod tests {
     };
     use arrow::array::{ListBuilder, UInt64Builder};
     use arrow::compute::cast;
-    use arrow::datatypes::{Int64Type, TimestampMicrosecondType};
+    use arrow::datatypes::{Float64Type, Int64Type, TimestampMicrosecondType};
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
@@ -1067,8 +1067,8 @@ mod tests {
         LogRecord, ResourceLogs, ScopeLogs,
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
-        Gauge, Histogram, HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics,
-        ScopeMetrics, Sum, metric, number_data_point,
+        ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint,
+        Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
     use otel_arrow_dfe_pdata::{OtapPayload, OtlpProtoBytes, TryIntoWithOptions};
@@ -1564,6 +1564,46 @@ mod tests {
             .map(|(t, temp, m)| (t.as_str(), temp.as_str(), *m))
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// Scenario: An exponential histogram point leaves scale, zero_count and zero_threshold at
+    /// their default of 0, so OTAP omits those all-default columns from the record.
+    /// Guarantees: The exporter reads the absent columns as 0, not null, so a genuine
+    /// scale/zero_count/zero_threshold of 0 (all plain, non-optional OTLP fields) is preserved
+    /// instead of being stored as null.
+    #[test]
+    fn exp_histogram_zero_fields_are_stored_as_zero() {
+        let point = ExponentialHistogramDataPoint {
+            time_unix_nano: 1,
+            count: 5,
+            scale: 0,
+            zero_count: 0,
+            zero_threshold: 0.0,
+            ..Default::default()
+        };
+        let req = metric_request(metric::Data::ExponentialHistogram(ExponentialHistogram {
+            data_points: vec![point],
+            aggregation_temporality: 1,
+        }));
+        let chunks = metrics(&req);
+        assert_eq!(chunks.len(), 1);
+        let v = &chunks[0].values;
+        assert_eq!(v.num_rows(), 1);
+        let scale = v.column_by_name("scale").expect("scale column");
+        assert_eq!(scale.null_count(), 0, "scale must not be null");
+        assert_eq!(scale.as_primitive::<Int32Type>().value(0), 0);
+        let zero_count = v.column_by_name("zero_count").expect("zero_count column");
+        assert_eq!(zero_count.null_count(), 0, "zero_count must not be null");
+        assert_eq!(zero_count.as_primitive::<Int64Type>().value(0), 0);
+        let zero_threshold = v
+            .column_by_name("zero_threshold")
+            .expect("zero_threshold column");
+        assert_eq!(
+            zero_threshold.null_count(),
+            0,
+            "zero_threshold must not be null"
+        );
+        assert_eq!(zero_threshold.as_primitive::<Float64Type>().value(0), 0.0);
     }
 
     /// Scenario: One gauge has three points with point attributes core=a, core=a and core=b.

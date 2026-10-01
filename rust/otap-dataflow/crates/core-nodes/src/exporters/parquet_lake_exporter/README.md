@@ -86,6 +86,17 @@ at the top level).
 | `retry_initial_backoff` | 200ms | First retry backoff of a block upload; doubles per attempt. |
 | `retry_max_backoff` | 10s | Largest retry backoff. |
 
+Extraction expands a request well past its wire size: the rows, the rendered
+attribute maps and the identity bytes of attribute-heavy logs can reach three
+to four times the OTLP byte size. `ingress.max_extracted_bytes` is measured on
+that expanded form, so a request that passes `ingress.max_request_bytes` can
+still be refused by `ingress.max_extracted_bytes`. Size the two together: with
+the defaults (16 MiB request, 32 MiB extracted) a request of attribute-heavy
+logs above roughly 9 MiB is refused. Raise `ingress.max_extracted_bytes` (up to
+`window.max_block_bytes`), or bound the upstream batch size below
+`max_extracted_bytes` divided by the expansion factor for your data, not just
+below `max_request_bytes`.
+
 ## Delivery Semantics
 
 - **Ack after land.** A request is acknowledged only after every block
@@ -148,7 +159,8 @@ The situations in which data can be lost, and how this exporter handles each:
 | Situation | Handling |
 | --- | --- |
 | Receivers ack before the data lands (`wait_for_result: false`, the receivers' default) | Cannot be enforced here; the exporter warns once (`parquet_lake.unacked_input`). Set `wait_for_result: true`. |
-| Malformed OTLP bytes (pdata converts them to an empty batch) | Refused (permanent Nack) instead of acknowledged. A valid empty request is still acknowledged. |
+| Malformed or truncated OTLP bytes | Every OTLP request is strictly decoded before conversion, so a request that is not a complete, valid OTLP message is refused (permanent Nack). This also stops the lenient converter from acknowledging a partial batch (records after a parse error dropped), panicking on a value whose wire type does not match its field number, or overflowing the stack on a deeply nested value. A valid empty request is still acknowledged. |
+| An OTLP request with more than 65,535 attributed log records, metrics, scopes or resources | Refused permanently, with a reason naming the count. The OTLP-to-OTAP converter addresses these with a `u16` id that would otherwise wrap (silently misattributing log attributes in release builds) or fail deep in the converter. Split the batch upstream. OTAP input is not affected. |
 | Power loss after an ack on the `file` backend | Files and directories are fsynced before the ack. |
 | Storage outage longer than the producers' retry window, or producer queues filling during slow uploads | No local disk buffer: producers must retry and queue. Size their retry time above the expected outage and their timeout above the worst-case ack delay. Use `durable_buffer` upstream only if losing ack-after-land is acceptable. |
 | Shutdown during a flush | The shutdown is handled at once; the flush gets until the shutdown deadline. Requests that did not land get a retryable `NodeShutdown` Nack. |
@@ -162,6 +174,10 @@ The situations in which data can be lost, and how this exporter handles each:
 | Metric description and dropped-attribute counts change | Not part of the identity. They are refreshed when the series row is written again: in the next hour, after a cache eviction or after a restart. Readers keep the latest row. |
 | Timestamps of 0 or above `i64::MAX` nanoseconds | Stored as null; the out-of-range ones are counted in `timestamps.out_of_range`. |
 | Exemplars | Not stored. |
+| `Metric.metadata` (for example `prometheus.type`) | Not stored: the exporter does not read the metric metadata table. The request is still acknowledged. |
+| A metric with no data points | Not stored, so its name, unit, description and metadata are not kept. A series row needs at least one point. |
+| `base_uri` on a FUSE object-store mount (blobfuse, gcsfuse, s3fs) or NFS | The durability fsync assumes a local POSIX disk. On a network or FUSE filesystem the underlying `object_store` may report an upload as written while a deferred close fails, so a block can be acknowledged without landing. Point `base_uri` at a local disk, or use the `s3`/`azure` backends. |
+| A large block on a slow upload link | The object store's per-request HTTP timeout is 30 s and is not configurable here; a block that cannot upload within it is retried until `flush_retry_deadline` and then Nacked. Keep `window.max_block_bytes` small enough to upload within 30 s on the available bandwidth. |
 | Queries that prune on `date=` / `hour=` | The partition is the block's ingest window, not the event time; filter on `time_unix_nano` for event time and widen the partition range for late data. |
 | Retention deleting series files before values files | Values can no longer be joined: keep the series files of a partition at least as long as its values files. |
 
@@ -310,6 +326,35 @@ The standard exporter outcome measurements (success and failure per signal).
   readable with the queries above; start from an empty `base_uri`.
 - `series_id` uses XXH3-128, which is not collision-resistant against
   adversarial input.
+
+### Pipeline placement
+
+Ack-after-land only reaches producers when the delivery contract is preserved
+end to end. The following upstream behaviors defeat it and cannot be corrected
+from the exporter; keep them off this path:
+
+- Keep `wait_for_result: true` on the receivers (see Delivery Semantics). With
+  the default `false`, upstream acknowledges before the block lands.
+- Do not place `processor:durable_buffer` or a `processor:fanout` with
+  `await_ack: none` (or as a non-primary destination) in front of this
+  exporter: each acknowledges upstream before this exporter reports its
+  result, bypassing ack-after-land.
+- Do not rely on `processor:retry` to retry this exporter's failures. A
+  retryable Nack from this exporter carries no payload (the exporter holds
+  only the ack context, not a copy of every in-flight request), so the retry
+  processor cannot resend it; with `exhaustion_action: mark_permanent` it
+  turns a transient failure into a permanent one. Let the producers retry
+  instead.
+- Do not insert a node that converts the payload format (OTLP <-> OTAP)
+  between `processor:batch` and this exporter: the batch processor routes the
+  acknowledgement by the returned payload's format, so a conversion can strand
+  it. A direct `batch -> parquet_lake` edge is correct.
+- A permanent refusal from this exporter (invalid content, an ingress limit,
+  traces, multivariate metrics) is only delivered as non-retryable to OTLP/HTTP
+  and OTLP/gRPC clients. `processor:batch` relays it as retryable, and the OTAP
+  receiver maps every Nack to a retryable status, so an OTAP producer or a
+  producer behind the batch processor retries a request that will always be
+  refused.
 
 ## Related Docs
 

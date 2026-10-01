@@ -253,25 +253,81 @@ pub static PARQUET_LAKE_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     validate_config: |value| LakeConfig::parse(value).map(|_| ()),
 };
 
-/// True when `raw` is not a valid OTLP request (strict protobuf decode). Used only for payloads
-/// that converted to zero rows: pdata's lenient conversion turns garbage into an empty batch,
-/// which must be refused rather than acknowledged unwritten.
-fn malformed_otlp(raw: &OtlpProtoBytes) -> bool {
+/// Largest count of u16-addressed entries pdata's OTLP -> OTAP encoder can assign before a `u16`
+/// id column wraps (logs: attributed records; both signals: scopes and resources; metrics: metric
+/// rows). A request past this is refused here with a clear reason, rather than left to silently
+/// misattribute attributes (logs, which wrap in release builds) or fail deep in the converter.
+const MAX_U16_ENTRIES: usize = u16::MAX as usize;
+
+/// Refuse a count that would overflow a `u16` id in the converter.
+fn check_u16_entries(what: &str, count: usize) -> Result<(), LakeError> {
+    if count > MAX_U16_ENTRIES {
+        return Err(LakeError::Invalid(format!(
+            "OTLP request has {count} {what}, more than the {MAX_U16_ENTRIES} the encoder can \
+             address without wrapping; {}",
+            error::SPLIT_HINT
+        )));
+    }
+    Ok(())
+}
+
+/// Strictly decode an OTLP request and refuse one that pdata's lenient conversion would mishandle.
+///
+/// The lenient `TryInto<OtapArrowRecords>` path stops at the first protobuf parse error and returns
+/// the records before it as a non-empty batch (an acknowledged partial batch), panics with
+/// `.expect(...)` on a value whose wire type does not match its field number, and recurses without
+/// a depth bound when it CBOR-encodes a deeply nested value (a stack overflow that aborts the whole
+/// process). A strict `prost` decode rejects all three (its recursion limit is 100). On success the
+/// per-table entry counts are checked so a request that would overflow a `u16` id in the converter
+/// is refused here instead of silently misattributing its attributes. OTAP input does not reach
+/// this path, so its ids and nesting are handled during extraction instead.
+fn validate_otlp_request(raw: &OtlpProtoBytes) -> Result<(), LakeError> {
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceRequest;
     use prost::Message as _;
+    let malformed = |_| LakeError::Conversion("malformed OTLP request".into());
     match raw {
         OtlpProtoBytes::ExportLogsRequest(b) => {
-            ExportLogsServiceRequest::decode(b.clone()).is_err()
+            let req = ExportLogsServiceRequest::decode(b.clone()).map_err(malformed)?;
+            let mut scopes = 0;
+            let mut attributed = 0;
+            for rl in &req.resource_logs {
+                scopes += rl.scope_logs.len();
+                for sl in &rl.scope_logs {
+                    // pdata assigns a log id only to records that carry attributes (encode/mod.rs);
+                    // only those consume the u16 space that wraps.
+                    attributed += sl
+                        .log_records
+                        .iter()
+                        .filter(|r| !r.attributes.is_empty())
+                        .count();
+                }
+            }
+            check_u16_entries("log records with attributes", attributed)?;
+            check_u16_entries("scopes", scopes)?;
+            check_u16_entries("resources", req.resource_logs.len())?;
         }
         OtlpProtoBytes::ExportMetricsRequest(b) => {
-            ExportMetricsServiceRequest::decode(b.clone()).is_err()
+            let req = ExportMetricsServiceRequest::decode(b.clone()).map_err(malformed)?;
+            let mut scopes = 0;
+            let mut metrics = 0;
+            for rm in &req.resource_metrics {
+                scopes += rm.scope_metrics.len();
+                for sm in &rm.scope_metrics {
+                    metrics += sm.metrics.len();
+                }
+            }
+            check_u16_entries("metrics", metrics)?;
+            check_u16_entries("scopes", scopes)?;
+            check_u16_entries("resources", req.resource_metrics.len())?;
         }
         OtlpProtoBytes::ExportTracesRequest(b) => {
-            ExportTraceServiceRequest::decode(b.clone()).is_err()
+            // Traces are refused later as unsupported; a strict decode still rejects garbage bytes.
+            let _ = ExportTraceServiceRequest::decode(b.clone()).map_err(malformed)?;
         }
     }
+    Ok(())
 }
 
 impl ParquetLakeExporter {
@@ -402,10 +458,13 @@ impl ParquetLakeExporter {
             });
         }
         let payload = token.take_payload();
-        let raw = match payload.data() {
-            PayloadData::OtlpBytes(b) => Some(b.clone()),
-            PayloadData::OtapArrowRecords(_) => None,
-        };
+        // Strict-decode OTLP bytes before pdata's lenient conversion runs on them below: the
+        // lenient path acks a partial batch on a parse error, panics on a malformed value,
+        // overflows the stack on deep nesting, and wraps u16 ids past 65535 attributed records.
+        // OTAP input (no `raw`) is not converted from OTLP and is validated during extraction.
+        if let PayloadData::OtlpBytes(raw) = payload.data() {
+            validate_otlp_request(raw)?;
+        }
         let records: Result<OtapArrowRecords, _> = payload.try_into_with_default();
         let mut records = records.map_err(|e| LakeError::Conversion(e.to_string()))?;
         records
@@ -424,11 +483,6 @@ impl ParquetLakeExporter {
             ),
             OtapArrowRecords::Traces(_) => return Err(LakeError::Unsupported("traces")),
         };
-        // pdata's lenient conversion turns garbage into an empty batch, which must be refused
-        // rather than acknowledged unwritten.
-        if extracted.chunks.is_empty() && raw.as_ref().is_some_and(malformed_otlp) {
-            return Err(LakeError::Conversion("malformed OTLP request".into()));
-        }
         Ok((signal, extracted))
     }
 

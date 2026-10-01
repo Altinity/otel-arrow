@@ -13,13 +13,17 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use super::block::{BlockId, EncodedBlock};
 use super::error::LakeError;
 
-/// Whether block `id` landed: its values object (written after series) exists.
+/// Whether block `id` landed: its values object (written after series) exists and is non-empty.
+/// The size check rejects a zero-length `values` object, which the exporter never writes (a block
+/// with no rows produces no file) but a crash between the local store's rename and its fsync can
+/// leave behind; treating that as landed would let a cross-process probe report lost data as
+/// present.
 pub async fn probe_block(
     store: &dyn ObjectStore,
     id: &BlockId,
 ) -> Result<bool, object_store::Error> {
     match store.head(&id.values_path()).await {
-        Ok(_) => Ok(true),
+        Ok(meta) => Ok(meta.size > 0),
         Err(object_store::Error::NotFound { .. }) => Ok(false),
         Err(e) => Err(e),
     }
@@ -37,7 +41,15 @@ pub async fn sync_local(base: &str, block: &EncodedBlock) -> Result<(), LakeErro
     // fsync blocks, so it runs off the core thread; one bounded call per landed block.
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         for f in &files {
-            std::fs::File::open(f)?.sync_all()?;
+            // Open the file writable: on Windows `FlushFileBuffers` (what `sync_all` calls)
+            // requires a write handle, so a read-only handle would fail every block's fsync. The
+            // file already exists, so no create or truncate; on Unix a write handle fsyncs the
+            // same as a read one. Directories below must stay read-only (a directory cannot be
+            // opened writable), and their fsync is Unix-only.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(f)?
+                .sync_all()?;
             #[cfg(unix)]
             {
                 let mut dir = f.parent();
@@ -64,6 +76,24 @@ async fn until<T>(
     futures::pin_mut!(fut, timeout);
     futures::select_biased! {
         r = fut => Ok(r?),
+        _ = timeout => Err(LakeError::Deadline),
+    }
+}
+
+/// Await a `LakeError` future until `deadline`, mapping a timeout to [`LakeError::Deadline`]. Used
+/// to bound the fsync phase, which otherwise has no deadline: a hung fsync (a failing disk, an NFS
+/// hard mount) would hold the single flush slot forever and freeze admission. On a timeout the
+/// block is Nacked; a `spawn_blocking` fsync already in progress keeps running on the blocking
+/// pool until it finishes, but it no longer blocks the core thread or the pipeline.
+pub async fn until_deadline<T>(
+    deadline: Instant,
+    fut: impl Future<Output = Result<T, LakeError>>,
+) -> Result<T, LakeError> {
+    let fut = fut.fuse();
+    let timeout = Delay::new(deadline.saturating_duration_since(Instant::now())).fuse();
+    futures::pin_mut!(fut, timeout);
+    futures::select_biased! {
+        r = fut => r,
         _ = timeout => Err(LakeError::Deadline),
     }
 }

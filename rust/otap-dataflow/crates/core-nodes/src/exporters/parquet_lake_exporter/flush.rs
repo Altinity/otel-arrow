@@ -15,7 +15,7 @@ use tokio::task::{JoinError, JoinHandle};
 use super::block::{BlockId, EncodeLimits, FileMeta, encode_block};
 use super::error::LakeError;
 use super::schema::Schemas;
-use super::upload::{sync_local, upload_block};
+use super::upload::{sync_local, until_deadline, upload_block};
 
 /// What a landed block wrote.
 #[derive(Clone, Copy, Debug)]
@@ -110,7 +110,9 @@ impl Uploader {
         )
         .await?;
         if let Some(base) = &self.local_base {
-            sync_local(base, &block).await?;
+            // Bound the fsync by the generation deadline too: without it a hung fsync would hold
+            // the single flush slot open indefinitely and stop admission.
+            until_deadline(deadline, sync_local(base, &block)).await?;
         }
         let series_bytes = block.series.as_ref().map_or(0, |p| p.content_length());
         Ok(Landed {

@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, Float64Builder, Int32Array, Int64Builder, ListBuilder, RecordBatch,
-    StringArray, StructArray, TimestampMicrosecondBuilder, UInt32Array, new_null_array,
+    Array, ArrayRef, AsArray, Float64Array, Float64Builder, Int32Array, Int64Builder, ListBuilder,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondBuilder, UInt32Array,
+    new_null_array,
 };
 use arrow::compute::cast;
 use arrow::datatypes::{
@@ -189,6 +190,17 @@ pub fn i32_or_zero(array: Option<&ArrayRef>, len: usize) -> Result<ArrayRef, Lak
     let a = a.as_primitive::<Int32Type>();
     Ok(Arc::new(Int32Array::from_iter_values(
         (0..len).map(|i| if a.is_null(i) { 0 } else { a.value(i) }),
+    )))
+}
+
+/// `Float64` column with an absent column or null cell read as 0.0. Used for plain (non-`optional`)
+/// OTLP point fields, such as an exponential histogram `zero_threshold`, that OTAP omits from the
+/// record when every point in the request has the default value; a null would lose the value 0.0.
+pub fn f64_or_zero(array: Option<&ArrayRef>, len: usize) -> Result<ArrayRef, LakeError> {
+    let a = cast_or_null(array, &DataType::Float64, len)?;
+    let a = a.as_primitive::<Float64Type>();
+    Ok(Arc::new(Float64Array::from_iter_values(
+        (0..len).map(|i| if a.is_null(i) { 0.0 } else { a.value(i) }),
     )))
 }
 

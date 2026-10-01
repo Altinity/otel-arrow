@@ -41,6 +41,9 @@ pub const MAX_NESTING_DEPTH: usize = 256;
 pub const MAX_CACHE_ENTRIES: usize = 16 * 1024 * 1024;
 /// Longest accepted `window.interval`: a block belongs to the hour of its window start.
 const MAX_INTERVAL: Duration = Duration::from_secs(3600);
+/// Longest accepted `writer_id`. Object names embed it alongside a ~73-byte fixed part; keeping it
+/// well under the common 255-byte filesystem `NAME_MAX` avoids `ENAMETOOLONG` on the file backend.
+const MAX_WRITER_ID_LEN: usize = 100;
 
 /// Window rotation and the budget of one block.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -172,6 +175,11 @@ impl LakeConfig {
         let id_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
         if self.writer_id.is_empty() || !self.writer_id.chars().all(id_char) {
             return Err("writer_id must be non-empty and made of [A-Za-z0-9_.-]".into());
+        }
+        if self.writer_id.len() > MAX_WRITER_ID_LEN {
+            return Err(format!(
+                "writer_id must be at most {MAX_WRITER_ID_LEN} characters"
+            ));
         }
         if self.producer_id_attribute.is_empty() {
             return Err("producer_id_attribute must not be empty".into());
@@ -478,14 +486,23 @@ mod tests {
         );
     }
 
-    /// Scenario: The writer id is empty or contains a path separator, a space or a colon; then a valid id is used.
-    /// Guarantees: Ids that could change the object path or break its parsing are rejected by field name; `w-1_a.b` is accepted.
+    /// Scenario: The writer id is empty, contains a path separator, a space or a colon, or is
+    /// longer than the length limit; then a valid id at the limit is used.
+    /// Guarantees: Ids that could change the object path, break its parsing, or overflow a
+    /// filesystem name are rejected by field name; a well-formed id of exactly the maximum length
+    /// is accepted.
     #[test]
     fn rejects_bad_writer_id() {
         for bad in ["", "a/b", "a b", "a:b"] {
             let err = LakeConfig::parse(&with("writer_id", json!(bad))).expect_err(bad);
             assert!(err.to_string().contains("writer_id"), "{bad}: {err}");
         }
+        let too_long = "a".repeat(MAX_WRITER_ID_LEN + 1);
+        let err = LakeConfig::parse(&with("writer_id", json!(too_long))).expect_err("too long");
+        assert!(err.to_string().contains("writer_id"), "{err}");
+        let at_limit = "a".repeat(MAX_WRITER_ID_LEN);
+        let c = LakeConfig::parse(&with("writer_id", json!(at_limit))).expect("valid at limit");
+        assert_eq!(c.writer_id.len(), MAX_WRITER_ID_LEN);
         let c = LakeConfig::parse(&with("writer_id", json!("w-1_a.b"))).expect("valid");
         assert_eq!(c.writer_id, "w-1_a.b");
         let err = LakeConfig::parse(&with("producer_id_attribute", json!(""))).expect_err("empty");

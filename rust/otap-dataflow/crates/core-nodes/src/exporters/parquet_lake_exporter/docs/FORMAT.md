@@ -588,11 +588,14 @@ Everything in which this writer differs from `exporter:series_parquet`:
    quantile_values         LIST<STRUCT<quantile DOUBLE, value DOUBLE>> null
    ```
 
-   An exponential histogram point fills `count` and, when present, `sum`,
-   `min`, `max` and the first seven columns above. A summary point fills
-   `count` and, when present, `sum` and `quantile_values`. Both leave
-   `value_int`, `value_double`, `bucket_counts` and `explicit_bounds` null.
-   Their series rows have `metric_type` `exp_histogram` or `summary`;
+   An exponential histogram point fills `count`, `scale`, `zero_count`,
+   `zero_threshold` and the bucket columns, and, when present, `sum`, `min`
+   and `max`. `scale`, `zero_count` and `zero_threshold` are required OTLP
+   fields, so an absent column reads as 0, not null (see the deviation note
+   below); `min` and `max` are optional and stay null when absent. A summary
+   point fills `count` and, when present, `sum` and `quantile_values`. Both
+   leave `value_int`, `value_double`, `bucket_counts` and `explicit_bounds`
+   null. Their series rows have `metric_type` `exp_histogram` or `summary`;
    classify by `metric_type`, as for every other kind.
 2. Additional nullable columns for dropped-attribute counts, all `INT64`:
    `resource_dropped_attributes_count` and `scope_dropped_attributes_count`
@@ -635,7 +638,11 @@ Do not point this writer and `exporter:series_parquet` at the same
   after an OTAP round trip: the transport omits a column whose every entry in
   a request is the type default, so when no point of a request carries a
   non-zero sum, every one of those sums is stored as null. The same holds for
-  any optional metrics column under the same condition.
+  the other genuinely optional metrics columns (`min`, `max`) under the same
+  condition. The required exponential-histogram fields `scale`, `zero_count`
+  and `zero_threshold` are instead read as 0 when the transport omits them,
+  because the omission means every point carried the value 0; storing null
+  would lose it.
 - The series columns that are not part of the identity (`description`, the
   dropped-attribute counts) are written with the series row, so a change is
   visible only when the row is written again: in the next hour, after a

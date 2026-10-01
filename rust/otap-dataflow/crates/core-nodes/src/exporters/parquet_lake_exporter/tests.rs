@@ -915,6 +915,61 @@ fn malformed_otlp_is_refused_but_empty_request_is_acked() {
         });
 }
 
+/// Scenario: A valid multi-record OTLP logs request is truncated near its end before extraction.
+/// Guarantees: The strict pre-conversion decode refuses the truncated request; pdata's lenient
+/// conversion would instead drop the records after the corruption and acknowledge a partial batch.
+/// The intact request validates.
+#[test]
+fn truncated_otlp_request_is_refused_not_partially_accepted() {
+    let bytes = logs_request(4, 1, 0).encode_to_vec();
+    assert!(bytes.len() > 8);
+    let truncated =
+        OtlpProtoBytes::ExportLogsRequest(Bytes::copy_from_slice(&bytes[..bytes.len() - 4]));
+    let err = super::validate_otlp_request(&truncated).expect_err("truncated is refused");
+    assert!(matches!(err, super::LakeError::Conversion(_)), "{err}");
+    super::validate_otlp_request(&OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes)))
+        .expect("the intact request validates");
+}
+
+/// Scenario: An OTLP logs request carries one more attributed log record than the converter's
+/// `u16` id space can address; a small request stays within it.
+/// Guarantees: The oversized request is refused permanently with a reason naming the count,
+/// instead of letting pdata wrap its ids in release builds and merge one record's attributes onto
+/// another; the small request validates.
+#[test]
+fn otlp_logs_beyond_u16_attributed_records_are_refused() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
+        LogRecord, ResourceLogs, ScopeLogs,
+    };
+    let make = |n: u64| {
+        let log_records = (0..n)
+            .map(|i| LogRecord {
+                time_unix_nano: i + 1,
+                attributes: vec![kv("k", "v".to_owned())],
+                ..Default::default()
+            })
+            .collect();
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        OtlpProtoBytes::ExportLogsRequest(Bytes::from(req.encode_to_vec()))
+    };
+    let over = super::MAX_U16_ENTRIES as u64 + 1;
+    let err = super::validate_otlp_request(&make(over)).expect_err("too many attributed records");
+    assert!(
+        matches!(&err, super::LakeError::Invalid(m) if m.contains("log records with attributes")),
+        "{err}"
+    );
+    super::validate_otlp_request(&make(8)).expect("a small request validates");
+}
+
 /// Scenario: A logs and a metrics request share one generation, and the logs values put is held by a closed gate that opens later.
 /// Guarantees: The blocks of a generation are flushed one after the other, logs first: no metrics object appears while the logs block is held, and both requests are Acked after the gate opens.
 #[test]
