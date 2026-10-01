@@ -44,7 +44,7 @@ use otel_arrow_dfe_engine::{
     ConsumerEffectHandlerExtension, Interests, LocalWakeupRequirements,
     ProcessorRuntimeRequirements, ProducerEffectHandlerExtension,
     config::ProcessorConfig,
-    control::{AckMsg, CallData, NackMsg, NodeControlMsg, WakeupSlot},
+    control::{AckMsg, CallData, NackCause, NackMsg, NodeControlMsg, WakeupSlot},
     error::{Error as EngineError, ProcessorErrorKind},
     local::processor as local,
     message::Message,
@@ -1076,7 +1076,12 @@ where
                 self.metrics.batching_errors.add(count as u64);
                 log_batching_failed(effect, self.signal, &e).await;
                 let str = e.to_string();
-                let res = Err(str.clone());
+                // A local batching failure is an internal, retryable error.
+                let res = Err(NackClass {
+                    reason: str.clone(),
+                    permanent: false,
+                    cause: NackCause::Unspecified,
+                });
                 // In this case, we are sending failure to all the pending inputs.
                 self.buffer
                     .handle_partial_responses(self.signal, effect, &res, inputs.context)
@@ -1219,7 +1224,7 @@ where
         signal: SignalType,
         calldata: CallData,
         effect: &mut local::EffectHandler<OtapPdata>,
-        res: &Result<(), String>,
+        res: &Result<(), NackClass>,
     ) -> Result<(), EngineError> {
         let outkey: SlotKey = calldata.try_into()?;
 
@@ -1248,7 +1253,11 @@ impl BatchProcessor {
         effect: &mut local::EffectHandler<OtapPdata>,
         nack: NackMsg<OtapPdata>,
     ) -> Result<(), EngineError> {
-        let res = Err(nack.reason);
+        let res = Err(NackClass {
+            reason: nack.reason,
+            permanent: nack.permanent,
+            cause: nack.cause,
+        });
         self.handle_response(*nack.refused, nack.unwind.route.calldata, effect, &res)
             .await
     }
@@ -1258,7 +1267,7 @@ impl BatchProcessor {
         retdata: OtapPdata,
         calldata: CallData,
         effect: &mut local::EffectHandler<OtapPdata>,
-        res: &Result<(), String>,
+        res: &Result<(), NackClass>,
     ) -> Result<(), EngineError> {
         if calldata.is_empty() {
             return Ok(());
@@ -1283,6 +1292,16 @@ impl BatchProcessor {
             None => Err(Self::no_active_format_error()),
         }
     }
+}
+
+/// The classification of a downstream NACK, carried back through the batch response path. Without
+/// it a split inbound request would be re-NACKed as a retryable `Unspecified` failure even when the
+/// downstream NACK was permanent (for example a `Refused`), and the producer would keep retrying a
+/// request that will always be refused.
+struct NackClass {
+    reason: String,
+    permanent: bool,
+    cause: NackCause,
 }
 
 /// Factory function to create a batch processor.
@@ -1592,7 +1611,7 @@ where
         &mut self,
         signal: SignalType,
         effect: &mut local::EffectHandler<OtapPdata>,
-        res: &Result<(), String>,
+        res: &Result<(), NackClass>,
         parts: Vec<BatchPortion>,
     ) -> Result<(), EngineError> {
         for part in parts {
@@ -1611,8 +1630,21 @@ where
                     let rdata =
                         OtapPdata::new(std::mem::take(&mut batch.ctx), OtapPayload::empty(signal));
 
-                    if let Err(err) = res {
-                        effect.notify_nack(NackMsg::new(err, rdata)).await?;
+                    if let Err(info) = res {
+                        // Preserve the downstream NACK's permanence and cause, so a permanently
+                        // refused request (for example NackCause::Refused) is relayed upstream as
+                        // permanent rather than retryable; otherwise the producer keeps retrying a
+                        // request that will always be refused.
+                        let nack = if info.permanent {
+                            NackMsg::new_permanent_with_cause(
+                                info.reason.clone(),
+                                rdata,
+                                info.cause,
+                            )
+                        } else {
+                            NackMsg::new_with_cause(info.reason.clone(), rdata, info.cause)
+                        };
+                        effect.notify_nack(nack).await?;
                     } else {
                         effect.notify_ack(AckMsg::new(rdata)).await?;
                     }
@@ -3650,6 +3682,87 @@ mod tests {
                 }
                 assert_eq!(acks, 0, "input must not be acked when a fragment nacks");
                 assert_eq!(nacks, 1, "input must be nacked exactly once");
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: an oversize single resource splits into several fragments; the last fragment is
+    /// NACKed permanently with cause Refused while the others are acked.
+    ///
+    /// Guarantees: the inbound request is NACKed exactly once and the NACK keeps the downstream
+    /// classification (permanent, cause Refused) instead of being downgraded to a retryable,
+    /// unspecified NACK, so a producer is not told to retry a request that will always be refused.
+    #[test]
+    fn test_permanent_fragment_nack_is_relayed_permanent() {
+        let (_telemetry_registry, _metrics_reporter, phase) = setup_test_runtime(json!({
+            "otlp": {
+                "min_size": null,
+                "max_size": 100,
+                "sizer": "bytes",
+            },
+            "format": "otlp",
+            "max_batch_duration": "0s",
+        }));
+
+        phase
+            .run_test(move |mut ctx| async move {
+                let (pipeline_completion_tx, mut pipeline_completion_rx) =
+                    pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(pipeline_completion_tx);
+
+                let bytes = single_resource_logs_bytes(8);
+                let pdata = OtapPdata::new_default(bytes.into()).test_subscribe_to(
+                    Interests::ACKS | Interests::NACKS,
+                    TestCallData::new_with(0, 0).into(),
+                    1,
+                );
+                ctx.process(Message::PData(pdata))
+                    .await
+                    .expect("process input");
+
+                let outputs = ctx.drain_pdata().await;
+                assert!(outputs.len() > 1, "oversize resource must split");
+
+                // Refuse the last fragment permanently; ack the rest.
+                let last = outputs.len() - 1;
+                for (i, out) in outputs.into_iter().enumerate() {
+                    if i == last {
+                        ctx.process(Message::Control(NodeControlMsg::Nack(
+                            next_nack(NackMsg::new_permanent_with_cause(
+                                "downstream refused",
+                                out,
+                                NackCause::Refused,
+                            ))
+                            .expect("has subs")
+                            .1,
+                        )))
+                        .await
+                        .expect("process nack");
+                    } else {
+                        ctx.process(Message::Control(NodeControlMsg::Ack(
+                            next_ack(AckMsg::new(out)).expect("has subs").1,
+                        )))
+                        .await
+                        .expect("process ack");
+                    }
+                }
+
+                let mut nacks = Vec::new();
+                while let Ok(msg) = pipeline_completion_rx.try_recv() {
+                    match msg {
+                        PipelineCompletionMsg::DeliverNack { nack } => nacks.push(nack),
+                        PipelineCompletionMsg::DeliverAck { .. } => {
+                            panic!("input must not be acked when a fragment is refused")
+                        }
+                    }
+                }
+                assert_eq!(nacks.len(), 1, "input must be nacked exactly once");
+                assert!(nacks[0].permanent, "permanent flag must be preserved");
+                assert_eq!(
+                    nacks[0].cause,
+                    NackCause::Refused,
+                    "cause must be preserved"
+                );
             })
             .validate(|_| async {});
     }
