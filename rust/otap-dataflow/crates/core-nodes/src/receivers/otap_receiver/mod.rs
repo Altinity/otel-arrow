@@ -1533,7 +1533,7 @@ mod tests {
     }
 
     /// Scenario: Hard memory pressure rejects a valid OTAP logs stream at ingress.
-    /// Guarantees: Memory-pressure stream rejection increments without any batch lifecycle.
+    /// Guarantees: Memory-pressure stream rejection increments without any batch lifecycle, and the refusal carries a RetryInfo with the configured 1 second delay, so Arrow clients retry.
     #[test]
     fn memory_pressure_stream_rejection_has_no_batch_lifecycle_metrics() {
         let test_runtime = TestRuntime::new();
@@ -1589,6 +1589,11 @@ mod tests {
                     }
                 };
                 assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                assert_eq!(
+                    otel_arrow_dfe_otap::retry_info::retry_delay(&status),
+                    Some(Duration::from_secs(1)),
+                    "the stream refusal carries RetryInfo, so Arrow clients retry"
+                );
                 assert_rejection_telemetry(&ctx, telemetry, "memory_pressure", 1, 0).await;
                 ctx.send_shutdown(Instant::now(), "memory pressure test complete")
                     .await

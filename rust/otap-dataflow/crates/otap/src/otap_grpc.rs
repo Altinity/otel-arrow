@@ -531,6 +531,19 @@ async fn reject_open_stream_for_memory_pressure(
     true
 }
 
+/// The batch status that refuses `batch_id` while hard memory pressure is active.
+///
+/// UNAVAILABLE, not RESOURCE_EXHAUSTED: a batch status has no details, so it cannot carry the
+/// RetryInfo that makes RESOURCE_EXHAUSTED retryable for OTLP clients. Memory pressure is
+/// recoverable, and clients must retry the batch.
+fn memory_pressure_batch_status(batch_id: i64) -> BatchStatus {
+    BatchStatus {
+        batch_id,
+        status_code: StatusCode::Unavailable as i32,
+        status_message: "Process memory pressure".to_string(),
+    }
+}
+
 /// handles sending the data down the pipeline via effect_handler and generating the appropriate response
 async fn accept_data<T: OtapBatchStore, F>(
     otap_batch: F,
@@ -558,11 +571,7 @@ where
             message = "Process memory pressure active while receiving streamed batch"
         );
 
-        tx.send(Ok(BatchStatus {
-            batch_id,
-            status_code: StatusCode::ResourceExhausted as i32,
-            status_message: "Process memory pressure".to_string(),
-        }))
+        tx.send(Ok(memory_pressure_batch_status(batch_id)))
         .await
         .map_err(|e| {
             otel_error!("otap.response.send_failed", error = ?e, message = "Error sending BatchStatus response");
@@ -923,6 +932,18 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// Scenario: the batch status for a batch refused under hard memory pressure is built for batch id 42.
+    /// Guarantees: It is UNAVAILABLE for that batch id with the memory-pressure message: retryable for Arrow clients, which cannot receive RetryInfo in a batch status and would drop a RESOURCE_EXHAUSTED batch.
+    #[test]
+    fn memory_pressure_batch_status_is_retryable() {
+        let status = memory_pressure_batch_status(42);
+        assert_eq!(status.batch_id, 42);
+        assert_eq!(status.status_code, StatusCode::Unavailable as i32);
+        assert_eq!(status.status_message, "Process memory pressure");
+    }
+
+    /// Scenario: an already-open OTAP stream is checked under hard memory pressure with a 3 second retry delay.
+    /// Guarantees: The stream is refused before the next batch is read, with RESOURCE_EXHAUSTED, 3000 ms pushback and a 3 second RetryInfo, and the rejection is counted once.
     #[tokio::test]
     async fn open_stream_rejection_stops_before_reading_next_batch() {
         let state = MemoryPressureState::default();
@@ -951,6 +972,10 @@ mod tests {
                 .get("grpc-retry-pushback-ms")
                 .and_then(|value| value.to_str().ok()),
             Some("3000")
+        );
+        assert_eq!(
+            crate::retry_info::retry_delay(&status),
+            Some(std::time::Duration::from_secs(3))
         );
         assert_eq!(metrics.calls.load(Ordering::Relaxed), 1);
     }

@@ -237,11 +237,17 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   active: HTTP returns 413 without `Retry-After`, and gRPC sends negative retry
   pushback.
 - An exhausted receiver may reject before decompressed request weight is known.
-  This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response has no retry hint.
+  This early response has no retry delay: HTTP returns 503 without
+  `Retry-After`, and gRPC returns `RESOURCE_EXHAUSTED` with a zero-delay
+  `RetryInfo`, so clients retry with their own backoff.
   Exact retry guidance or non-retryable oversized classification is available
   only after the weighted admission point.
 - `wait_for_result` reflects the immediate downstream node, not necessarily the
   final exporter.
+- Recoverable gRPC refusals (concurrency limit, memory pressure, rate limit)
+  carry a `google.rpc.RetryInfo` detail. OTLP clients retry
+  `RESOURCE_EXHAUSTED` only with that detail; without it they treat the refusal
+  as permanent and drop the data.
 
 ## Related Docs
 

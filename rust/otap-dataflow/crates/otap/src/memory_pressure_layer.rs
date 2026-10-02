@@ -9,10 +9,12 @@ use otel_arrow_dfe_engine::memory_limiter::SharedReceiverAdmissionState;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tonic::{Code, Status, body::Body, metadata::MetadataMap};
 use tower::{Layer, Service};
 
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
+use crate::retry_info::retryable_status;
 use otel_arrow_dfe_telemetry::common_attributes::ReceiverRejectionErrorType;
 
 /// Records request rejections before they enter the pipeline.
@@ -31,19 +33,26 @@ pub trait ReceiverRejectionMetrics: Send + Sync {
     }
 }
 
-/// Builds a gRPC `resource_exhausted` status with retry pushback metadata.
+/// Builds a gRPC `resource_exhausted` status the client may retry after the configured delay: a
+/// `RetryInfo` detail (which OTLP clients require to retry this code) plus retry pushback
+/// metadata.
 #[must_use]
 pub fn grpc_memory_pressure_status(state: &SharedReceiverAdmissionState) -> Status {
+    let retry_after_secs = u64::from(state.retry_after_secs().max(1));
     let mut metadata = MetadataMap::new();
-    let retry_pushback_ms = u64::from(state.retry_after_secs().max(1)) * 1_000;
     let _ = metadata.insert(
         "grpc-retry-pushback-ms",
-        retry_pushback_ms
+        (retry_after_secs * 1_000)
             .to_string()
             .parse()
             .expect("retry pushback metadata should be valid ASCII"),
     );
-    Status::with_metadata(Code::ResourceExhausted, "memory pressure", metadata)
+    retryable_status(
+        Code::ResourceExhausted,
+        "memory pressure",
+        Duration::from_secs(retry_after_secs),
+        metadata,
+    )
 }
 
 impl ReceiverRejectionMetrics for Mutex<OtlpReceiverMetrics> {
@@ -193,6 +202,8 @@ mod tests {
         }
     }
 
+    /// Scenario: the layer is under hard memory pressure with a 3 second retry delay.
+    /// Guarantees: The request is refused before the inner service is polled or called, with gRPC status 8, 3000 ms retry pushback and a RetryInfo detail header, so OTLP clients retry instead of dropping the data.
     #[test]
     fn hard_pressure_short_circuits_before_inner_readiness_and_call() {
         let state = MemoryPressureState::default();
@@ -234,6 +245,10 @@ mod tests {
                 .get("grpc-retry-pushback-ms")
                 .and_then(|v| v.to_str().ok()),
             Some("3000")
+        );
+        assert!(
+            response.headers().contains_key("grpc-status-details-bin"),
+            "the refusal carries its RetryInfo detail"
         );
     }
 
