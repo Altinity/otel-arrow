@@ -354,7 +354,10 @@ fn malformed(e: &prost::DecodeError) -> LakeError {
 /// the records before it as a non-empty batch (an acknowledged partial batch), panics with
 /// `.expect(...)` on a value whose wire type does not match its field number, and recurses without
 /// a depth bound when it CBOR-encodes a deeply nested value (a stack overflow that aborts the whole
-/// process). A strict `prost` decode rejects all three (its recursion limit is 100). On success the
+/// process). A strict `prost` decode rejects the first two. It rejects the third only while prost
+/// keeps its recursion limit of 100: a build that enables prost's `no-recursion-limit` feature
+/// (the default `df_engine` build does, through `jemalloc_pprof` -> `pprof_util`) decodes any
+/// depth here, so a deeply nested value can still overflow the stack in this decode. On success the
 /// per-table entry counts are checked so a request that would overflow a `u16` id in the converter
 /// is refused here instead of silently misattributing its attributes. OTAP input does not reach
 /// this path, so its ids and nesting are handled during extraction instead.
@@ -539,7 +542,11 @@ impl ParquetLakeExporter {
             PayloadData::OtapArrowRecords(_) => None,
         };
         let (payload, otlp_repaired) = match repair {
-            Some((raw, strings)) => (OtapPayload::from(raw), strings),
+            Some((raw, strings)) => {
+                // Free the original bytes now: only one copy of the request stays resident.
+                drop(payload);
+                (OtapPayload::from(raw), strings)
+            }
             None => (payload, 0),
         };
         let records: Result<OtapArrowRecords, _> = payload.try_into_with_default();

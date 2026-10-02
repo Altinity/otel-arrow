@@ -18,11 +18,10 @@
 
 use std::borrow::Cow;
 
-use prost::encoding::{
-    DecodeContext, WireType, decode_key, decode_varint, encode_key, encode_varint, skip_field,
-};
+use prost::encoding::{WireType, decode_key, decode_varint, encode_key, encode_varint};
 
-/// Deepest message nesting the rewriter walks; prost's decoder has the same limit.
+/// Deepest message nesting the rewriter walks: prost's own recursion limit. The rewriter keeps
+/// this bound in every build, also when prost is compiled with its `no-recursion-limit` feature.
 const MAX_DEPTH: u32 = 100;
 
 /// The request tree to rewrite.
@@ -34,7 +33,8 @@ pub enum OtlpTree {
     Metrics,
 }
 
-/// The bytes are not a well-formed message of the expected tree, or nest deeper than prost allows.
+/// The bytes are not a well-formed message of the expected tree, or nest deeper than `MAX_DEPTH`
+/// messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Malformed;
 
@@ -51,7 +51,7 @@ pub struct Repaired {
 ///
 /// `Ok(None)` when every string field already is valid UTF-8 (the request needs no change).
 /// `Err(Malformed)` for a bad key, a truncated field, a string or message field with a wire type
-/// other than length-delimited, an unknown field prost cannot skip, or nesting beyond the limit.
+/// other than length-delimited, a group (OTLP has none), or nesting beyond the limit.
 pub fn repair_otlp(tree: OtlpTree, request: &[u8]) -> Result<Option<Repaired>, Malformed> {
     let root = match tree {
         OtlpTree::Logs => Kind::LogsRequest,
@@ -199,8 +199,7 @@ fn rewrite(
             // A string or message field is always length-delimited; prost refuses it too.
             (Some(_), _) => return Err(Malformed),
             (None, wire_type) => {
-                skip_field(wire_type, number, &mut rest, DecodeContext::default())
-                    .map_err(|_| Malformed)?;
+                skip_unknown(wire_type, &mut rest)?;
                 None
             }
         };
@@ -220,6 +219,28 @@ fn rewrite(
         }
     }
     Ok(out)
+}
+
+/// Skip the value of a field the rewriter does not know, without recursion. A group is refused:
+/// OTLP has none, and skipping one means descending through its nested groups, which has no
+/// bound when prost is compiled without its recursion limit.
+fn skip_unknown(wire_type: WireType, rest: &mut &[u8]) -> Result<(), Malformed> {
+    let len = match wire_type {
+        WireType::Varint => {
+            let _ = decode_varint(rest).map_err(|_| Malformed)?;
+            0
+        }
+        WireType::ThirtyTwoBit => 4,
+        WireType::SixtyFourBit => 8,
+        WireType::LengthDelimited => {
+            let len = decode_varint(rest).map_err(|_| Malformed)?;
+            usize::try_from(len).map_err(|_| Malformed)?
+        }
+        WireType::StartGroup | WireType::EndGroup => return Err(Malformed),
+    };
+    let tail = rest.get(len..).ok_or(Malformed)?;
+    *rest = tail;
+    Ok(())
 }
 
 /// The lossy UTF-8 decoding of a string field, or `None` when it already is valid UTF-8.
@@ -338,14 +359,26 @@ mod tests {
         assert_eq!(repair_otlp(OtlpTree::Logs, &stray_end), Err(Malformed));
     }
 
-    /// Scenario: a log body nests 1,000 arrays around a string of invalid bytes, far beyond prost's recursion limit of 100.
-    /// Guarantees: The rewriter refuses it as malformed once it reaches its depth limit, so it never recurses deeper than prost would (no stack overflow).
+    /// Scenario: a log body nests 1,000 arrays around a string of invalid bytes, far beyond the rewriter's depth limit of 100.
+    /// Guarantees: The rewriter refuses it as malformed once it reaches its depth limit, so it never recurses deeper than 100 messages (no stack overflow on a default test-thread stack).
     #[test]
     fn nesting_beyond_the_limit_is_refused() {
         assert_eq!(
             repair_otlp(OtlpTree::Logs, &nested_body_logs_request(1_000)),
             Err(Malformed)
         );
+    }
+
+    /// Scenario: a corrupted logs request ends with an unknown field that opens 100,000 nested groups.
+    /// Guarantees: The rewriter refuses the group as malformed without descending into it, so nested groups cannot make it recurse, whatever recursion limit prost was compiled with.
+    #[test]
+    fn unknown_groups_are_refused_without_recursion() {
+        let mut bytes = every_string_logs(BAD).encode_to_vec();
+        let _ = corrupt_utf8(&mut bytes);
+        for _ in 0..100_000 {
+            encode_key(99, WireType::StartGroup, &mut bytes);
+        }
+        assert_eq!(repair_otlp(OtlpTree::Logs, &bytes), Err(Malformed));
     }
 
     /// Scenario: a log body nests 40 arrays around a string of invalid bytes, within prost's recursion limit.

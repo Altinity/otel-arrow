@@ -1654,7 +1654,7 @@ fn invalid_utf8_request_is_repaired_by_validation() {
     );
 }
 
-/// Scenario: requests with invalid UTF-8 that are also truncated, carry a schema URL with the wrong wire type, nest 1,000 arrays deep, or are not a complete protobuf message at all.
+/// Scenario: requests with invalid UTF-8 that are also truncated, carry a schema URL with the wrong wire type, or are not a complete protobuf message at all.
 /// Guarantees: Each is refused as invalid content whose reason starts with "malformed OTLP request" and carries prost's description; none is repaired.
 #[test]
 fn malformed_requests_with_invalid_utf8_are_still_refused() {
@@ -1665,7 +1665,6 @@ fn malformed_requests_with_invalid_utf8_are_still_refused() {
     for (name, case) in [
         ("truncated", bytes[..bytes.len() - 4].to_vec()),
         ("wrong wire type", wrong_type),
-        ("too deep", nested_body_logs_request(1_000)),
         ("garbage", vec![0x0a, 0x05, b'h', b'i', 0xff, 0xff]),
     ] {
         let raw = OtlpProtoBytes::ExportLogsRequest(Bytes::from(case));
@@ -1676,6 +1675,30 @@ fn malformed_requests_with_invalid_utf8_are_still_refused() {
             "{name}: {err}"
         );
     }
+}
+
+/// Scenario: an OTLP logs request whose body nests 1,000 arrays around a string of invalid UTF-8 is validated on a thread with a 16 MiB stack.
+/// Guarantees: It is refused as malformed and is not repaired, in both prost configurations: with prost's recursion limit the decoder refuses at 100 nested messages; without it (the `no-recursion-limit` feature, which workspace builds enable through `pprof_util`) the decoder walks all 2,000 nested messages, reports the invalid string, and the rewriter then refuses at its own depth limit. The large stack is needed for that second case: the unbounded decode of 2,000 messages does not fit the 2 MiB stack of a test thread.
+#[test]
+fn deeply_nested_request_with_invalid_utf8_is_refused() {
+    let handle = std::thread::Builder::new()
+        .stack_size(16 * MIB)
+        .spawn(|| {
+            let raw =
+                OtlpProtoBytes::ExportLogsRequest(Bytes::from(nested_body_logs_request(1_000)));
+            super::validate_otlp_request(&raw, usize::MAX)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .expect("spawn");
+    let err = handle
+        .join()
+        .expect("the validation does not panic")
+        .expect_err("too deep");
+    assert!(
+        err.contains("malformed OTLP request: failed to decode Protobuf message"),
+        "{err:.300}"
+    );
 }
 
 /// Scenario: an OTLP logs request with 65,536 attributed log records, one of whose attribute values holds invalid UTF-8.
