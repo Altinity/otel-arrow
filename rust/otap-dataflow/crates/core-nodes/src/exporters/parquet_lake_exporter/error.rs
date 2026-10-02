@@ -85,7 +85,9 @@ impl LakeError {
             Self::Invalid(_) | Self::MissingColumn { .. } => Refusal::Invalid,
             Self::TooDeep(_) => Refusal::TooDeep,
             Self::Unsupported(_) => Refusal::Unsupported,
-            // The flush-path variants never refuse a request; they end up in a retryable Nack.
+            // A conversion failure of an admitted request (pdata's converter) refuses it as
+            // `Other`; the flush-path variants never refuse a request and end up in a retryable
+            // Nack. Malformed OTLP is `Invalid` (see `validate_otlp_request`).
             Self::Conversion(_)
             | Self::Arrow(_)
             | Self::Parquet(_)

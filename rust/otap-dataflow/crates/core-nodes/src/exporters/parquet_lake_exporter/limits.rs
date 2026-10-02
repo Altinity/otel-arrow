@@ -40,18 +40,24 @@ impl Limits {
 /// Bytes the extraction of one request may produce. Every allocation that scales with the request
 /// (expanded dictionary columns, rendered attribute values, gathered maps, fixed row cells) is
 /// charged before it is made, so an input that expands far beyond its wire size is refused instead
-/// of being materialized.
+/// of being materialized. It also counts the string values whose invalid UTF-8 was repaired during
+/// the extraction, since it travels through every step that reads strings.
 #[derive(Debug)]
 pub struct Budget {
     limit: usize,
     used: usize,
+    repaired: u64,
 }
 
 impl Budget {
     /// A budget of `limit` bytes.
     #[must_use]
     pub const fn new(limit: usize) -> Self {
-        Self { limit, used: 0 }
+        Self {
+            limit,
+            used: 0,
+            repaired: 0,
+        }
     }
 
     /// Charge `bytes`, refusing the request once the total passes the limit.
@@ -71,6 +77,17 @@ impl Budget {
     #[must_use]
     pub const fn used(&self) -> usize {
         self.used
+    }
+
+    /// Count one string value whose invalid UTF-8 was replaced with U+FFFD.
+    pub const fn note_repaired(&mut self) {
+        self.repaired += 1;
+    }
+
+    /// String values repaired so far.
+    #[must_use]
+    pub const fn repaired(&self) -> u64 {
+        self.repaired
     }
 }
 

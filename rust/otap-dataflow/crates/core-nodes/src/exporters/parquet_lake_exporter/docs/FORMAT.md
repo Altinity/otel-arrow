@@ -50,8 +50,9 @@ tag  type     payload
 0x08 kvlist   count:u32_be ++ (string key, value)*  sorted by key bytes
 ```
 
-Strings reach this writer as Arrow UTF-8 columns, so they are always valid
-UTF-8 and no repair rule applies.
+Strings reach this encoder as valid UTF-8: invalid UTF-8 is repaired on
+ingress (see "Extensions and deviations", item 9), so the encoder itself has
+no repair rule.
 
 Attribute lists are encoded as `kvlist`. Identity fields are appended in this
 fixed order:
@@ -137,7 +138,7 @@ false, true                             bool
 null, undefined                         null
 any other simple value, a lone break    invalid
 byte string                             bytes
-text string                             string; not valid UTF-8: invalid
+text string                             string; not valid UTF-8: repaired
 array                                   array, items in order
 map                                     kvlist, sorted by key bytes
 ```
@@ -149,8 +150,13 @@ map                                     kvlist, sorted by key bytes
 - Byte strings, text strings, arrays and maps may have indefinite length.
   An indefinite string is the concatenation of its chunks, which must be of
   the same major type; a chunk that is itself indefinite is flattened into
-  it. Each text chunk must be valid UTF-8 on its own.
-- Invalid UTF-8 inside the item is refused, never repaired.
+  it.
+- A text string or map key that is not valid UTF-8 is repaired, not refused:
+  each chunk is decoded on its own, and each maximal invalid byte sequence
+  becomes U+FFFD (the rule of Rust's `String::from_utf8_lossy` and of the
+  WHATWG decoder). A code point split across chunks therefore becomes
+  replacement characters. Keys that become equal after repair are duplicate
+  keys and make the item invalid.
 - Each array or map is one nesting level. An item with more than
   `ingress.max_nesting_depth` levels is too deep.
 - Only the first item of the cell is decoded; bytes after it are ignored. A
@@ -615,6 +621,16 @@ Everything in which this writer differs from `exporter:series_parquet`:
 7. Row groups are closed at about 8 MiB of encoder memory instead of 64 MiB.
 8. `L` has no abort-timeout term, because there is no multipart upload to
    abort.
+9. Invalid UTF-8 is repaired on ingress instead of refused
+   (`exporter:series_parquet` refuses it): OTLP string fields at any level,
+   CBOR text strings and map keys in `ser` cells, and Binary-typed OTAP
+   string columns. Each maximal invalid sequence becomes U+FFFD. Inputs both
+   writers accept produce identical canonical bytes and series ids; only
+   inputs the reference refuses differ. Distinct invalid strings can repair
+   to the same string and so share a series id. The golden vector
+   `text_not_utf8` in `testdata/golden/cbor_v1.json` holds the repaired
+   value; its series id is this writer's own output, so it guards against
+   regressions and is not a reference value.
 
 Do not point this writer and `exporter:series_parquet` at the same
 `base_uri` unless the readers handle items 1 to 3.

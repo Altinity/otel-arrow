@@ -83,4 +83,10 @@ pub struct LakeMetrics {
     /// Timestamps stored as null because they were negative.
     #[metric(name = "timestamps.out_of_range", unit = "{timestamp}")]
     pub timestamps_out_of_range: Counter<u64>,
+    /// Requests accepted after invalid UTF-8 in their strings was replaced with U+FFFD.
+    #[metric(name = "requests.repaired", unit = "{request}")]
+    pub requests_repaired: Counter<u64>,
+    /// String values whose invalid UTF-8 was replaced with U+FFFD.
+    #[metric(name = "strings.repaired", unit = "{string}")]
+    pub strings_repaired: Counter<u64>,
 }

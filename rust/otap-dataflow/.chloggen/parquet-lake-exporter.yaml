@@ -21,3 +21,4 @@ issues: []
 subtext: |
   A series row is written once per writer and hour. One block accepts while another is flushed. Requests above
   the ingress limits and invalid content are refused. Receivers need wait_for_result.
+  Invalid UTF-8 is replaced with U+FFFD and counted, not refused.

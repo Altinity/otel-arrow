@@ -17,7 +17,7 @@ use otel_arrow_dfe_pdata::otlp::attributes::AttributeValueType;
 use otel_arrow_dfe_pdata::schema::consts;
 
 use super::canonical::{encode_value, put_bool, put_bytes, put_double, put_int, put_null, put_str};
-use super::columns::{cast_cost, cast_or_null};
+use super::columns::{cast_cost, cast_or_null, utf8_lossy};
 use super::error::LakeError;
 use super::limits::{Budget, Limits};
 use super::value::{Value, decode_cbor, render_v1, write_bytes_v1, write_double};
@@ -63,7 +63,7 @@ impl AnyValueColumns {
         }
         let c = |name: &str, dt: &DataType| cast_or_null(get(name).as_ref(), dt, len);
         let ty = downcast::<UInt8Array>(&c(consts::ATTRIBUTE_TYPE, &DataType::UInt8)?);
-        let str_ = downcast::<StringArray>(&c(consts::ATTRIBUTE_STR, &DataType::Utf8)?);
+        let str_ = utf8_lossy(get(consts::ATTRIBUTE_STR).as_ref(), len, budget)?;
         let bytes = downcast::<BinaryArray>(&c(consts::ATTRIBUTE_BYTES, &DataType::Binary)?);
         let ser = downcast::<BinaryArray>(&c(consts::ATTRIBUTE_SER, &DataType::Binary)?);
         let mut nested = HashMap::new();

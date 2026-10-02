@@ -159,13 +159,14 @@ The situations in which data can be lost, and how this exporter handles each:
 | Situation | Handling |
 | --- | --- |
 | Receivers ack before the data lands (`wait_for_result: false`, the receivers' default) | Cannot be enforced here; the exporter warns once (`parquet_lake.unacked_input`). Set `wait_for_result: true`. |
-| Malformed or truncated OTLP bytes | Every OTLP request is strictly decoded before conversion, so a request that is not a complete, valid OTLP message is refused (permanent Nack). This also stops the lenient converter from acknowledging a partial batch (records after a parse error dropped), panicking on a value whose wire type does not match its field number, or overflowing the stack on a deeply nested value. A valid empty request is still acknowledged. |
+| Malformed or truncated OTLP bytes | Every OTLP request is strictly decoded before conversion, so a request that is not a complete, valid OTLP message is refused (permanent Nack). This also stops the lenient converter from acknowledging a partial batch (records after a parse error dropped), panicking on a value whose wire type does not match its field number, or overflowing the stack on a deeply nested value. A valid empty request is still acknowledged. The reason carries the decoder's error and the refusal counts in `requests.refused.invalid`. Invalid UTF-8 alone is not malformed; see the next row. |
+| Invalid UTF-8 in a string (OTLP string fields at any level, including nested values; CBOR text strings and map keys in OTAP `ser` cells; Binary-typed OTAP string columns) | Repaired, not refused: each invalid byte sequence becomes U+FFFD (the rule of Rust's `String::from_utf8_lossy`), the request is accepted and acked after it lands, and the repairs are counted in `requests.repaired` and `strings.repaired`. Strings that differ only in invalid bytes become equal after repair, so their series merge into one series id, and two attribute keys that become equal are refused as duplicate keys. A repaired OTLP request must still fit `ingress.max_request_bytes`. Traces are not repaired (they are refused as unsupported anyway). |
 | An OTLP request with more than 65,535 attributed log records, metrics, scopes or resources | Refused permanently, with a reason naming the count. The OTLP-to-OTAP converter addresses these with a `u16` id that would otherwise wrap (silently misattributing log attributes in release builds) or fail deep in the converter. Split the batch upstream. OTAP input is not affected. |
 | Power loss after an ack on the `file` backend | Files and directories are fsynced before the ack. |
 | Storage outage longer than the producers' retry window, or producer queues filling during slow uploads | No local disk buffer: producers must retry and queue. Size their retry time above the expected outage and their timeout above the worst-case ack delay. Use `durable_buffer` upstream only if losing ack-after-land is acceptable. |
 | Shutdown during a flush | The shutdown is handled at once; the flush gets until the shutdown deadline. Requests that did not land get a retryable `NodeShutdown` Nack. |
 | A request above `ingress.max_request_bytes`, `ingress.max_extracted_bytes`, `ingress.max_row_bytes` or `ingress.max_nesting_depth` | Refused permanently; the reason names the setting, the observed value and the limit. Split the batch upstream or raise the limit. |
-| `processor:batch` builds batches above `ingress.max_request_bytes` | The batch is refused; the batch processor relays the refusal upstream as a retryable Nack, so producers resend into the same limit. Bound the batch size: for OTLP batches set `otlp.max_size` (`sizer: bytes`) below the limit; for OTAP batches only `sizer: items` exists, so `otap.max_size` bounds the record count, not the bytes. |
+| `processor:batch` builds batches above `ingress.max_request_bytes` | The batch is refused; the batch processor relays the permanent refusal to every request in the batch, so their producers get a client error and drop the data. Bound the batch size: for OTLP batches set `otlp.max_size` (`sizer: bytes`) below the limit; for OTAP batches only `sizer: items` exists, so `otap.max_size` bounds the record count, not the bytes. |
 | Duplicate attribute keys, a data point without a metric row, a sum or histogram without temporality, histogram lists of mismatched lengths, a count above `i64::MAX`, an undecodable nested value | Refused permanently with a reason naming the rule; the valid rows of that request are not written either. |
 | Traces or multivariate metrics sent to this exporter | Refused (permanent). Route them elsewhere. |
 | Deterministic encode failure of a block | Retryable Nack for the block's requests: requests that only shared the block succeed on resend; the failing request keeps failing until the producer gives up (logged as `parquet_lake.block.failed`). |
@@ -302,12 +303,15 @@ The standard exporter outcome measurements (success and failure per signal).
 | `requests.refused.unsupported` | `{request}` | Requests refused as unsupported (traces) |
 | `requests.refused.other` | `{request}` | Requests refused for a conversion or internal failure |
 | `timestamps.out_of_range` | `{timestamp}` | Timestamps stored as null because they were negative |
+| `requests.repaired` | `{request}` | Requests accepted after invalid UTF-8 in their strings was replaced with U+FFFD |
+| `strings.repaired` | `{string}` | String values whose invalid UTF-8 was replaced with U+FFFD |
 
 ### Events
 
 - `parquet_lake.start` (info): writer id, boot id, window interval, `max_block_bytes`, `worst_case_flush_bytes`.
 - `parquet_lake.block.failed` (warn): a block did not land; its requests are Nacked.
 - `parquet_lake.request.refused` (warn, at most one per second): a request was refused permanently, with the reason.
+- `parquet_lake.request.repaired` (warn, at most one per second): invalid UTF-8 in a request was replaced with U+FFFD; carries the number of repaired strings, never their content.
 - `parquet_lake.unacked_input` (warn, once): a request arrived without Ack/Nack subscribers, so upstream acknowledged it before it landed.
 
 ## Limits

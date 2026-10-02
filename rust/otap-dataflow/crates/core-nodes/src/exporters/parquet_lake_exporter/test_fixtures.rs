@@ -14,17 +14,19 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
 use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
-    AnyValue, InstrumentationScope, KeyValue, any_value,
+    AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
-    ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint,
-    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint,
-    exponential_histogram_data_point, metric, number_data_point, summary_data_point,
+    Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
+    HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary,
+    SummaryDataPoint, exemplar, exponential_histogram_data_point, metric, number_data_point,
+    summary_data_point,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
 use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayload, OtlpProtoBytes, TryIntoWithOptions};
 use prost::Message;
+use prost::encoding::{WireType, encode_key, encode_varint};
 
 use super::canonical::{Descriptor, MetricDescriptor, MetricKind, Signal, Temporality};
 use super::value::Value;
@@ -465,4 +467,211 @@ pub fn replace_column(
     column: ArrayRef,
 ) {
     try_replace_column(records, pt, name, column).expect("the OTAP schema accepts the column");
+}
+
+/// Marker that [`corrupt_utf8`] turns into invalid UTF-8 after a request is encoded.
+pub const BAD: &str = "<<BAD>>";
+
+/// A corrupted [`BAD`] marker after repair: each of its three invalid bytes becomes U+FFFD.
+pub const REPAIRED: &str = "<<\u{FFFD}\u{FFFD}\u{FFFD}>>";
+
+/// Replace every [`BAD`] marker in encoded bytes by `<<` 0xFF 0xFE 0xFD `>>`. The length is
+/// unchanged, so every protobuf length prefix stays valid, but the string is no longer UTF-8.
+/// Returns how many markers were replaced.
+pub fn corrupt_utf8(bytes: &mut [u8]) -> u64 {
+    let marker = BAD.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while i + marker.len() <= bytes.len() {
+        if bytes[i..].starts_with(marker) {
+            bytes[i + 2..i + 5].copy_from_slice(&[0xff, 0xfe, 0xfd]);
+            count += 1;
+            i += marker.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// A logs request in which every OTLP string field holds `m` once, after a prefix naming the
+/// field: both schema URLs, the scope name and version, resource, scope and record attribute keys
+/// and values, an entity ref (all four strings), severity text, event name, a string body, a
+/// kvlist body whose key and nested array item hold `m`, and a record attribute `nested_attr` with
+/// the same nesting (kvlist key and array item). A third record is clean (body `clean`).
+#[must_use]
+pub fn every_string_logs(m: &str) -> ExportLogsServiceRequest {
+    let s = |prefix: &str| AnyValue {
+        value: Some(any_value::Value::StringValue(format!("{prefix}{m}"))),
+    };
+    let kvs = |prefix: &str| {
+        vec![KeyValue {
+            key: format!("{prefix}.key{m}"),
+            value: Some(s(&format!("{prefix}.value"))),
+        }]
+    };
+    let record = |time: u64, body: AnyValue, prefix: &str| LogRecord {
+        time_unix_nano: BASE_NS + time,
+        severity_text: format!("{prefix}.severity{m}"),
+        event_name: format!("{prefix}.event{m}"),
+        body: Some(body),
+        attributes: kvs(prefix),
+        ..Default::default()
+    };
+    // A kvlist whose key and whose array item hold `m`.
+    let nested = |prefix: &str| AnyValue {
+        value: Some(any_value::Value::KvlistValue(KeyValueList {
+            values: vec![KeyValue {
+                key: format!("{prefix}.key{m}"),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::ArrayValue(ArrayValue {
+                        values: vec![s(&format!("{prefix}.item"))],
+                    })),
+                }),
+            }],
+        })),
+    };
+    // The nested value also travels as an attribute: pdata CBOR-encodes it into the `ser` column,
+    // and the exporter decodes and renders it into the `attrs` map.
+    let mut string_record = record(1, s("body"), "string_body");
+    string_record.attributes.push(KeyValue {
+        key: "nested_attr".into(),
+        value: Some(nested("nested.attr")),
+    });
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: kvs("resource"),
+                entity_refs: vec![EntityRef {
+                    schema_url: format!("entity.schema{m}"),
+                    r#type: format!("entity.type{m}"),
+                    id_keys: vec![format!("entity.id{m}")],
+                    description_keys: vec![format!("entity.description{m}")],
+                }],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: format!("scope.name{m}"),
+                    version: format!("scope.version{m}"),
+                    attributes: kvs("scope"),
+                    ..Default::default()
+                }),
+                log_records: vec![
+                    string_record,
+                    record(2, nested("nested"), "kvlist_body"),
+                    LogRecord {
+                        time_unix_nano: BASE_NS + 3,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("clean".into())),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                schema_url: format!("scope.schema{m}"),
+            }],
+            schema_url: format!("resource.schema{m}"),
+        }],
+    }
+}
+
+/// [`metrics_request`] (all five metric kinds) with `m` added once to every string field: schema
+/// URLs, scope name and version, resource and scope attributes, each metric's name (suffix),
+/// description, unit and metadata, every data point's attributes, and one exemplar per gauge, sum,
+/// histogram and exponential histogram point with a filtered attribute.
+#[must_use]
+pub fn every_string_metrics(m: &str) -> ExportMetricsServiceRequest {
+    let mut req = metrics_request();
+    let tag = |attrs: &mut Vec<KeyValue>, prefix: &str| {
+        attrs.push(kv(
+            &format!("{prefix}.key{m}"),
+            format!("{prefix}.value{m}"),
+        ));
+    };
+    let exemplar = |i: usize| Exemplar {
+        time_unix_nano: BASE_NS + 1,
+        filtered_attributes: vec![kv(
+            &format!("metric{i}.exemplar.key{m}"),
+            format!("metric{i}.exemplar.value{m}"),
+        )],
+        value: Some(exemplar::Value::AsInt(1)),
+        ..Default::default()
+    };
+    for rm in &mut req.resource_metrics {
+        rm.schema_url = format!("resource.schema{m}");
+        tag(
+            &mut rm.resource.get_or_insert_with(Resource::default).attributes,
+            "resource",
+        );
+        for sm in &mut rm.scope_metrics {
+            sm.schema_url = format!("scope.schema{m}");
+            let scope = sm.scope.get_or_insert_with(InstrumentationScope::default);
+            scope.name = format!("scope.name{m}");
+            scope.version = format!("scope.version{m}");
+            tag(&mut scope.attributes, "scope");
+            for (i, metric) in sm.metrics.iter_mut().enumerate() {
+                metric.name = format!("{}{m}", metric.name);
+                metric.description = format!("metric{i}.description{m}");
+                metric.unit = format!("metric{i}.unit{m}");
+                tag(&mut metric.metadata, &format!("metric{i}.metadata"));
+                let point = format!("metric{i}.point");
+                match metric.data.as_mut() {
+                    Some(
+                        metric::Data::Gauge(Gauge { data_points })
+                        | metric::Data::Sum(Sum { data_points, .. }),
+                    ) => {
+                        for p in data_points {
+                            tag(&mut p.attributes, &point);
+                            p.exemplars.push(exemplar(i));
+                        }
+                    }
+                    Some(metric::Data::Histogram(h)) => {
+                        for p in &mut h.data_points {
+                            tag(&mut p.attributes, &point);
+                            p.exemplars.push(exemplar(i));
+                        }
+                    }
+                    Some(metric::Data::ExponentialHistogram(h)) => {
+                        for p in &mut h.data_points {
+                            tag(&mut p.attributes, &point);
+                            p.exemplars.push(exemplar(i));
+                        }
+                    }
+                    Some(metric::Data::Summary(s)) => {
+                        for p in &mut s.data_points {
+                            tag(&mut p.attributes, &point);
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    req
+}
+
+/// One length-delimited protobuf field `number` holding `body`.
+#[must_use]
+pub fn length_delimited(number: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 8);
+    encode_key(number, WireType::LengthDelimited, &mut out);
+    encode_varint(body.len() as u64, &mut out);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Encoded logs request whose only record's body nests `levels` arrays around a string of three
+/// invalid bytes, built without recursion: AnyValue.string_value (1), AnyValue.array_value (5) >
+/// ArrayValue.values (1), then LogRecord.body (5) > ScopeLogs.log_records (2) >
+/// ResourceLogs.scope_logs (2) > ExportLogsServiceRequest.resource_logs (1).
+#[must_use]
+pub fn nested_body_logs_request(levels: usize) -> Vec<u8> {
+    let mut any = length_delimited(1, &[0xff, 0xfe, 0xfd]);
+    for _ in 0..levels {
+        any = length_delimited(5, &length_delimited(1, &any));
+    }
+    length_delimited(
+        1,
+        &length_delimited(2, &length_delimited(2, &length_delimited(5, &any))),
+    )
 }

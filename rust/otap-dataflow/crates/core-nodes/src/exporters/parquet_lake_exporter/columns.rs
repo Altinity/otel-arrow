@@ -5,11 +5,12 @@
 //! v1 cell rules (required columns, timestamps, counts). Only the column types of the OTAP schema
 //! are read; every cast that can allocate more than its input is charged to the request budget.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Float64Array, Float64Builder, Int32Array, Int64Builder, ListBuilder,
-    RecordBatch, StringArray, StructArray, TimestampMicrosecondBuilder, UInt32Array,
+    RecordBatch, StringArray, StringBuilder, StructArray, TimestampMicrosecondBuilder, UInt32Array,
     new_null_array,
 };
 use arrow::compute::cast;
@@ -162,7 +163,57 @@ pub fn cast_cost(array: &ArrayRef, to: &DataType) -> usize {
         .sum()
 }
 
+/// Whether `dt` is Binary or a dictionary over Binary.
+fn is_binary(dt: &DataType) -> bool {
+    match dt {
+        DataType::Binary => true,
+        DataType::Dictionary(_, value) => value.as_ref() == &DataType::Binary,
+        _ => false,
+    }
+}
+
+/// A string column as plain `Utf8`, or all null when absent; the caller charges the cast cost. A
+/// Binary column (or dictionary over Binary) is decoded lossily: a value that is not UTF-8 has
+/// each invalid sequence replaced with U+FFFD and counts in the budget's repaired strings, where
+/// Arrow's safe cast would turn it into a null. A column that needs a repair is rebuilt: that
+/// second copy is charged before it is built, and then the growth of each repaired value.
+pub fn utf8_lossy(
+    array: Option<&ArrayRef>,
+    len: usize,
+    budget: &mut Budget,
+) -> Result<StringArray, LakeError> {
+    let Some(a) = array.filter(|a| is_binary(a.data_type())) else {
+        return Ok(cast_or_null(array, &DataType::Utf8, len)?
+            .as_string::<i32>()
+            .clone());
+    };
+    let plain = cast(a, &DataType::Binary)?;
+    let bin = plain.as_binary::<i32>();
+    if let Ok(valid) = StringArray::try_from_binary(bin.clone()) {
+        return Ok(valid);
+    }
+    // At least one value is not UTF-8: the column is rebuilt next to the cast result.
+    budget.charge(bin.get_buffer_memory_size())?;
+    let mut out = StringBuilder::with_capacity(bin.len(), bin.value_data().len());
+    for value in bin.iter() {
+        let Some(raw) = value else {
+            out.append_null();
+            continue;
+        };
+        match String::from_utf8_lossy(raw) {
+            Cow::Borrowed(s) => out.append_value(s),
+            Cow::Owned(s) => {
+                budget.charge(s.len().saturating_sub(raw.len()))?;
+                budget.note_repaired();
+                out.append_value(s);
+            }
+        }
+    }
+    Ok(out.finish())
+}
+
 /// Utf8 column with nulls (and an absent column) read as `""`: the v1 string columns are required.
+/// A Binary column is decoded lossily (see [`utf8_lossy`]).
 pub fn utf8_or_empty(
     array: Option<&ArrayRef>,
     len: usize,
@@ -172,10 +223,9 @@ pub fn utf8_or_empty(
         return Ok(StringArray::from(vec![""; len]));
     };
     budget.charge(cast_cost(a, &DataType::Utf8))?;
-    let plain = cast_or_null(Some(a), &DataType::Utf8, len)?;
-    let s = plain.as_string::<i32>();
+    let s = utf8_lossy(Some(a), len, budget)?;
     if s.null_count() == 0 {
-        return Ok(s.clone());
+        return Ok(s);
     }
     // The column is rebuilt without nulls.
     budget.charge(s.get_buffer_memory_size())?;
@@ -420,7 +470,7 @@ pub fn take_charged(
 mod tests {
     use super::*;
     use arrow::array::{
-        DictionaryArray, LargeStringArray, ListArray, ListViewArray, MapBuilder, StringBuilder,
+        BinaryArray, DictionaryArray, LargeStringArray, ListArray, ListViewArray, MapBuilder,
         StringViewArray, UInt16Array, UInt64Array, UInt64Builder,
     };
     use arrow::buffer::ScalarBuffer;
@@ -726,5 +776,36 @@ mod tests {
         // 300 + 4 for the string, 8 bytes of keys and values plus 8 per entry plus 4 for the map,
         // 3 * 8 + 4 for the list.
         assert_eq!(bytes[1], 304 + (8 + 16 + 4) + 28);
+    }
+
+    /// Scenario: a Binary column and a Dictionary<UInt16, Binary> column hold "ok", the bytes `41 ff 41` and a null, and are read as a lossy and as a required string column.
+    /// Guarantees: The invalid value reads as "A", U+FFFD, "A" instead of a null or an empty string; the null stays null (lossy) or reads as "" (required); each repaired value is counted once per read; the rebuilt column is charged to the budget, and a budget of one byte refuses the read as too large.
+    #[test]
+    fn binary_string_columns_are_decoded_lossily() {
+        let values: Vec<Option<&[u8]>> =
+            vec![Some(&b"ok"[..]), Some(&[0x41, 0xff, 0x41][..]), None];
+        let plain: ArrayRef = Arc::new(BinaryArray::from(values.clone()));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<UInt16Type>::new(
+            UInt16Array::from(vec![0, 1, 2]),
+            Arc::new(BinaryArray::from(values)),
+        ));
+        for array in [plain, dict] {
+            let mut budget = Budget::new(1 << 20);
+            let lossy = utf8_lossy(Some(&array), 3, &mut budget).expect("lossy");
+            assert_eq!(lossy.value(0), "ok");
+            assert_eq!(lossy.value(1), "A\u{FFFD}A");
+            assert!(lossy.is_null(2));
+            assert_eq!(budget.repaired(), 1);
+            assert!(budget.used() > 0, "the rebuilt column is charged");
+            let err = utf8_lossy(Some(&array), 3, &mut Budget::new(1))
+                .expect_err("the rebuilt column does not fit one byte");
+            assert!(matches!(err, LakeError::TooLarge { .. }), "{err}");
+            let required = utf8_or_empty(Some(&array), 3, &mut budget).expect("required");
+            assert_eq!(
+                required.iter().collect::<Vec<_>>(),
+                vec![Some("ok"), Some("A\u{FFFD}A"), Some("")]
+            );
+            assert_eq!(budget.repaired(), 2);
+        }
     }
 }

@@ -40,6 +40,7 @@ mod test_store;
 #[cfg(test)]
 mod tests;
 mod upload;
+mod utf8;
 mod value;
 mod window;
 
@@ -55,6 +56,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use linkme::distributed_slice;
 use object_store::ObjectStore;
 use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -76,7 +78,7 @@ use otel_arrow_dfe_otap::object_store::StorageType;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otlp::OtlpProtoBytes;
-use otel_arrow_dfe_pdata::{PayloadData, TryIntoWithOptions};
+use otel_arrow_dfe_pdata::{OtapPayload, PayloadData, TryIntoWithOptions};
 use otel_arrow_dfe_telemetry::common_attributes::{Outcome, SignalOutcomeAttributes};
 use otel_arrow_dfe_telemetry::metrics::{MeasurementMetricSet, MetricSet, MetricSetHandler};
 use tokio::task::JoinError;
@@ -110,6 +112,8 @@ pub struct ParquetLakeExporter {
     warned_unacked: bool,
     /// Last time a refusal was logged (at most one line per second).
     refusal_logged: Option<Instant>,
+    /// Last time a repaired request was logged (at most one line per second).
+    repair_logged: Option<Instant>,
     /// Test hook: use this store instead of building one from `config.storage`.
     #[cfg(test)]
     store_override: Option<Arc<dyn ObjectStore>>,
@@ -271,25 +275,30 @@ fn check_u16_entries(what: &str, count: usize) -> Result<(), LakeError> {
     Ok(())
 }
 
-/// Strictly decode an OTLP request and refuse one that pdata's lenient conversion would mishandle.
-///
-/// The lenient `TryInto<OtapArrowRecords>` path stops at the first protobuf parse error and returns
-/// the records before it as a non-empty batch (an acknowledged partial batch), panics with
-/// `.expect(...)` on a value whose wire type does not match its field number, and recurses without
-/// a depth bound when it CBOR-encodes a deeply nested value (a stack overflow that aborts the whole
-/// process). A strict `prost` decode rejects all three (its recursion limit is 100). On success the
-/// per-table entry counts are checked so a request that would overflow a `u16` id in the converter
-/// is refused here instead of silently misattributing its attributes. OTAP input does not reach
-/// this path, so its ids and nesting are handled during extraction instead.
-fn validate_otlp_request(raw: &OtlpProtoBytes) -> Result<(), LakeError> {
+/// Per-table entry counts of a decoded OTLP request, each checked against the converter's `u16`
+/// ids, in the order they are reported.
+struct EntryCounts([(&'static str, usize); 3]);
+
+impl EntryCounts {
+    /// Refuse the first count that would overflow a `u16` id.
+    fn check(&self) -> Result<(), LakeError> {
+        for &(what, count) in &self.0 {
+            check_u16_entries(what, count)?;
+        }
+        Ok(())
+    }
+}
+
+/// Strictly decode an OTLP request (prost validates structure, nesting and UTF-8) and count the
+/// entries the converter addresses with `u16` ids.
+fn decode_otlp(raw: &OtlpProtoBytes) -> Result<EntryCounts, prost::DecodeError> {
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceRequest;
     use prost::Message as _;
-    let malformed = |_| LakeError::Conversion("malformed OTLP request".into());
     match raw {
         OtlpProtoBytes::ExportLogsRequest(b) => {
-            let req = ExportLogsServiceRequest::decode(b.clone()).map_err(malformed)?;
+            let req = ExportLogsServiceRequest::decode(b.clone())?;
             let mut scopes = 0;
             let mut attributed = 0;
             for rl in &req.resource_logs {
@@ -304,12 +313,14 @@ fn validate_otlp_request(raw: &OtlpProtoBytes) -> Result<(), LakeError> {
                         .count();
                 }
             }
-            check_u16_entries("log records with attributes", attributed)?;
-            check_u16_entries("scopes", scopes)?;
-            check_u16_entries("resources", req.resource_logs.len())?;
+            Ok(EntryCounts([
+                ("log records with attributes", attributed),
+                ("scopes", scopes),
+                ("resources", req.resource_logs.len()),
+            ]))
         }
         OtlpProtoBytes::ExportMetricsRequest(b) => {
-            let req = ExportMetricsServiceRequest::decode(b.clone()).map_err(malformed)?;
+            let req = ExportMetricsServiceRequest::decode(b.clone())?;
             let mut scopes = 0;
             let mut metrics = 0;
             for rm in &req.resource_metrics {
@@ -318,16 +329,75 @@ fn validate_otlp_request(raw: &OtlpProtoBytes) -> Result<(), LakeError> {
                     metrics += sm.metrics.len();
                 }
             }
-            check_u16_entries("metrics", metrics)?;
-            check_u16_entries("scopes", scopes)?;
-            check_u16_entries("resources", req.resource_metrics.len())?;
+            Ok(EntryCounts([
+                ("metrics", metrics),
+                ("scopes", scopes),
+                ("resources", req.resource_metrics.len()),
+            ]))
         }
         OtlpProtoBytes::ExportTracesRequest(b) => {
             // Traces are refused later as unsupported; a strict decode still rejects garbage bytes.
-            let _ = ExportTraceServiceRequest::decode(b.clone()).map_err(malformed)?;
+            let _ = ExportTraceServiceRequest::decode(b.clone())?;
+            Ok(EntryCounts([("spans", 0), ("scopes", 0), ("resources", 0)]))
         }
     }
-    Ok(())
+}
+
+/// The refusal of bytes that fail the strict decode, with prost's description of the defect.
+fn malformed(e: &prost::DecodeError) -> LakeError {
+    LakeError::Invalid(format!("malformed OTLP request: {e}"))
+}
+
+/// Strictly decode an OTLP request and refuse one that pdata's lenient conversion would mishandle.
+///
+/// The lenient `TryInto<OtapArrowRecords>` path stops at the first protobuf parse error and returns
+/// the records before it as a non-empty batch (an acknowledged partial batch), panics with
+/// `.expect(...)` on a value whose wire type does not match its field number, and recurses without
+/// a depth bound when it CBOR-encodes a deeply nested value (a stack overflow that aborts the whole
+/// process). A strict `prost` decode rejects all three (its recursion limit is 100). On success the
+/// per-table entry counts are checked so a request that would overflow a `u16` id in the converter
+/// is refused here instead of silently misattributing its attributes. OTAP input does not reach
+/// this path, so its ids and nesting are handled during extraction instead.
+///
+/// prost also rejects invalid UTF-8 in string fields. When the strict decode fails and the request
+/// is a logs or metrics request whose string fields can be repaired (`utf8::repair_otlp`: each
+/// invalid sequence becomes U+FFFD), the repaired bytes are checked against `max_request_bytes`,
+/// strict-decoded and count-checked again, and returned with the number of repaired strings.
+/// `Ok(None)`: the request is valid as it is.
+fn validate_otlp_request(
+    raw: &OtlpProtoBytes,
+    max_request_bytes: usize,
+) -> Result<Option<(OtlpProtoBytes, u64)>, LakeError> {
+    let defect = match decode_otlp(raw) {
+        Ok(counts) => return counts.check().map(|()| None),
+        Err(e) => e,
+    };
+    let (tree, wrap): (utf8::OtlpTree, fn(Bytes) -> OtlpProtoBytes) = match raw {
+        OtlpProtoBytes::ExportLogsRequest(_) => {
+            (utf8::OtlpTree::Logs, OtlpProtoBytes::ExportLogsRequest)
+        }
+        OtlpProtoBytes::ExportMetricsRequest(_) => (
+            utf8::OtlpTree::Metrics,
+            OtlpProtoBytes::ExportMetricsRequest,
+        ),
+        // Refused as unsupported anyway: no repair.
+        OtlpProtoBytes::ExportTracesRequest(_) => return Err(malformed(&defect)),
+    };
+    // Not walkable, or nothing to repair: the defect is not (only) invalid UTF-8.
+    let Ok(Some(repaired)) = utf8::repair_otlp(tree, raw.as_bytes()) else {
+        return Err(malformed(&defect));
+    };
+    let observed = repaired.bytes.len();
+    if observed > max_request_bytes {
+        return Err(LakeError::TooLarge {
+            setting: "ingress.max_request_bytes",
+            observed,
+            limit: max_request_bytes,
+        });
+    }
+    let fixed = wrap(Bytes::from(repaired.bytes));
+    decode_otlp(&fixed).map_err(|e| malformed(&e))?.check()?;
+    Ok(Some((fixed, repaired.strings)))
 }
 
 impl ParquetLakeExporter {
@@ -345,6 +415,7 @@ impl ParquetLakeExporter {
             wall: Rc::new(SystemWallClock),
             warned_unacked: false,
             refusal_logged: None,
+            repair_logged: None,
             #[cfg(test)]
             store_override: None,
             #[cfg(test)]
@@ -461,10 +532,16 @@ impl ParquetLakeExporter {
         // Strict-decode OTLP bytes before pdata's lenient conversion runs on them below: the
         // lenient path acks a partial batch on a parse error, panics on a malformed value,
         // overflows the stack on deep nesting, and wraps u16 ids past 65535 attributed records.
+        // A request whose only defect is invalid UTF-8 is replaced by its repaired bytes.
         // OTAP input (no `raw`) is not converted from OTLP and is validated during extraction.
-        if let PayloadData::OtlpBytes(raw) = payload.data() {
-            validate_otlp_request(raw)?;
-        }
+        let repair = match payload.data() {
+            PayloadData::OtlpBytes(raw) => validate_otlp_request(raw, limit)?,
+            PayloadData::OtapArrowRecords(_) => None,
+        };
+        let (payload, otlp_repaired) = match repair {
+            Some((raw, strings)) => (OtapPayload::from(raw), strings),
+            None => (payload, 0),
+        };
         let records: Result<OtapArrowRecords, _> = payload.try_into_with_default();
         let mut records = records.map_err(|e| LakeError::Conversion(e.to_string()))?;
         records
@@ -472,7 +549,7 @@ impl ParquetLakeExporter {
             .map_err(|e| LakeError::Conversion(e.to_string()))?;
         let limits = self.config.limits();
         let producer = self.config.producer_id_attribute.as_str();
-        let (signal, extracted) = match &records {
+        let (signal, mut extracted) = match &records {
             OtapArrowRecords::Logs(_) => (
                 Signal::Logs,
                 extract::extract_logs(&records, schemas, &limits, producer)?,
@@ -483,7 +560,28 @@ impl ParquetLakeExporter {
             ),
             OtapArrowRecords::Traces(_) => return Err(LakeError::Unsupported("traces")),
         };
+        extracted.strings_repaired += otlp_repaired;
         Ok((signal, extracted))
+    }
+
+    /// Count a request whose invalid UTF-8 was repaired; log it at most once per second.
+    fn note_repaired(&mut self, strings: u64) {
+        if let Some(m) = self.metrics.as_mut() {
+            m.requests_repaired.inc();
+            m.strings_repaired.add(strings);
+        }
+        let now = Instant::now();
+        if self
+            .repair_logged
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+        {
+            self.repair_logged = Some(now);
+            otel_warn!(
+                "parquet_lake.request.repaired",
+                message = "invalid UTF-8 replaced with U+FFFD; logged at most once per second",
+                strings = strings
+            );
+        }
     }
 
     /// Refuse a request permanently: the identical bytes would be refused again.
@@ -556,6 +654,9 @@ impl ParquetLakeExporter {
         {
             m.timestamps_out_of_range
                 .add(extracted.timestamps_out_of_range);
+        }
+        if extracted.strings_repaired > 0 {
+            self.note_repaired(extracted.strings_repaired);
         }
         let seq = st.pending.admit(token, Instant::now());
         let done = self.push_chunks(st, seq, signal, extracted.chunks.into());

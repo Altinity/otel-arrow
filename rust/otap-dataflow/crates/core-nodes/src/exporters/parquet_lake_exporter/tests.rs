@@ -45,8 +45,9 @@ use super::config::LakeConfig;
 use super::extract::extract_logs;
 use super::schema::Schemas;
 use super::test_fixtures::{
-    kv, logs_payload, logs_request, metrics_payload, sized_logs_payload, sized_logs_request,
-    to_otap,
+    BAD, REPAIRED, corrupt_utf8, every_string_logs, every_string_metrics, kv, logs_payload,
+    logs_request, metrics_payload, metrics_request, nested_body_logs_request, sized_logs_payload,
+    sized_logs_request, to_otap,
 };
 use super::test_store::{Faults, TestStore, list_paths};
 use super::window::TestWallClock;
@@ -292,6 +293,45 @@ fn series_ids(batches: &[RecordBatch]) -> HashSet<Vec<u8>> {
             (0..a.len()).map(move |i| a.value(i).to_vec())
         })
         .collect()
+}
+
+/// Every non-null string cell of `batches`: Utf8 columns, dictionaries that cast to Utf8, and the
+/// keys and values of map columns.
+fn all_strings(batches: &[RecordBatch]) -> Vec<String> {
+    fn collect(array: &arrow::array::ArrayRef, out: &mut Vec<String>) {
+        match array.data_type() {
+            arrow::datatypes::DataType::Utf8 => {
+                out.extend(array.as_string::<i32>().iter().flatten().map(str::to_owned))
+            }
+            arrow::datatypes::DataType::Dictionary(_, _) => {
+                if let Ok(plain) = arrow::compute::cast(array, &arrow::datatypes::DataType::Utf8) {
+                    collect(&plain, out);
+                }
+            }
+            arrow::datatypes::DataType::Map(_, _) => {
+                let map = array.as_map();
+                collect(map.keys(), out);
+                collect(map.values(), out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for batch in batches {
+        for column in batch.columns() {
+            collect(column, &mut out);
+        }
+    }
+    out
+}
+
+/// Every string cell of every file in `store`.
+async fn written_strings(store: &dyn ObjectStore) -> Vec<String> {
+    let mut out = Vec::new();
+    for path in list_paths(store).await {
+        out.extend(all_strings(&batches(read(store, &path).await)));
+    }
+    out
 }
 
 fn matching<'a>(paths: &'a [String], part: &str) -> Vec<&'a String> {
@@ -645,13 +685,14 @@ fn shutdown_with_expired_deadline_nacks_without_encoding() {
 }
 
 /// Scenario: A logs request and a metrics request are flushed when their window ends.
-/// Guarantees: The four datasets are written under `v=1/signal=<s>/dataset=<d>/date=2026-09-30/hour=10/`; the files read back with exactly the schemas of the format (names, types, nullability); every values series_id has a series row in its partition; each written series_id is XXH3-128 of the written identity_bytes; files carry `format_version` 1.
+/// Guarantees: The four datasets are written under `v=1/signal=<s>/dataset=<d>/date=2026-09-30/hour=10/`; the files read back with exactly the schemas of the format (names, types, nullability); every values series_id has a series row in its partition; each written series_id is XXH3-128 of the written identity_bytes; files carry `format_version` 1; valid input counts no repair.
 #[test]
 fn logs_and_metrics_write_four_datasets() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store: Arc<dyn ObjectStore> = Arc::new(TestStore::new(dir.path(), Faults::default()));
     let runtime = TestRuntime::new();
     let (exp, _clock) = exporter(&runtime, &config(dir.path(), json!({})), store.clone());
+    let registry = runtime.metrics_registry();
     runtime
         .set_exporter(exp)
         .run_test(move |ctx| async move {
@@ -717,6 +758,13 @@ fn logs_and_metrics_write_four_datasets() {
                 }
             }
             assert_coverage(store.as_ref()).await;
+            let m = lake_metrics(&registry);
+            assert_eq!(
+                m.get("requests.repaired").copied().unwrap_or(0),
+                0,
+                "{m:?}"
+            );
+            assert_eq!(m.get("strings.repaired").copied().unwrap_or(0), 0, "{m:?}");
         });
 }
 
@@ -845,7 +893,7 @@ fn metrics_without_univariate_root_are_refused() {
     let store: Arc<dyn ObjectStore> = Arc::new(TestStore::new(dir.path(), Faults::default()));
     let runtime = TestRuntime::new();
     let (exp, _clock) = exporter(&runtime, &config(dir.path(), json!({})), store.clone());
-    let full = super::test_fixtures::metrics_otap(&super::test_fixtures::metrics_request());
+    let full = super::test_fixtures::metrics_otap(&metrics_request());
     let OtapArrowRecords::Metrics(_) = &full else {
         panic!("metrics records");
     };
@@ -879,13 +927,14 @@ fn metrics_without_univariate_root_are_refused() {
 }
 
 /// Scenario: A logs request carries bytes that are not a valid OTLP request, and another carries a valid but empty request.
-/// Guarantees: The malformed request is refused with a permanent Nack instead of being acknowledged with nothing written, while the valid empty request is still acknowledged.
+/// Guarantees: The malformed request is refused with a permanent Nack whose reason carries prost's decode error and that counts as invalid content (not as other), instead of being acknowledged with nothing written, while the valid empty request is still acknowledged.
 #[test]
 fn malformed_otlp_is_refused_but_empty_request_is_acked() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store: Arc<dyn ObjectStore> = Arc::new(TestStore::new(dir.path(), Faults::default()));
     let runtime = TestRuntime::new();
     let (exp, _clock) = exporter(&runtime, &config(dir.path(), json!({})), store.clone());
+    let registry = runtime.metrics_registry();
     runtime
         .set_exporter(exp)
         .run_test(move |ctx| async move {
@@ -911,7 +960,18 @@ fn malformed_otlp_is_refused_but_empty_request_is_acked() {
             assert!(permanent);
             assert_eq!(*cause, NackCause::Refused);
             assert!(reason.contains("malformed"), "{reason}");
+            assert!(
+                reason.contains("malformed OTLP request: failed to decode Protobuf message"),
+                "{reason}"
+            );
             assert!(list_paths(store.as_ref()).await.is_empty());
+            let m = lake_metrics(&registry);
+            assert_eq!(m.get("requests.refused.invalid"), Some(&1), "{m:?}");
+            assert_eq!(
+                m.get("requests.refused.other").copied().unwrap_or(0),
+                0,
+                "{m:?}"
+            );
         });
 }
 
@@ -925,10 +985,20 @@ fn truncated_otlp_request_is_refused_not_partially_accepted() {
     assert!(bytes.len() > 8);
     let truncated =
         OtlpProtoBytes::ExportLogsRequest(Bytes::copy_from_slice(&bytes[..bytes.len() - 4]));
-    let err = super::validate_otlp_request(&truncated).expect_err("truncated is refused");
-    assert!(matches!(err, super::LakeError::Conversion(_)), "{err}");
-    super::validate_otlp_request(&OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes)))
-        .expect("the intact request validates");
+    let err =
+        super::validate_otlp_request(&truncated, usize::MAX).expect_err("truncated is refused");
+    assert!(
+        matches!(&err, super::LakeError::Invalid(m) if m.starts_with("malformed OTLP request")),
+        "{err}"
+    );
+    assert!(
+        super::validate_otlp_request(
+            &OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes)),
+            usize::MAX
+        )
+        .expect("the intact request validates")
+        .is_none()
+    );
 }
 
 /// Scenario: An OTLP logs request carries one more attributed log record than the converter's
@@ -962,12 +1032,17 @@ fn otlp_logs_beyond_u16_attributed_records_are_refused() {
         OtlpProtoBytes::ExportLogsRequest(Bytes::from(req.encode_to_vec()))
     };
     let over = super::MAX_U16_ENTRIES as u64 + 1;
-    let err = super::validate_otlp_request(&make(over)).expect_err("too many attributed records");
+    let err = super::validate_otlp_request(&make(over), usize::MAX)
+        .expect_err("too many attributed records");
     assert!(
         matches!(&err, super::LakeError::Invalid(m) if m.contains("log records with attributes")),
         "{err}"
     );
-    super::validate_otlp_request(&make(8)).expect("a small request validates");
+    assert!(
+        super::validate_otlp_request(&make(8), usize::MAX)
+            .expect("a small request validates")
+            .is_none()
+    );
 }
 
 /// Scenario: A logs and a metrics request share one generation, and the logs values put is held by a closed gate that opens later.
@@ -1560,4 +1635,251 @@ async fn closed_admission_holds_the_bounded_terms() {
             assert_eq!(m.cache_entries.get(), 0, "nothing landed yet");
         })
         .await;
+}
+
+/// Scenario: an OTLP logs request whose every string field holds three invalid UTF-8 bytes is validated without a size limit.
+/// Guarantees: It is repaired, not refused: the returned request is the prost encoding of the repaired message, with the number of corrupted strings.
+#[test]
+fn invalid_utf8_request_is_repaired_by_validation() {
+    let mut bytes = every_string_logs(BAD).encode_to_vec();
+    let corrupted = corrupt_utf8(&mut bytes);
+    let raw = OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes));
+    let (fixed, strings) = super::validate_otlp_request(&raw, usize::MAX)
+        .expect("repaired, not refused")
+        .expect("the request changed");
+    assert_eq!(strings, corrupted);
+    assert_eq!(
+        fixed.as_bytes(),
+        every_string_logs(REPAIRED).encode_to_vec().as_slice()
+    );
+}
+
+/// Scenario: requests with invalid UTF-8 that are also truncated, carry a schema URL with the wrong wire type, nest 1,000 arrays deep, or are not a complete protobuf message at all.
+/// Guarantees: Each is refused as invalid content whose reason starts with "malformed OTLP request" and carries prost's description; none is repaired.
+#[test]
+fn malformed_requests_with_invalid_utf8_are_still_refused() {
+    let mut bytes = every_string_logs(BAD).encode_to_vec();
+    let _ = corrupt_utf8(&mut bytes);
+    let mut wrong_type = bytes.clone();
+    wrong_type.extend_from_slice(&[0x0a, 0x02, 0x18, 0x05]);
+    for (name, case) in [
+        ("truncated", bytes[..bytes.len() - 4].to_vec()),
+        ("wrong wire type", wrong_type),
+        ("too deep", nested_body_logs_request(1_000)),
+        ("garbage", vec![0x0a, 0x05, b'h', b'i', 0xff, 0xff]),
+    ] {
+        let raw = OtlpProtoBytes::ExportLogsRequest(Bytes::from(case));
+        let err = super::validate_otlp_request(&raw, usize::MAX).expect_err(name);
+        assert!(
+            matches!(&err, super::LakeError::Invalid(m)
+                if m.starts_with("malformed OTLP request: failed to decode Protobuf message")),
+            "{name}: {err}"
+        );
+    }
+}
+
+/// Scenario: an OTLP logs request with 65,536 attributed log records, one of whose attribute values holds invalid UTF-8.
+/// Guarantees: The repaired request still goes through the u16 entry check and is refused with the reason naming the count, so a repair never bypasses that check.
+#[test]
+fn repaired_request_is_checked_for_u16_entries() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
+        LogRecord, ResourceLogs, ScopeLogs,
+    };
+    let n = super::MAX_U16_ENTRIES as u64 + 1;
+    let log_records = (0..n)
+        .map(|i| LogRecord {
+            time_unix_nano: i + 1,
+            attributes: vec![kv(
+                "k",
+                if i == 0 {
+                    BAD.to_owned()
+                } else {
+                    "v".to_owned()
+                },
+            )],
+            ..Default::default()
+        })
+        .collect();
+    let req = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut bytes = req.encode_to_vec();
+    assert_eq!(corrupt_utf8(&mut bytes), 1);
+    let raw = OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes));
+    let err =
+        super::validate_otlp_request(&raw, usize::MAX).expect_err("too many attributed records");
+    assert!(
+        matches!(&err, super::LakeError::Invalid(m) if m.contains("log records with attributes")),
+        "{err}"
+    );
+}
+
+/// Scenario: a corrupted OTLP logs request is validated with `ingress.max_request_bytes` equal to its own size; repair grows each three-byte invalid sequence to nine bytes.
+/// Guarantees: The repaired request is refused as too large, naming the setting and the limit; without a limit it is repaired.
+#[test]
+fn repaired_request_above_max_request_bytes_is_refused() {
+    let mut bytes = every_string_logs(BAD).encode_to_vec();
+    let _ = corrupt_utf8(&mut bytes);
+    let limit = bytes.len();
+    let raw = OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes));
+    let err =
+        super::validate_otlp_request(&raw, limit).expect_err("repaired size exceeds the limit");
+    assert!(
+        matches!(
+            &err,
+            super::LakeError::TooLarge { setting: "ingress.max_request_bytes", limit: l, .. }
+                if *l == limit
+        ),
+        "{err}"
+    );
+    assert!(
+        super::validate_otlp_request(&raw, usize::MAX)
+            .expect("repaired")
+            .is_some()
+    );
+}
+
+/// Scenario: An OTLP logs request whose every string field (resource, scope, record, entity ref, and a kvlist key and array item nested in a body and in a record attribute) holds three invalid UTF-8 bytes, next to one clean record, is sent to the exporter.
+/// Guarantees: The request is acknowledged once, not refused; the files hold each corrupted string with U+FFFD in place of every invalid byte, including the nested ones in the rendered body and in the `attrs` map value, and the clean record's body unchanged; requests.repaired is 1 and strings.repaired equals the number of corrupted strings.
+#[test]
+fn invalid_utf8_logs_are_repaired_and_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStore> = Arc::new(TestStore::new(dir.path(), Faults::default()));
+    let runtime = TestRuntime::new();
+    let (exp, _clock) = exporter(&runtime, &config(dir.path(), json!({})), store.clone());
+    let registry = runtime.metrics_registry();
+    let mut bytes = every_string_logs(BAD).encode_to_vec();
+    let corrupted = corrupt_utf8(&mut bytes);
+    let payload: OtapPayload = OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes)).into();
+    runtime
+        .set_exporter(exp)
+        .run_test(move |ctx| async move {
+            ctx.send_pdata(subscribed(payload)).await.expect("send");
+            ctx.sleep(Duration::from_millis(200)).await;
+            ctx.send_shutdown(deadline_in(1_000), "test")
+                .await
+                .expect("shutdown");
+        })
+        .run_validation(move |mut ctx, result| async move {
+            result.expect("exporter terminates cleanly");
+            let out = drain(&mut ctx);
+            assert_eq!(out.acks, 1, "{:?}", out.nacks);
+            assert!(out.nacks.is_empty(), "{:?}", out.nacks);
+            let written = written_strings(store.as_ref()).await;
+            for prefix in [
+                "body",
+                "string_body.severity",
+                "string_body.event",
+                "string_body.key",
+                "string_body.value",
+                "kvlist_body.severity",
+                "kvlist_body.event",
+                "kvlist_body.key",
+                "kvlist_body.value",
+                "resource.key",
+                "resource.value",
+                "resource.schema",
+                "scope.name",
+                "scope.version",
+                "scope.key",
+                "scope.value",
+                "scope.schema",
+            ] {
+                let want = format!("{prefix}{REPAIRED}");
+                assert!(
+                    written.iter().any(|s| s.contains(&want)),
+                    "{want} not in {written:?}"
+                );
+            }
+            let nested_key = format!("nested.key{REPAIRED}");
+            let nested_item = format!("nested.item{REPAIRED}");
+            assert!(
+                written
+                    .iter()
+                    .any(|s| s.contains(&nested_key) && s.contains(&nested_item)),
+                "{written:?}"
+            );
+            // The same nesting inside a record attribute: pdata CBOR `ser` cell -> decode -> render.
+            let attr_key = format!("nested.attr.key{REPAIRED}");
+            let attr_item = format!("nested.attr.item{REPAIRED}");
+            assert!(
+                written
+                    .iter()
+                    .any(|s| s.contains(&attr_key) && s.contains(&attr_item)),
+                "{written:?}"
+            );
+            assert!(written.iter().any(|s| s == "clean"), "{written:?}");
+            let m = lake_metrics(&registry);
+            assert_eq!(m.get("requests.repaired"), Some(&1), "{m:?}");
+            assert_eq!(m.get("strings.repaired"), Some(&corrupted), "{m:?}");
+        });
+}
+
+/// Scenario: An OTLP metrics request whose every string field (resource, scope, metric name, unit, description, metadata, data-point attributes of all five kinds, exemplar attributes) holds three invalid UTF-8 bytes is sent to the exporter.
+/// Guarantees: It is acknowledged once and written; for each of the six metrics (two gauges, sum, histogram, exponential histogram, summary) the name, unit, description and the data-point attribute key and value carry the U+FFFD replacement, as do the resource and scope strings; requests.repaired is 1 and strings.repaired equals the number of corrupted strings. Exemplar attributes and metric metadata are not stored by this writer; their repair is covered by the rewriter's exact-output test.
+#[test]
+fn invalid_utf8_metrics_are_repaired_and_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStore> = Arc::new(TestStore::new(dir.path(), Faults::default()));
+    let runtime = TestRuntime::new();
+    let (exp, _clock) = exporter(&runtime, &config(dir.path(), json!({})), store.clone());
+    let registry = runtime.metrics_registry();
+    let mut bytes = every_string_metrics(BAD).encode_to_vec();
+    let corrupted = corrupt_utf8(&mut bytes);
+    let payload: OtapPayload = OtlpProtoBytes::ExportMetricsRequest(Bytes::from(bytes)).into();
+    let names: Vec<String> = metrics_request()
+        .resource_metrics
+        .iter()
+        .flat_map(|r| &r.scope_metrics)
+        .flat_map(|s| &s.metrics)
+        .map(|m| format!("{}{REPAIRED}", m.name))
+        .collect();
+    runtime
+        .set_exporter(exp)
+        .run_test(move |ctx| async move {
+            ctx.send_pdata(subscribed(payload)).await.expect("send");
+            ctx.sleep(Duration::from_millis(200)).await;
+            ctx.send_shutdown(deadline_in(1_000), "test")
+                .await
+                .expect("shutdown");
+        })
+        .run_validation(move |mut ctx, result| async move {
+            result.expect("exporter terminates cleanly");
+            let out = drain(&mut ctx);
+            assert_eq!(out.acks, 1, "{:?}", out.nacks);
+            assert!(out.nacks.is_empty(), "{:?}", out.nacks);
+            let written = written_strings(store.as_ref()).await;
+            let has = |want: &str| written.iter().any(|s| s == want);
+            assert_eq!(names.len(), 6, "one metric per kind, gauge twice");
+            for (i, name) in names.iter().enumerate() {
+                assert!(has(name), "{name} not in {written:?}");
+                for field in ["unit", "description", "point.key", "point.value"] {
+                    let want = format!("metric{i}.{field}{REPAIRED}");
+                    assert!(has(&want), "{want} not in {written:?}");
+                }
+            }
+            for prefix in [
+                "resource.key",
+                "resource.value",
+                "resource.schema",
+                "scope.name",
+                "scope.version",
+                "scope.key",
+                "scope.value",
+                "scope.schema",
+            ] {
+                let want = format!("{prefix}{REPAIRED}");
+                assert!(has(&want), "{want} not in {written:?}");
+            }
+            let m = lake_metrics(&registry);
+            assert_eq!(m.get("requests.repaired"), Some(&1), "{m:?}");
+            assert_eq!(m.get("strings.repaired"), Some(&corrupted), "{m:?}");
+        });
 }

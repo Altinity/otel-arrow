@@ -43,7 +43,8 @@ fn invalid(msg: &str) -> LakeError {
 ///
 /// The decoded tree is charged to `budget` while it is built (one node per value plus string,
 /// byte and key content), so a small cell of many tiny items is refused before it expands far
-/// beyond its size.
+/// beyond its size. Text strings and map keys that are not UTF-8 are repaired per chunk (each
+/// invalid sequence becomes U+FFFD) and counted in `budget`.
 pub fn decode_cbor(
     bytes: &[u8],
     max_depth: usize,
@@ -190,30 +191,38 @@ impl CborReader<'_, '_> {
     }
 
     /// The content of a bytes or text item whose header gave `len`. An indefinite item is the
-    /// concatenation of its chunks of the same kind; a nested indefinite chunk is flattened.
+    /// concatenation of its chunks of the same kind; a nested indefinite chunk is flattened. A text
+    /// chunk that is not UTF-8 on its own is repaired on its own (each invalid sequence becomes
+    /// U+FFFD; RFC 8949 requires every chunk to be valid by itself), and a text item with a
+    /// repaired chunk counts once in the budget's repaired strings.
     fn content(&mut self, len: Option<usize>, text: bool) -> Result<Vec<u8>, LakeError> {
         use ciborium_ll::Header;
         let mut out = Vec::new();
-        let Some(len) = len else {
+        let mut repaired = false;
+        if let Some(len) = len {
+            repaired = self.chunk(&mut out, len, text)?;
+        } else {
             let mut open = 1_usize;
             while open > 0 {
                 match (self.header()?, text) {
                     (Header::Break, _) => open -= 1,
                     (Header::Bytes(None), false) | (Header::Text(None), true) => open += 1,
                     (Header::Bytes(Some(n)), false) | (Header::Text(Some(n)), true) => {
-                        self.chunk(&mut out, n, text)?;
+                        repaired |= self.chunk(&mut out, n, text)?;
                     }
                     _ => return Err(invalid("cbor decode: malformed chunk")),
                 }
             }
-            return Ok(out);
-        };
-        self.chunk(&mut out, len, text)?;
+        }
+        if repaired {
+            self.budget.note_repaired();
+        }
         Ok(out)
     }
 
-    /// Append one chunk of `n` bytes to `out`; a text chunk must be UTF-8 on its own.
-    fn chunk(&mut self, out: &mut Vec<u8>, n: usize, text: bool) -> Result<(), LakeError> {
+    /// Append one chunk of `n` bytes to `out`. A text chunk that is not UTF-8 is replaced by its
+    /// lossy decoding, and the growth is charged; returns whether it was.
+    fn chunk(&mut self, out: &mut Vec<u8>, n: usize, text: bool) -> Result<bool, LakeError> {
         use ciborium_io::Read as _;
         self.fits_input(n, 1)?;
         self.budget.charge(n)?;
@@ -222,10 +231,14 @@ impl CborReader<'_, '_> {
         self.decoder
             .read_exact(&mut out[start..])
             .map_err(|_| invalid("cbor decode: truncated chunk"))?;
-        if text && std::str::from_utf8(&out[start..]).is_err() {
-            return Err(invalid("cbor decode: text is not UTF-8"));
+        if !text || std::str::from_utf8(&out[start..]).is_ok() {
+            return Ok(false);
         }
-        Ok(())
+        let fixed = String::from_utf8_lossy(&out[start..]).into_owned();
+        self.budget.charge(fixed.len().saturating_sub(n))?;
+        out.truncate(start);
+        out.extend_from_slice(fixed.as_bytes());
+        Ok(true)
     }
 
     /// A tag 2 or 3 bignum of at most 16 bytes, as an `i64`.
@@ -425,5 +438,41 @@ mod tests {
         let value = decode_cbor(&cell, 4, &mut budget).expect("decodes");
         assert!(matches!(value, Value::Array(items) if items.len() == n));
         assert!(budget.used() >= n * size_of::<Value>(), "{}", budget.used());
+    }
+
+    /// Scenario: CBOR text that is not UTF-8: a definite string `c3 28`, an indefinite string whose two chunks split one code point (`c3` | `a9`), and a map key `ff`.
+    /// Guarantees: Each decodes with every invalid sequence replaced by U+FFFD (per chunk for the indefinite string), and each text item counts one repaired string.
+    #[test]
+    fn invalid_utf8_text_is_repaired() {
+        let mut budget = Budget::new(1 << 20);
+        let v = decode_cbor(&[0x62, 0xc3, 0x28], 4, &mut budget).expect("repaired");
+        assert!(matches!(&v, Value::Str(s) if s == "\u{FFFD}("), "{v:?}");
+        assert_eq!(budget.repaired(), 1);
+        let v =
+            decode_cbor(&[0x7f, 0x61, 0xc3, 0x61, 0xa9, 0xff], 4, &mut budget).expect("repaired");
+        assert!(
+            matches!(&v, Value::Str(s) if s == "\u{FFFD}\u{FFFD}"),
+            "{v:?}"
+        );
+        assert_eq!(budget.repaired(), 2);
+        let v = decode_cbor(&[0xa1, 0x61, 0xff, 0x01], 4, &mut budget).expect("repaired");
+        assert!(
+            matches!(&v, Value::KvList(kvs) if kvs.len() == 1 && kvs[0].0 == "\u{FFFD}"),
+            "{v:?}"
+        );
+        assert_eq!(budget.repaired(), 3);
+    }
+
+    /// Scenario: a CBOR map whose keys `ff` and `fe` differ only in invalid bytes.
+    /// Guarantees: Both keys repair to U+FFFD and so are duplicates: the item is invalid content, as for any duplicate key.
+    #[test]
+    fn keys_equal_after_repair_are_duplicates() {
+        let err = decode_cbor(
+            &[0xa2, 0x61, 0xff, 0x01, 0x61, 0xfe, 0x02],
+            4,
+            &mut Budget::new(1 << 20),
+        )
+        .expect_err("duplicate key");
+        assert!(matches!(err, LakeError::Invalid(_)), "{err}");
     }
 }

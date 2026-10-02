@@ -97,6 +97,9 @@ pub struct Extracted {
     pub bytes: usize,
     /// Bytes charged to the request budget.
     pub charged: usize,
+    /// String values whose invalid UTF-8 was replaced with U+FFFD: repaired during extraction
+    /// (OTAP CBOR text, Binary string columns) plus, set by the node, the OTLP repair.
+    pub strings_repaired: u64,
 }
 
 fn invalid(msg: &str) -> LakeError {
@@ -558,6 +561,7 @@ pub fn extract_logs(
     };
     split(values, &ids, &mut series_rows, limits, &mut out)?;
     out.charged = budget.used();
+    out.strings_repaired = budget.repaired();
     Ok(out)
 }
 
@@ -1043,6 +1047,7 @@ pub fn extract_metrics(
     }
     out.timestamps_out_of_range = out_of_range;
     out.charged = budget.used();
+    out.strings_repaired = budget.repaired();
     Ok(out)
 }
 
@@ -2287,5 +2292,88 @@ mod tests {
             .collect();
         assert_eq!(ids.iter().filter(|id| *id == "a100").count(), 500);
         assert_eq!(ids.iter().filter(|id| *id == "b100").count(), 500);
+    }
+
+    /// An array attribute `list` holding one string.
+    fn list_kv() -> KeyValue {
+        KeyValue {
+            key: "list".into(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::ArrayValue(ArrayValue {
+                    values: vec![AnyValue {
+                        value: Some(any_value::Value::StringValue("x".into())),
+                    }],
+                })),
+            }),
+        }
+    }
+
+    /// Replace every non-null `ser` cell of the resource attributes by `81 62 c3 28`: a CBOR array
+    /// holding one text string that is not UTF-8.
+    fn corrupt_resource_ser(otap: &mut OtapArrowRecords) {
+        let batch = otap
+            .get(ArrowPayloadType::ResourceAttrs)
+            .expect("resource attributes")
+            .clone();
+        let ser = col(&batch, consts::ATTRIBUTE_SER).expect("ser column");
+        let plain = cast(ser, &DataType::Binary).expect("binary");
+        let cells: BinaryArray = plain
+            .as_binary::<i32>()
+            .iter()
+            .map(|cell| cell.map(|_| &[0x81_u8, 0x62, 0xc3, 0x28][..]))
+            .collect();
+        let cells: ArrayRef = Arc::new(cells);
+        let column = cast(&cells, ser.data_type()).expect("cast back");
+        replace_column(
+            otap,
+            ArrowPayloadType::ResourceAttrs,
+            consts::ATTRIBUTE_SER,
+            column,
+        );
+    }
+
+    /// Scenario: OTAP logs and metrics batches carry one resource with an array attribute `list`; its CBOR `ser` cell is then replaced by an array holding the non-UTF-8 text `c3 28`.
+    /// Guarantees: Before the replacement each extraction reports 0 repaired strings. After it, extraction succeeds for both signals, the series row renders `list` with U+FFFD in place of the invalid byte, and `Extracted::strings_repaired` is 1, so OTAP-side repairs reach the node's counters.
+    #[test]
+    fn otap_repairs_are_reported_in_extracted() {
+        let rendered = |out: &Extracted| {
+            map_entries(&out.chunks[0].series.rows, "resource_attrs", 0)
+                .into_iter()
+                .find(|(key, _)| key == "list")
+                .expect("list attribute")
+                .1
+        };
+
+        let mut req = logs_request(2, 1, 0);
+        req.resource_logs[0]
+            .resource
+            .as_mut()
+            .expect("resource")
+            .attributes
+            .push(list_kv());
+        let mut otap = to_otap(&req);
+        let clean = extract_logs(&otap, &Schemas::new(), &limits(), "host.id").expect("extract");
+        assert_eq!(clean.strings_repaired, 0);
+        corrupt_resource_ser(&mut otap);
+        let out = extract_logs(&otap, &Schemas::new(), &limits(), "host.id")
+            .expect("repaired, not refused");
+        assert_eq!(out.strings_repaired, 1);
+        assert!(rendered(&out).contains("\u{FFFD}("), "{}", rendered(&out));
+
+        let mut req = metrics_request();
+        req.resource_metrics[0]
+            .resource
+            .as_mut()
+            .expect("resource")
+            .attributes
+            .push(list_kv());
+        let mut otap = metrics_otap(&req);
+        let clean = extract_metrics(&otap, &Schemas::new(), &limits(), "host.id").expect("extract");
+        assert_eq!(clean.strings_repaired, 0);
+        corrupt_resource_ser(&mut otap);
+        let out = extract_metrics(&otap, &Schemas::new(), &limits(), "host.id")
+            .expect("repaired, not refused");
+        assert_eq!(out.strings_repaired, 1);
+        assert!(rendered(&out).contains("\u{FFFD}("), "{}", rendered(&out));
     }
 }
