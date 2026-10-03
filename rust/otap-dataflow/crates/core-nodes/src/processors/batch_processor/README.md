@@ -62,7 +62,19 @@ config:
 
   # Output format: "otap", "otlp", or "preserve" (default: preserve).
   format: preserve
+
+  # Isolation of the inputs of a merged output that is refused permanently
+  # (see "Refused batches" below).
+  isolation:
+    enabled: true                 # default: true
+    max_retained_bytes: 67108864  # default: 64 MiB, per signal and per format
 ```
+
+`isolation.max_retained_bytes` bounds the copies of in-flight inputs kept for
+a re-send. The budget applies per signal and per format, so with
+`format: preserve` one processor instance can hold up to 6 x 64 MiB = 384 MiB
+of copies, per core. Nothing is kept when `max_batch_duration` is `0s`, because
+every input is then flushed alone and no output is ever shared.
 
 Each format object contains:
 
@@ -150,12 +162,51 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 | `otap.processor.batch.nacked_inbound_slots` | `{msg}` | Number of requests nacked due to inbound slot exhaustion. |
 | `otap.processor.batch.nacked_outbound_slots` | `{msg}` | Number of requests nacked due to outbound slot exhaustion. |
 | `otap.processor.batch.split_budget_fallbacks` | `{entry}` | Number of oversize resource entries emitted whole because splitting would have exceeded `max_split_fragments`, `max_split_overhead_bytes`, or the per-flush `max_split_fragments_per_flush` threshold. |
+| `otap.processor.batch.inputs_isolated` | `{request}` | Inputs re-sent alone because a merged output holding their data was refused permanently. |
+| `otap.processor.batch.isolation_fallbacks` | `{request}` | Inputs of a permanently refused merged output that were not re-sent (not kept because of the retention budget, or the re-send could not start) and got a retryable Nack instead. |
+| `otap.processor.batch.isolation_retained_bytes` | `By` | Bytes of inputs currently kept for an isolating re-send. |
 
 ### Events
 
 | Event | Severity | Description |
 | --- | --- | --- |
 | *None* | N/A | No node-specific events are emitted. |
+
+## Refused batches
+
+A merged output is judged by the downstream as one request. When an exporter
+refuses it permanently (for example `exporter:parquet_lake` refusing malformed
+bytes, duplicate attribute keys or a size limit), that refusal is not proof
+against any single input: one invalid request from one producer would
+otherwise refuse every producer whose data shares the output.
+
+With `isolation.enabled` (the default), each input that requested Ack/Nack
+keeps a copy of its payload while it is in flight (reference-counted, within
+`isolation.max_retained_bytes`). When an output that holds data of more than
+one input is refused permanently, each of those inputs is re-sent alone, split
+by `max_size` as usual, and receives the outcome of its own send. Only the
+input that is refused on its own is refused permanently; the others are acked
+when their solo output lands. Each input is re-sent at most once.
+
+- An input that was not kept (budget exhausted) gets a retryable Nack with the
+  downstream cause instead, so its producer retries rather than drops it. These
+  are counted in `isolation_fallbacks`.
+- Inputs without Ack/Nack interest are never kept: they were acknowledged on
+  arrival and have no one to report to.
+- A permanent refusal of an output that holds one input only, and every
+  retryable refusal, is relayed as today, with no re-send.
+- An input split across several outputs is re-sent whole, so fragments that
+  already landed are written again (at-least-once).
+- A producer that keeps sending invalid requests causes one extra send per
+  input that shares a batch with them; `inputs_isolated` shows the rate.
+- A solo re-send that cannot be routed (no outbound slot) or sent is not
+  emitted; the input gets a retryable Nack.
+- Isolation starts on any permanent refusal, whatever its cause. With a
+  `processor:retry` downstream that uses `exhaustion_action: mark_permanent`,
+  an outage that outlasts the retry window turns every merged output into a
+  permanent refusal, so every contributor is re-sent alone and retried again
+  (one extra send per input, about twice the latency, copies held longer).
+  Prefer the retry processor's default exhaustion action in that topology.
 
 ## Limits
 

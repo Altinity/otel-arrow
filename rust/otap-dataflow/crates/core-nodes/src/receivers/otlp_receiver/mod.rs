@@ -3793,6 +3793,18 @@ mod tests {
                         .and_then(|value| value.to_str().ok()),
                     expected_pushback
                 );
+                // The detail must survive the wire: a real client reads it from the trailer.
+                // The transient refusal is the early saturation refusal, which has no known
+                // delay; the oversized refusal must stay non-retryable.
+                let expected_retry_delay = if oversized {
+                    None
+                } else {
+                    Some(Duration::ZERO)
+                };
+                assert_eq!(
+                    otel_arrow_dfe_otap::retry_info::retry_delay(&status),
+                    expected_retry_delay
+                );
                 if !oversized {
                     assert_eq!(authorization_calls.load(Ordering::Relaxed), 0);
                 }
@@ -3957,14 +3969,15 @@ mod tests {
 
     /// Scenario: an OTLP gRPC request reaches a saturated bucket before its weight is known.
     /// Guarantees: the client receives a generic resource-exhausted response without
-    /// request-specific pushback, and neither authorization nor admission runs.
+    /// request-specific pushback but with a zero-delay RetryInfo, so it is retryable for OTLP
+    /// clients, and neither authorization nor admission runs.
     #[test]
     fn test_otlp_grpc_transient_rate_limit_rejection() {
         run_otlp_grpc_rate_limit_rejection_test(false);
     }
 
     /// Scenario: an OTLP gRPC request is larger than the configured burst.
-    /// Guarantees: the client receives non-retryable pushback and the request is not admitted.
+    /// Guarantees: the client receives non-retryable pushback without RetryInfo and the request is not admitted.
     #[test]
     fn test_otlp_grpc_oversized_rate_limit_rejection() {
         run_otlp_grpc_rate_limit_rejection_test(true);

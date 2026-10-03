@@ -13,6 +13,7 @@ use std::task::Poll;
 
 use crate::accessory::slots::{Key as SlotKey, State as SlotsState};
 use crate::pdata::{Context, OtapPdata};
+use crate::retry_info::grpc_concurrency_limit_status;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::{Request, Response};
@@ -286,9 +287,7 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                     .map(|mut state| state.allocate(|| oneshot::channel()))
                 {
                     Err(_) => return Err(Status::internal("Mutex poisoned")),
-                    Ok(None) => {
-                        return Err(Status::resource_exhausted("Too many concurrent requests"));
-                    }
+                    Ok(None) => return Err(grpc_concurrency_limit_status()),
                     Ok(Some(pair)) => pair,
                 };
 

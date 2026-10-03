@@ -26,7 +26,11 @@
 //! This component should be installed before any retry processor
 //! (i.e., only retry after batching). This component does not support
 //! Interests::RETURN_DATA because (a) more memory required, (b) forces
-//! whole-request retry (instead of partial).
+//! whole-request retry (instead of partial). Instead it keeps a copy of
+//! each input that requested Ack/Nack (within
+//! `isolation.max_retained_bytes`): when a merged output is refused
+//! permanently, each of those inputs is re-sent alone, so only an invalid
+//! input is refused.
 
 otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = OTAP_BATCH_PROCESSOR_URN,
@@ -44,7 +48,7 @@ use otel_arrow_dfe_engine::{
     ConsumerEffectHandlerExtension, Interests, LocalWakeupRequirements,
     ProcessorRuntimeRequirements, ProducerEffectHandlerExtension,
     config::ProcessorConfig,
-    control::{AckMsg, CallData, NackMsg, NodeControlMsg, WakeupSlot},
+    control::{AckMsg, CallData, NackCause, NackMsg, NodeControlMsg, WakeupSlot},
     error::{Error as EngineError, ProcessorErrorKind},
     local::processor as local,
     message::Message,
@@ -61,7 +65,7 @@ use otel_arrow_dfe_pdata::{
     otap::batching::make_item_batches,
     otlp::batching::{BytesBatches, make_bytes_batches_owned},
 };
-use otel_arrow_dfe_telemetry::instrument::{Counter, Mmsc};
+use otel_arrow_dfe_telemetry::instrument::{Counter, Gauge, Mmsc};
 use otel_arrow_dfe_telemetry::metrics::MetricSet;
 use otel_arrow_dfe_telemetry_macros::metric_set;
 use serde::{Deserialize, Serialize};
@@ -240,6 +244,41 @@ pub struct Config {
     /// to batch OTAP and OTLP separately.
     #[serde(default = "default_batching_format")]
     pub format: BatchingFormat,
+
+    /// Isolation of the inputs of a merged output that is refused permanently: each subscribed
+    /// input is re-sent alone, so only an invalid input is refused.
+    #[serde(default)]
+    pub isolation: IsolationConfig,
+}
+
+/// Settings of [`Config::isolation`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct IsolationConfig {
+    /// Re-send the subscribed inputs of a permanently refused merged output alone.
+    #[serde(default = "default_isolation_enabled")]
+    pub enabled: bool,
+    /// Largest total size, in bytes, of the inputs kept for a re-send, per signal and format. An
+    /// input that does not fit is not kept; when its merged output is refused permanently it gets a
+    /// retryable Nack instead. 0 keeps nothing.
+    #[serde(default = "default_isolation_max_retained_bytes")]
+    pub max_retained_bytes: usize,
+}
+
+const fn default_isolation_enabled() -> bool {
+    true
+}
+
+const fn default_isolation_max_retained_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+impl Default for IsolationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_isolation_enabled(),
+            max_retained_bytes: default_isolation_max_retained_bytes(),
+        }
+    }
 }
 
 const fn default_otap_min_size_items() -> Option<NonZeroUsize> {
@@ -345,6 +384,7 @@ impl Default for Config {
             inbound_request_limit: default_inbound_request_limit(),
             outbound_request_limit: default_outbound_request_limit(),
             format: default_batching_format(),
+            isolation: IsolationConfig::default(),
         }
     }
 }
@@ -469,11 +509,28 @@ struct SignalBatches<T: OtapPayloadHelpers> {
 }
 
 /// Per-input wait context, including the arriving request's context.
-struct BatchContext {
+struct BatchContext<T> {
     /// Original request context.
     ctx: Context,
     /// Number of outbounds
     outbound: usize,
+    /// A copy of the input kept for an isolating re-send, while it fits the retention budget.
+    retained: Option<T>,
+    /// Bytes charged to the retention budget for `retained`.
+    retained_bytes: usize,
+    /// Peer address of the input, for the outputs of a re-send.
+    peer_addr: Option<SocketAddr>,
+    /// Whether the input was already re-sent alone; its outcome is then final.
+    isolated: bool,
+}
+
+/// The inputs routed through one output.
+struct Outbound {
+    /// Portions of the subscribed inputs in this output.
+    parts: Vec<BatchPortion>,
+    /// Whether the output holds data of more than one input, counting inputs without Ack/Nack
+    /// interest.
+    shared: bool,
 }
 
 /// Portion of input wait context
@@ -512,11 +569,14 @@ struct SignalBuffer<T: OtapPayloadHelpers> {
 
     /// Map of inbound requests.  This contains a limited number of pending request
     /// contexts with details for the impl to notify after an outcome is available.
-    inbound: SlotState<BatchContext>,
+    inbound: SlotState<BatchContext<T>>,
 
     /// Map of outbound requests.  This contains the assignments from each input
     /// batch, each a corresponding (maybe partial) inbound context.
-    outbound: SlotState<Vec<BatchPortion>>,
+    outbound: SlotState<Outbound>,
+
+    /// Bytes of inputs kept for an isolating re-send (`BatchContext::retained`).
+    retained_bytes: usize,
 
     /// Arrival time of the oldest data. This is reset whenever the number in the
     /// pending Inputs becomes non-empty.
@@ -613,6 +673,17 @@ pub struct BatchProcessorMetrics {
     /// splitting them would have exceeded the configured fragment budget.
     #[metric(unit = "{entry}")]
     split_budget_fallbacks: Counter<u64>,
+
+    /// Inputs re-sent alone because a merged output holding their data was refused permanently.
+    #[metric(unit = "{request}")]
+    inputs_isolated: Counter<u64>,
+    /// Inputs of a permanently refused merged output that were not re-sent (not kept because of
+    /// the retention budget, or the re-send could not start) and got a retryable Nack instead.
+    #[metric(unit = "{request}")]
+    isolation_fallbacks: Counter<u64>,
+    /// Bytes of inputs kept for an isolating re-send, set when telemetry is collected.
+    #[metric(unit = "By")]
+    isolation_retained_bytes: Gauge<u64>,
 }
 
 fn nzu_to_nz64(nz: Option<NonZeroUsize>) -> Option<NonZeroU64> {
@@ -908,7 +979,7 @@ impl Batcher<OtlpProtoBytes> for SignalBuffer<OtlpProtoBytes> {
     }
 }
 
-impl<'a, T: OtapPayloadHelpers> BatchProcessorSignal<'a, T>
+impl<'a, T: OtapPayloadHelpers + Clone> BatchProcessorSignal<'a, T>
 where
     SignalBuffer<T>: Batcher<T>,
 {
@@ -937,13 +1008,25 @@ where
 
         // Retain contexts needed for Ack/Nack routing or metrics unwinding.
         let inkey = if ctx.needs_completion_tracking() {
-            let slot = self
-                .buffer
-                .inbound
-                .allocate_with_data(BatchContext { ctx, outbound: 0 });
+            // Only an input with Ack/Nack interest has someone to report a re-send to; a context
+            // kept for metrics unwinding alone is not worth a copy.
+            let (retained, retained_bytes) = if ctx.has_ack_or_nack_subscribers() {
+                self.buffer.retain(self.config, &payload)
+            } else {
+                (None, 0)
+            };
+            let slot = self.buffer.inbound.allocate_with_data(BatchContext {
+                ctx,
+                outbound: 0,
+                retained,
+                retained_bytes,
+                peer_addr,
+                isolated: false,
+            });
 
             match slot {
                 Err(bctx) => {
+                    self.buffer.release(bctx.retained_bytes);
                     self.metrics.nacked_inbound_slots.inc();
                     let refused = OtapPdata::new(bctx.ctx, payload.into());
                     // Note: Failure to Ack/Nack is an engine-level error.
@@ -1076,7 +1159,12 @@ where
                 self.metrics.batching_errors.add(count as u64);
                 log_batching_failed(effect, self.signal, &e).await;
                 let str = e.to_string();
-                let res = Err(str.clone());
+                // A local batching failure is an internal, retryable error.
+                let res = Err(NackClass {
+                    reason: str.clone(),
+                    permanent: false,
+                    cause: NackCause::Unspecified,
+                });
                 // In this case, we are sending failure to all the pending inputs.
                 self.buffer
                     .handle_partial_responses(self.signal, effect, &res, inputs.context)
@@ -1161,7 +1249,8 @@ where
 
             // If any inputs require completion tracking, get an outbound slot
             // and subscribe so their contexts can unwind after this output.
-            let (routed_ctxs, merged_peer) = self.buffer.drain_context(weight, &mut input_context);
+            let (routed_ctxs, merged_peer, contributors) =
+                self.buffer.drain_context(weight, &mut input_context);
             // Forward the receiver-observed peer address only when every
             // input merged into this output batch came from the same peer
             // (see Context::merge_peer_addr). Mixed-peer batches leave
@@ -1169,13 +1258,18 @@ where
             if let Some(addr) = merged_peer {
                 pdata.set_peer_addr(addr);
             }
-            if let Some(ctxs) = routed_ctxs {
-                match self.buffer.outbound.allocate_with_data(ctxs) {
-                    Err(ctxs) => {
-                        for bp in ctxs {
+            if let Some(parts) = routed_ctxs {
+                let outbound = Outbound {
+                    parts,
+                    shared: contributors > 1,
+                };
+                match self.buffer.outbound.allocate_with_data(outbound) {
+                    Err(outbound) => {
+                        for bp in outbound.parts {
                             if let Some(inkey) = bp.inkey
                                 && let Some(batch) = self.buffer.inbound.take(inkey)
                             {
+                                self.buffer.release(batch.retained_bytes);
                                 self.metrics.nacked_outbound_slots.inc();
                                 // Note: Failure to Ack/Nack is an engine-level error.
                                 effect
@@ -1219,21 +1313,250 @@ where
         signal: SignalType,
         calldata: CallData,
         effect: &mut local::EffectHandler<OtapPdata>,
-        res: &Result<(), String>,
+        res: &Result<(), NackClass>,
     ) -> Result<(), EngineError> {
         let outkey: SlotKey = calldata.try_into()?;
 
-        if let Some(parts) = self.buffer.outbound.take(outkey) {
-            self.buffer
-                .handle_partial_responses(signal, effect, res, parts)
-                .await?;
+        if let Some(outbound) = self.buffer.outbound.take(outkey) {
+            let refused_permanently = matches!(res, Err(info) if info.permanent);
+            if self.config.isolation.enabled && outbound.shared && refused_permanently {
+                self.isolate(effect, res, outbound.parts).await?;
+            } else {
+                self.buffer
+                    .handle_partial_responses(signal, effect, res, outbound.parts)
+                    .await?;
+            }
         }
 
         Ok(())
     }
+
+    /// Handles a permanent refusal of an output that holds data of more than one input. The refusal
+    /// is not proof against any single input, so each subscribed input still waiting is re-sent
+    /// alone and resolved by that send; an input without a kept copy gets a retryable Nack instead,
+    /// so its producer retries rather than drops it. Every listed input is resolved even when a
+    /// re-send fails; the first engine error is returned after the loop.
+    async fn isolate(
+        &mut self,
+        effect: &mut local::EffectHandler<OtapPdata>,
+        res: &Result<(), NackClass>,
+        parts: Vec<BatchPortion>,
+    ) -> Result<(), EngineError> {
+        // `handle` calls this only for a permanent Nack; an Ok here would leave every listed input
+        // unresolved, so it is resolved as a retryable Nack instead of being dropped.
+        let fallback = NackClass {
+            reason: "batch outcome lost".to_owned(),
+            permanent: false,
+            cause: NackCause::Unspecified,
+        };
+        let refusal = match res {
+            Err(refusal) => refusal,
+            Ok(()) => {
+                debug_assert!(false, "isolate called without a refusal");
+                &fallback
+            }
+        };
+        let mut first_error = None;
+        for part in parts {
+            let Some(inkey) = part.inkey else {
+                continue;
+            };
+            // Already resolved, or already isolated through an earlier portion or output.
+            let Some(mut batch) = self.buffer.inbound.take(inkey) else {
+                continue;
+            };
+            self.buffer.release(batch.retained_bytes);
+            batch.retained_bytes = 0;
+            let result = match batch.retained.take() {
+                Some(payload) if !batch.isolated => {
+                    self.resend_alone(effect, batch, payload, refusal).await
+                }
+                _ => {
+                    // An isolated input's outcome is final; an input without a copy must not be
+                    // refused permanently for another input's data.
+                    let permanent = batch.isolated;
+                    if !permanent {
+                        self.metrics.isolation_fallbacks.inc();
+                    }
+                    self.nack_input(effect, batch, &refusal.reason, refusal.cause, permanent)
+                        .await
+                }
+            };
+            if let Err(e) = result {
+                let _ = first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Re-sends one input alone: batches it without other inputs (so `max_size` still splits it)
+    /// and sends the outputs with routes that list only this input. The input moves to a new
+    /// inbound slot, so responses to its earlier outputs no longer reach it. Every failure resolves
+    /// the input with a retryable Nack.
+    async fn resend_alone(
+        &mut self,
+        effect: &mut local::EffectHandler<OtapPdata>,
+        mut batch: BatchContext<T>,
+        payload: T,
+        refusal: &NackClass,
+    ) -> Result<(), EngineError> {
+        if self.fmtcfg.sizer.batch_size(&payload).is_err() {
+            self.metrics.isolation_fallbacks.inc();
+            return self
+                .nack_input(effect, batch, &refusal.reason, refusal.cause, false)
+                .await;
+        }
+        batch.isolated = true;
+        batch.outbound = 0;
+        let inkey = match self.buffer.inbound.allocate_with_data(batch) {
+            Ok(inkey) => inkey,
+            // Not expected: the caller has just freed this input's slot.
+            Err(batch) => {
+                self.metrics.isolation_fallbacks.inc();
+                return self
+                    .nack_input(effect, batch, &refusal.reason, refusal.cause, false)
+                    .await;
+            }
+        };
+        let output = match SignalBuffer::<T>::make_batches(self.fmtcfg, self.signal, vec![payload])
+        {
+            Ok(output) => output,
+            Err(e) => {
+                self.metrics.batching_errors.inc();
+                self.metrics.isolation_fallbacks.inc();
+                log_batching_failed(effect, self.signal, &e).await;
+                return self
+                    .fail_alone(effect, inkey, &e.to_string(), refusal.cause)
+                    .await;
+            }
+        };
+        if output.budget_fallbacks > 0 {
+            self.metrics
+                .split_budget_fallbacks
+                .add(output.budget_fallbacks);
+        }
+        self.emit_alone(effect, inkey, output.batches, refusal.cause)
+            .await
+    }
+
+    /// Sends the outputs of an input re-sent alone. Unlike a flush, an output that cannot be routed
+    /// back to the input (no outbound slot) is not sent, because it holds only this input's data:
+    /// the input gets a retryable Nack and its later outputs are not sent. A failed send also
+    /// resolves the input before the engine error is returned.
+    async fn emit_alone(
+        &mut self,
+        effect: &mut local::EffectHandler<OtapPdata>,
+        inkey: SlotKey,
+        output_batches: Vec<(T, usize)>,
+        cause: NackCause,
+    ) -> Result<(), EngineError> {
+        // An input with a positive weight always batches to at least one output.
+        debug_assert!(
+            !output_batches.is_empty(),
+            "re-send of an input without outputs"
+        );
+        if output_batches.is_empty() {
+            self.metrics.isolation_fallbacks.inc();
+            return self
+                .fail_alone(effect, inkey, "re-send produced no output", cause)
+                .await;
+        }
+        let mut sent = 0_u64;
+        for (records, ownership) in output_batches {
+            let Some(batch) = self.buffer.inbound.get_mut(inkey) else {
+                // Resolved by a failure of an earlier output.
+                break;
+            };
+            batch.outbound += 1;
+            let peer_addr = batch.peer_addr;
+            let parts = vec![BatchPortion::new(Some(inkey), peer_addr, ownership)];
+            let outbound = Outbound {
+                parts,
+                shared: false,
+            };
+            let Ok(outkey) = self.buffer.outbound.allocate_with_data(outbound) else {
+                self.metrics.nacked_outbound_slots.inc();
+                if sent == 0 {
+                    self.metrics.isolation_fallbacks.inc();
+                }
+                return self
+                    .fail_alone(effect, inkey, "outbound routes exhausted", cause)
+                    .await;
+            };
+            let mut pdata = OtapPdata::new(Context::default(), records.into());
+            if let Some(addr) = peer_addr {
+                pdata.set_peer_addr(addr);
+            }
+            effect.subscribe_to(
+                Interests::NACKS | Interests::ACKS,
+                outkey.into(),
+                &mut pdata,
+            );
+            if let Err(e) = effect.send_message_with_source_node(pdata).await {
+                let _ = self.buffer.outbound.take(outkey);
+                if sent == 0 {
+                    self.metrics.isolation_fallbacks.inc();
+                }
+                self.fail_alone(effect, inkey, "re-send failed", cause)
+                    .await?;
+                return Err(e.into());
+            }
+            sent += 1;
+            if sent == 1 {
+                self.metrics.inputs_isolated.inc();
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves an input that is being re-sent alone with a retryable Nack, if it is still waiting.
+    async fn fail_alone(
+        &mut self,
+        effect: &mut local::EffectHandler<OtapPdata>,
+        inkey: SlotKey,
+        reason: &str,
+        cause: NackCause,
+    ) -> Result<(), EngineError> {
+        match self.buffer.inbound.take(inkey) {
+            Some(batch) => {
+                self.buffer.release(batch.retained_bytes);
+                self.nack_input(effect, batch, reason, cause, false).await
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Nacks one input with `reason` and `cause`, permanently or not.
+    async fn nack_input(
+        &mut self,
+        effect: &mut local::EffectHandler<OtapPdata>,
+        batch: BatchContext<T>,
+        reason: &str,
+        cause: NackCause,
+        permanent: bool,
+    ) -> Result<(), EngineError> {
+        let rdata = OtapPdata::new(batch.ctx, SignalBuffer::<T>::empty(self.signal).into());
+        let nack = if permanent {
+            NackMsg::new_permanent_with_cause(reason.to_owned(), rdata, cause)
+        } else {
+            NackMsg::new_with_cause(reason.to_owned(), rdata, cause)
+        };
+        effect.notify_nack(nack).await
+    }
 }
 
 impl BatchProcessor {
+    /// Bytes of inputs kept for an isolating re-send, over every format and signal.
+    fn retained_bytes(&self) -> u64 {
+        fn sum<T: OtapPayloadHelpers>(signals: Option<&SignalBatches<T>>) -> usize {
+            signals.map_or(0, |s| {
+                s.logs.retained_bytes + s.metrics.retained_bytes + s.traces.retained_bytes
+            })
+        }
+        let total = sum(self.otap_signals.as_ref()) + sum(self.otlp_signals.as_ref());
+        u64::try_from(total).unwrap_or(u64::MAX)
+    }
+
     async fn handle_ack(
         &mut self,
         effect: &mut local::EffectHandler<OtapPdata>,
@@ -1248,7 +1571,11 @@ impl BatchProcessor {
         effect: &mut local::EffectHandler<OtapPdata>,
         nack: NackMsg<OtapPdata>,
     ) -> Result<(), EngineError> {
-        let res = Err(nack.reason);
+        let res = Err(NackClass {
+            reason: nack.reason,
+            permanent: nack.permanent,
+            cause: nack.cause,
+        });
         self.handle_response(*nack.refused, nack.unwind.route.calldata, effect, &res)
             .await
     }
@@ -1258,7 +1585,7 @@ impl BatchProcessor {
         retdata: OtapPdata,
         calldata: CallData,
         effect: &mut local::EffectHandler<OtapPdata>,
-        res: &Result<(), String>,
+        res: &Result<(), NackClass>,
     ) -> Result<(), EngineError> {
         if calldata.is_empty() {
             return Ok(());
@@ -1283,6 +1610,16 @@ impl BatchProcessor {
             None => Err(Self::no_active_format_error()),
         }
     }
+}
+
+/// The classification of a downstream NACK, carried back through the batch response path. Without
+/// it a split inbound request would be re-NACKed as a retryable `Unspecified` failure even when the
+/// downstream NACK was permanent (for example a `Refused`), and the producer would keep retrying a
+/// request that will always be refused.
+struct NackClass {
+    reason: String,
+    permanent: bool,
+    cause: NackCause,
 }
 
 /// Factory function to create a batch processor.
@@ -1331,6 +1668,8 @@ impl local::Processor<OtapPdata> for BatchProcessor {
                         .map_err(|e| EngineError::InternalError {
                             message: e.to_string(),
                         })?;
+                    let retained = self.retained_bytes();
+                    self.metrics.isolation_retained_bytes.set(retained);
                     metrics_reporter.report(&mut self.metrics).map_err(|e| {
                         EngineError::InternalError {
                             message: e.to_string(),
@@ -1494,9 +1833,35 @@ where
             inputs: Inputs::default(),
             inbound: SlotState::new(cfg.inbound_request_limit.get()),
             outbound: SlotState::new(cfg.outbound_request_limit.get()),
+            retained_bytes: 0,
             arrival: None,
             wakeup_armed: false,
         }
+    }
+
+    /// A copy of `payload` for an isolating re-send, and the bytes charged for it: `(None, 0)` when
+    /// isolation is disabled, when every input is flushed alone (`max_batch_duration` 0, so no
+    /// output is ever shared), or when the copy does not fit the remaining budget.
+    fn retain(&mut self, config: &Config, payload: &T) -> (Option<T>, usize)
+    where
+        T: Clone,
+    {
+        if !config.isolation.enabled || config.max_batch_duration == Duration::ZERO {
+            return (None, 0);
+        }
+        let bytes = payload.retained_memory_bytes();
+        match self.retained_bytes.checked_add(bytes) {
+            Some(total) if total <= config.isolation.max_retained_bytes => {
+                self.retained_bytes = total;
+                (Some(payload.clone()), bytes)
+            }
+            _ => (None, 0),
+        }
+    }
+
+    /// Returns `bytes` of a released copy to the retention budget.
+    const fn release(&mut self, bytes: usize) {
+        self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
     }
 
     /// Takes the residual batch, used in case the final output is less than
@@ -1549,13 +1914,16 @@ where
         &mut self,
         mut weight: usize,
         contexts: &mut MultiContext,
-    ) -> (Option<Vec<BatchPortion>>, Option<SocketAddr>) {
+    ) -> (Option<Vec<BatchPortion>>, Option<SocketAddr>, usize) {
         let mut out = Vec::new();
         // Track every contributing portion's peer_addr, even ones that do not
         // route ack/nack, so the merged output `peer_addr` is correct when
         // some (or all) inputs had no subscribers. Folded incrementally to
         // avoid allocating a `Vec` on every flush.
         let mut peer_merger = PeerAddrMerger::new();
+        // Inputs (subscribed or not) whose data is in this output: an output with more than one is
+        // shared, and a permanent refusal of it is not proof against any single one of them.
+        let mut contributors = 0;
 
         while weight > 0 && contexts.pos < contexts.inputs.len() {
             let bp = contexts.inputs.get_mut(contexts.pos).expect("valid");
@@ -1563,6 +1931,7 @@ where
             let take = bp.weight.min(weight);
             bp.weight -= take;
             weight -= take;
+            contributors += 1;
             let peer_addr = bp.peer_addr;
             peer_merger.push(peer_addr);
 
@@ -1581,7 +1950,7 @@ where
 
         let merged_peer = peer_merger.finish();
         let routed = (!out.is_empty()).then_some(out);
-        (routed, merged_peer)
+        (routed, merged_peer, contributors)
     }
 
     /// Handles a response, returning an Ack or Nack conditionally when
@@ -1592,7 +1961,7 @@ where
         &mut self,
         signal: SignalType,
         effect: &mut local::EffectHandler<OtapPdata>,
-        res: &Result<(), String>,
+        res: &Result<(), NackClass>,
         parts: Vec<BatchPortion>,
     ) -> Result<(), EngineError> {
         for part in parts {
@@ -1608,11 +1977,25 @@ where
                     }
                 });
                 if let Some(mut batch) = removed {
+                    self.release(batch.retained_bytes);
                     let rdata =
                         OtapPdata::new(std::mem::take(&mut batch.ctx), OtapPayload::empty(signal));
 
-                    if let Err(err) = res {
-                        effect.notify_nack(NackMsg::new(err, rdata)).await?;
+                    if let Err(info) = res {
+                        // Preserve the downstream NACK's permanence and cause, so a permanently
+                        // refused request (for example NackCause::Refused) is relayed upstream as
+                        // permanent rather than retryable; otherwise the producer keeps retrying a
+                        // request that will always be refused.
+                        let nack = if info.permanent {
+                            NackMsg::new_permanent_with_cause(
+                                info.reason.clone(),
+                                rdata,
+                                info.cause,
+                            )
+                        } else {
+                            NackMsg::new_with_cause(info.reason.clone(), rdata, info.cause)
+                        };
+                        effect.notify_nack(nack).await?;
                     } else {
                         effect.notify_ack(AckMsg::new(rdata)).await?;
                     }
@@ -3654,6 +4037,87 @@ mod tests {
             .validate(|_| async {});
     }
 
+    /// Scenario: an oversize single resource splits into several fragments; the last fragment is
+    /// NACKed permanently with cause Refused while the others are acked.
+    ///
+    /// Guarantees: the inbound request is NACKed exactly once and the NACK keeps the downstream
+    /// classification (permanent, cause Refused) instead of being downgraded to a retryable,
+    /// unspecified NACK, so a producer is not told to retry a request that will always be refused.
+    #[test]
+    fn test_permanent_fragment_nack_is_relayed_permanent() {
+        let (_telemetry_registry, _metrics_reporter, phase) = setup_test_runtime(json!({
+            "otlp": {
+                "min_size": null,
+                "max_size": 100,
+                "sizer": "bytes",
+            },
+            "format": "otlp",
+            "max_batch_duration": "0s",
+        }));
+
+        phase
+            .run_test(move |mut ctx| async move {
+                let (pipeline_completion_tx, mut pipeline_completion_rx) =
+                    pipeline_completion_msg_channel(16);
+                ctx.set_pipeline_completion_sender(pipeline_completion_tx);
+
+                let bytes = single_resource_logs_bytes(8);
+                let pdata = OtapPdata::new_default(bytes.into()).test_subscribe_to(
+                    Interests::ACKS | Interests::NACKS,
+                    TestCallData::new_with(0, 0).into(),
+                    1,
+                );
+                ctx.process(Message::PData(pdata))
+                    .await
+                    .expect("process input");
+
+                let outputs = ctx.drain_pdata().await;
+                assert!(outputs.len() > 1, "oversize resource must split");
+
+                // Refuse the last fragment permanently; ack the rest.
+                let last = outputs.len() - 1;
+                for (i, out) in outputs.into_iter().enumerate() {
+                    if i == last {
+                        ctx.process(Message::Control(NodeControlMsg::Nack(
+                            next_nack(NackMsg::new_permanent_with_cause(
+                                "downstream refused",
+                                out,
+                                NackCause::Refused,
+                            ))
+                            .expect("has subs")
+                            .1,
+                        )))
+                        .await
+                        .expect("process nack");
+                    } else {
+                        ctx.process(Message::Control(NodeControlMsg::Ack(
+                            next_ack(AckMsg::new(out)).expect("has subs").1,
+                        )))
+                        .await
+                        .expect("process ack");
+                    }
+                }
+
+                let mut nacks = Vec::new();
+                while let Ok(msg) = pipeline_completion_rx.try_recv() {
+                    match msg {
+                        PipelineCompletionMsg::DeliverNack { nack } => nacks.push(nack),
+                        PipelineCompletionMsg::DeliverAck { .. } => {
+                            panic!("input must not be acked when a fragment is refused")
+                        }
+                    }
+                }
+                assert_eq!(nacks.len(), 1, "input must be nacked exactly once");
+                assert!(nacks[0].permanent, "permanent flag must be preserved");
+                assert_eq!(
+                    nacks[0].cause,
+                    NackCause::Refused,
+                    "cause must be preserved"
+                );
+            })
+            .validate(|_| async {});
+    }
+
     /// Scenario: a single oversize `ResourceLogs` would split into more
     /// fragments than the configured `max_split_fragments` budget allows.
     ///
@@ -4237,5 +4701,601 @@ mod tests {
                 );
             })
             .validate(|_| async {});
+    }
+
+    // ---- Isolation of a permanently refused merged output ----
+
+    /// OTLP logs request bytes holding `ids.len()` resource entries, entry `k` carrying the three
+    /// markers of `create_marked_logs(ids[k])`.
+    fn marked_logs_bytes(ids: &[usize]) -> OtlpProtoBytes {
+        let resource_logs = ids
+            .iter()
+            .flat_map(|&id| match create_marked_logs(id) {
+                OtlpProtoMessage::Logs(logs) => logs.resource_logs,
+                _ => unreachable!("marked logs"),
+            })
+            .collect();
+        otlp_message_to_bytes(&OtlpProtoMessage::Logs(LogsData { resource_logs }))
+    }
+
+    /// The marker ids (`create_marked_logs` ids) present in an output.
+    fn marker_ids(output: &OtapPdata) -> std::collections::BTreeSet<usize> {
+        extract_log_markers(&otap_pdata_to_message(output))
+            .into_iter()
+            .map(|t| ((t - 1_000_000_000) / 1000) as usize)
+            .collect()
+    }
+
+    /// Outcome delivered upstream for one subscribed input.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Outcome {
+        Ack,
+        Nack { permanent: bool, cause: NackCause },
+    }
+
+    /// Simulated downstream for the isolation tests: every output holding a marker of `poison` is
+    /// refused permanently with cause Refused, every other output is acked, until no output is
+    /// left. Returns the number of outputs answered.
+    async fn answer_outputs(
+        ctx: &mut otel_arrow_dfe_engine::testing::processor::TestContext<OtapPdata>,
+        poison: usize,
+    ) -> usize {
+        let mut seen = 0;
+        loop {
+            let outputs = ctx.drain_pdata().await;
+            if outputs.is_empty() {
+                return seen;
+            }
+            seen += outputs.len();
+            for out in outputs {
+                let msg = if marker_ids(&out).contains(&poison) {
+                    NodeControlMsg::Nack(
+                        next_nack(NackMsg::new_permanent_with_cause(
+                            "downstream refused",
+                            out,
+                            NackCause::Refused,
+                        ))
+                        .expect("has subs")
+                        .1,
+                    )
+                } else {
+                    NodeControlMsg::Ack(next_ack(AckMsg::new(out)).expect("has subs").1)
+                };
+                ctx.process(Message::Control(msg))
+                    .await
+                    .expect("process response");
+            }
+        }
+    }
+
+    /// Collects the outcomes delivered upstream, by input (`TestCallData::new_with(id, 0)`).
+    fn collect_outcomes(
+        rx: &mut otel_arrow_dfe_engine::control::PipelineCompletionMsgReceiver<OtapPdata>,
+    ) -> std::collections::BTreeMap<u64, Vec<Outcome>> {
+        let mut out: std::collections::BTreeMap<u64, Vec<Outcome>> =
+            std::collections::BTreeMap::new();
+        while let Ok(msg) = rx.try_recv() {
+            let (calldata, outcome) = match msg {
+                // A completion for a context without Ack/Nack interest (metrics unwinding only)
+                // has no subscriber and no outcome to record.
+                PipelineCompletionMsg::DeliverAck { ack } => {
+                    let Some((_, ack)) = next_ack(ack) else {
+                        continue;
+                    };
+                    (ack.unwind.route.calldata, Outcome::Ack)
+                }
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    let Some((_, nack)) = next_nack(nack) else {
+                        continue;
+                    };
+                    let outcome = Outcome::Nack {
+                        permanent: nack.permanent,
+                        cause: nack.cause,
+                    };
+                    (nack.unwind.route.calldata, outcome)
+                }
+            };
+            let calldata: TestCallData = calldata.try_into().expect("test calldata");
+            let id = (0..=u64::from(u8::MAX))
+                .find(|&id| TestCallData::new_with(id, 0) == calldata)
+                .expect("input id");
+            out.entry(id).or_default().push(outcome);
+        }
+        out
+    }
+
+    /// A subscribed OTLP logs input with marker `id`, routed back as `TestCallData::new_with(id, 0)`.
+    fn subscribed_input(id: usize, bytes: OtlpProtoBytes) -> OtapPdata {
+        OtapPdata::new_default(bytes.into()).test_subscribe_to(
+            Interests::ACKS | Interests::NACKS,
+            TestCallData::new_with(id as u64, 0).into(),
+            1,
+        )
+    }
+
+    async fn fire_timers(
+        ctx: &mut otel_arrow_dfe_engine::testing::processor::TestContext<OtapPdata>,
+    ) {
+        let when = Instant::now() + Duration::from_secs(1);
+        for slot in all_wakeup_slots() {
+            ctx.process(Message::Control(NodeControlMsg::Wakeup {
+                slot,
+                when,
+                revision: 0,
+            }))
+            .await
+            .expect("process wakeup");
+        }
+    }
+
+    fn otlp_isolation_config(extra: Value) -> Value {
+        let mut cfg = json!({
+            "otlp": {"min_size": null, "max_size": 1_048_576, "sizer": "bytes"},
+            "format": "otlp",
+            "max_batch_duration": "1s",
+        });
+        if let (Value::Object(a), Value::Object(b)) = (&mut cfg, extra) {
+            a.extend(b);
+        }
+        cfg
+    }
+
+    const PERMANENT_REFUSED: Outcome = Outcome::Nack {
+        permanent: true,
+        cause: NackCause::Refused,
+    };
+    const RETRYABLE_REFUSED: Outcome = Outcome::Nack {
+        permanent: false,
+        cause: NackCause::Refused,
+    };
+
+    /// Scenario: 21 subscribed OTLP logs inputs from different producers are merged into one output; the downstream refuses that output permanently because input 0 is invalid, then accepts every re-sent input except input 0.
+    /// Guarantees: Inputs 1 to 20 are acked exactly once, input 0 gets exactly one permanent Nack with the downstream cause, every input was re-sent alone (22 outputs in total, 21 isolated), so one invalid request no longer refuses other producers' data.
+    #[test]
+    fn isolation_refuses_only_the_invalid_input_otlp() {
+        let (telemetry_registry, metrics_reporter, phase) =
+            setup_test_runtime(otlp_isolation_config(json!({})));
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                for id in 0..21 {
+                    ctx.process(Message::PData(subscribed_input(
+                        id,
+                        marked_logs_bytes(&[id]),
+                    )))
+                    .await
+                    .expect("process input");
+                }
+                assert!(
+                    ctx.drain_pdata().await.is_empty(),
+                    "nothing flushes before the timer"
+                );
+                fire_timers(&mut ctx).await;
+                let seen = answer_outputs(&mut ctx, 0).await;
+                assert_eq!(seen, 22, "one merged output plus 21 solo outputs");
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 21, "{outcomes:?}");
+                assert_eq!(outcomes[&0], vec![PERMANENT_REFUSED]);
+                for id in 1..21 {
+                    assert_eq!(outcomes[&id], vec![Outcome::Ack], "input {id}");
+                }
+                ctx.process(Message::Control(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter,
+                }))
+                .await
+                .expect("collect telemetry");
+            })
+            .validate(move |_| async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(
+                    counter_metric_value(
+                        &telemetry_registry,
+                        "otap.processor.batch",
+                        "inputs.isolated"
+                    ),
+                    21
+                );
+                assert_eq!(
+                    counter_metric_value(
+                        &telemetry_registry,
+                        "otap.processor.batch",
+                        "isolation.fallbacks"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    counter_metric_value(
+                        &telemetry_registry,
+                        "otap.processor.batch",
+                        "isolation.retained.bytes"
+                    ),
+                    0,
+                    "every kept copy is released once its input is resolved"
+                );
+            });
+    }
+
+    /// Scenario: an input that carries only metric interest (no Ack/Nack subscriber) is merged with a subscribed input, and the merged output is refused permanently.
+    /// Guarantees: The metrics-only input is not kept for a re-send (nothing to report to), so it is not re-sent and the retained budget stays at the subscribed input's size; the subscribed input is isolated as usual.
+    #[test]
+    fn metrics_only_input_is_not_kept() {
+        let (telemetry_registry, metrics_reporter, phase) =
+            setup_test_runtime(otlp_isolation_config(json!({})));
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                let metrics_only = OtapPdata::new_default(marked_logs_bytes(&[0]).into())
+                    .test_subscribe_to(
+                        Interests::NODE_METRICS,
+                        TestCallData::new_with(0, 0).into(),
+                        1,
+                    );
+                ctx.process(Message::PData(metrics_only))
+                    .await
+                    .expect("process metrics-only input");
+                ctx.process(Message::PData(subscribed_input(1, marked_logs_bytes(&[1]))))
+                    .await
+                    .expect("process input");
+                fire_timers(&mut ctx).await;
+                let seen = answer_outputs(&mut ctx, 0).await;
+                assert_eq!(
+                    seen, 2,
+                    "the merged output and input 1 alone; input 0 is not re-sent"
+                );
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+                assert_eq!(outcomes[&1], vec![Outcome::Ack]);
+                ctx.process(Message::Control(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter,
+                }))
+                .await
+                .expect("collect telemetry");
+            })
+            .validate(move |_| async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(
+                    counter_metric_value(
+                        &telemetry_registry,
+                        "otap.processor.batch",
+                        "inputs.isolated"
+                    ),
+                    1
+                );
+            });
+    }
+
+    /// Scenario: the same 21 producers send OTAP (Arrow records) inputs that are merged into one output; the downstream refuses it permanently because of input 0 and accepts every re-sent input except input 0.
+    /// Guarantees: Isolation works for the OTAP format as for OTLP bytes: inputs 1 to 20 are acked once, input 0 gets one permanent Nack.
+    #[test]
+    fn isolation_refuses_only_the_invalid_input_otap() {
+        let (_telemetry_registry, _metrics_reporter, phase) = setup_test_runtime(json!({
+            "otap": {"min_size": null, "max_size": 100_000, "sizer": "items"},
+            "max_batch_duration": "1s",
+        }));
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                for id in 0..21 {
+                    let OtlpProtoMessage::Logs(logs) = create_marked_logs(id) else {
+                        unreachable!("marked logs");
+                    };
+                    let records = encode_logs_otap_batch(&logs).expect("encode logs");
+                    let pdata = OtapPdata::new_default(records.into()).test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        TestCallData::new_with(id as u64, 0).into(),
+                        1,
+                    );
+                    ctx.process(Message::PData(pdata))
+                        .await
+                        .expect("process input");
+                }
+                fire_timers(&mut ctx).await;
+                let seen = answer_outputs(&mut ctx, 0).await;
+                assert_eq!(seen, 22, "one merged output plus 21 solo outputs");
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 21, "{outcomes:?}");
+                assert_eq!(outcomes[&0], vec![PERMANENT_REFUSED]);
+                for id in 1..21 {
+                    assert_eq!(outcomes[&id], vec![Outcome::Ack], "input {id}");
+                }
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: the invalid input 0 is sent without Ack/Nack interest and is merged with the subscribed input 1; the downstream refuses the merged output permanently and accepts input 1 alone.
+    /// Guarantees: The output counts as shared although it lists one subscribed input, so input 1 is re-sent alone and acked instead of being refused for another producer's data.
+    #[test]
+    fn unsubscribed_poison_does_not_refuse_a_subscribed_input() {
+        let (_telemetry_registry, _metrics_reporter, phase) =
+            setup_test_runtime(otlp_isolation_config(json!({})));
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                let poison = OtapPdata::new_default(marked_logs_bytes(&[0]).into());
+                ctx.process(Message::PData(poison))
+                    .await
+                    .expect("process poison");
+                ctx.process(Message::PData(subscribed_input(1, marked_logs_bytes(&[1]))))
+                    .await
+                    .expect("process input");
+                fire_timers(&mut ctx).await;
+                let seen = answer_outputs(&mut ctx, 0).await;
+                assert_eq!(seen, 2, "the merged output and input 1 alone");
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+                assert_eq!(outcomes[&1], vec![Outcome::Ack]);
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: input 10 holds four resource entries and is split by `max_size` into {10,11,12} (sent at once) and a re-buffered tail {13}; the invalid input 0 then joins the tail in a shared output. Both outputs are answered only after the timer flush: the first is acked, the shared one is refused permanently.
+    /// Guarantees: Input 10 is re-sent whole exactly once and resolved by that solo send (one Ack, no second outcome from the earlier Ack); input 0 gets exactly one permanent Nack.
+    #[test]
+    fn split_input_is_resent_whole_once() {
+        let entry = marked_logs_bytes(&[0]).as_bytes().len();
+        let (_telemetry_registry, _metrics_reporter, phase) = setup_test_runtime(json!({
+            "otlp": {"min_size": null, "max_size": 3 * entry, "sizer": "bytes"},
+            "format": "otlp",
+            "max_batch_duration": "1s",
+        }));
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                ctx.process(Message::PData(subscribed_input(
+                    10,
+                    marked_logs_bytes(&[10, 11, 12, 13]),
+                )))
+                .await
+                .expect("process input 10");
+                ctx.process(Message::PData(subscribed_input(0, marked_logs_bytes(&[0]))))
+                    .await
+                    .expect("process input 0");
+                fire_timers(&mut ctx).await;
+                let first = ctx.drain_pdata().await;
+                let ids: Vec<_> = first.iter().map(marker_ids).collect();
+                assert_eq!(ids.len(), 2, "{ids:?}");
+                assert_eq!(ids[0], [10, 11, 12].into_iter().collect(), "{ids:?}");
+                assert_eq!(ids[1], [13, 0].into_iter().collect(), "{ids:?}");
+                for out in first {
+                    let msg = if marker_ids(&out).contains(&0) {
+                        NodeControlMsg::Nack(
+                            next_nack(NackMsg::new_permanent_with_cause(
+                                "downstream refused",
+                                out,
+                                NackCause::Refused,
+                            ))
+                            .expect("has subs")
+                            .1,
+                        )
+                    } else {
+                        NodeControlMsg::Ack(next_ack(AckMsg::new(out)).expect("has subs").1)
+                    };
+                    ctx.process(Message::Control(msg))
+                        .await
+                        .expect("process response");
+                }
+                // The re-sends: input 10 alone (split again) and input 0 alone.
+                let resent = answer_outputs(&mut ctx, 0).await;
+                assert!(resent >= 2, "{resent}");
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+                assert_eq!(outcomes[&10], vec![Outcome::Ack]);
+                assert_eq!(outcomes[&0], vec![PERMANENT_REFUSED]);
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: two inputs are merged and the output is refused permanently (cause Refused) while only one outbound slot exists for the re-sends.
+    /// Guarantees: Only the solo output that got a slot is sent; the other input is resolved at once with a retryable Nack (cause kept) and counted in nacked_outbound_slots, so nothing untracked goes downstream; acking the solo output resolves the first input.
+    #[test]
+    fn resend_without_outbound_slot_is_retryable() {
+        let (telemetry_registry, metrics_reporter, phase) =
+            setup_test_runtime(otlp_isolation_config(json!({"outbound_request_limit": 1})));
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                for id in 1..=2 {
+                    ctx.process(Message::PData(subscribed_input(
+                        id,
+                        marked_logs_bytes(&[id]),
+                    )))
+                    .await
+                    .expect("process input");
+                }
+                fire_timers(&mut ctx).await;
+                let merged = ctx.drain_pdata().await;
+                assert_eq!(merged.len(), 1);
+                let merged = merged.into_iter().next().expect("merged output");
+                ctx.process(Message::Control(NodeControlMsg::Nack(
+                    next_nack(NackMsg::new_permanent_with_cause(
+                        "downstream refused",
+                        merged,
+                        NackCause::Refused,
+                    ))
+                    .expect("has subs")
+                    .1,
+                )))
+                .await
+                .expect("process nack");
+                let solo = ctx.drain_pdata().await;
+                assert_eq!(solo.len(), 1, "only one re-send has a route");
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+                let (&failed, outcome) = outcomes.iter().next().expect("one outcome");
+                assert_eq!(outcome, &vec![RETRYABLE_REFUSED]);
+                let solo = solo.into_iter().next().expect("solo output");
+                let routed = if failed == 1 { 2 } else { 1 };
+                assert_eq!(marker_ids(&solo), [routed as usize].into_iter().collect());
+                ctx.process(Message::Control(NodeControlMsg::Ack(
+                    next_ack(AckMsg::new(solo)).expect("has subs").1,
+                )))
+                .await
+                .expect("process ack");
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes[&routed], vec![Outcome::Ack]);
+                ctx.process(Message::Control(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter,
+                }))
+                .await
+                .expect("collect telemetry");
+            })
+            .validate(move |_| async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(
+                    counter_metric_value(
+                        &telemetry_registry,
+                        "otap.processor.batch",
+                        "nacked.outbound.slots"
+                    ),
+                    1
+                );
+            });
+    }
+
+    /// Scenario: the retention budget is 0, so no input is kept; three inputs are merged and the output is refused permanently because of input 0.
+    /// Guarantees: Every input gets a retryable Nack with the downstream cause (its producer retries instead of dropping), nothing is re-sent, and each input counts as an isolation fallback.
+    #[test]
+    fn over_budget_input_falls_back_to_retryable() {
+        let (telemetry_registry, metrics_reporter, phase) = setup_test_runtime(
+            otlp_isolation_config(json!({"isolation": {"max_retained_bytes": 0}})),
+        );
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                for id in 0..3 {
+                    ctx.process(Message::PData(subscribed_input(
+                        id,
+                        marked_logs_bytes(&[id]),
+                    )))
+                    .await
+                    .expect("process input");
+                }
+                fire_timers(&mut ctx).await;
+                let seen = answer_outputs(&mut ctx, 0).await;
+                assert_eq!(seen, 1, "no re-send without a kept copy");
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 3, "{outcomes:?}");
+                for id in 0..3 {
+                    assert_eq!(outcomes[&id], vec![RETRYABLE_REFUSED], "input {id}");
+                }
+                ctx.process(Message::Control(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter,
+                }))
+                .await
+                .expect("collect telemetry");
+            })
+            .validate(move |_| async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(
+                    counter_metric_value(
+                        &telemetry_registry,
+                        "otap.processor.batch",
+                        "isolation.fallbacks"
+                    ),
+                    3
+                );
+            });
+    }
+
+    /// Scenario: isolation is disabled; three inputs are merged and the output is refused permanently because of input 0.
+    /// Guarantees: Today's behavior: every input gets the permanent Nack with the downstream cause and nothing is re-sent.
+    #[test]
+    fn disabled_isolation_relays_permanently() {
+        let (_telemetry_registry, _metrics_reporter, phase) = setup_test_runtime(
+            otlp_isolation_config(json!({"isolation": {"enabled": false}})),
+        );
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                for id in 0..3 {
+                    ctx.process(Message::PData(subscribed_input(
+                        id,
+                        marked_logs_bytes(&[id]),
+                    )))
+                    .await
+                    .expect("process input");
+                }
+                fire_timers(&mut ctx).await;
+                let seen = answer_outputs(&mut ctx, 0).await;
+                assert_eq!(seen, 1);
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 3, "{outcomes:?}");
+                for id in 0..3 {
+                    assert_eq!(outcomes[&id], vec![PERMANENT_REFUSED], "input {id}");
+                }
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: two inputs are merged and the downstream refuses the output with a retryable Nack.
+    /// Guarantees: Retryable refusals are unchanged by isolation: both inputs get a retryable Nack and nothing is re-sent.
+    #[test]
+    fn retryable_refusal_of_shared_output_is_relayed_unchanged() {
+        let (_telemetry_registry, _metrics_reporter, phase) =
+            setup_test_runtime(otlp_isolation_config(json!({})));
+        phase
+            .run_test(move |mut ctx| async move {
+                let (tx, mut rx) = pipeline_completion_msg_channel(64);
+                ctx.set_pipeline_completion_sender(tx);
+                for id in 1..=2 {
+                    ctx.process(Message::PData(subscribed_input(
+                        id,
+                        marked_logs_bytes(&[id]),
+                    )))
+                    .await
+                    .expect("process input");
+                }
+                fire_timers(&mut ctx).await;
+                let merged = ctx.drain_pdata().await;
+                assert_eq!(merged.len(), 1);
+                let merged = merged.into_iter().next().expect("merged output");
+                ctx.process(Message::Control(NodeControlMsg::Nack(
+                    next_nack(NackMsg::new("downstream busy", merged))
+                        .expect("has subs")
+                        .1,
+                )))
+                .await
+                .expect("process nack");
+                assert!(ctx.drain_pdata().await.is_empty(), "no re-send");
+                let outcomes = collect_outcomes(&mut rx);
+                assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+                for id in 1..=2 {
+                    assert!(
+                        matches!(
+                            outcomes[&id][..],
+                            [Outcome::Nack {
+                                permanent: false,
+                                ..
+                            }]
+                        ),
+                        "input {id}: {:?}",
+                        outcomes[&id]
+                    );
+                }
+            })
+            .validate(|_| async {});
+    }
+
+    /// Scenario: the isolation settings are given explicitly, and the defaults are read.
+    /// Guarantees: `isolation.enabled` and `isolation.max_retained_bytes` parse; the defaults are enabled and 64 MiB.
+    #[test]
+    fn isolation_config_parses_and_defaults() {
+        let cfg: Config = serde_json::from_value(json!({
+            "isolation": {"enabled": false, "max_retained_bytes": 1024}
+        }))
+        .expect("isolation config parses");
+        assert!(!cfg.isolation.enabled);
+        assert_eq!(cfg.isolation.max_retained_bytes, 1024);
+        let default = Config::default();
+        assert!(default.isolation.enabled);
+        assert_eq!(default.isolation.max_retained_bytes, 64 * 1024 * 1024);
     }
 }

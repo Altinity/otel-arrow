@@ -1,0 +1,91 @@
+version: otel_dataflow/v1
+engine: { }
+groups:
+  default:
+    pipelines:
+      main:
+        # OTLP + OTAP receivers -> batch -> series/values Parquet datasets on object storage
+        # (Series Lake Format v1).
+        #
+        # Delivery: at-least-once, acknowledged only after the block holding the data
+        # has landed. Receivers answer producers only then (wait_for_result: true), so:
+        #   - receiver `timeout` must exceed the worst-case ack delay. A request is
+        #     resolved within window.interval + 2 x window.flush_retry_deadline (135s
+        #     here), and a request parked under backpressure within
+        #     2 x flush_retry_deadline + max(interval, flush_retry_deadline) (180s here),
+        #     plus sort and encode time;
+        #   - receiver concurrency must cover the in-flight requests
+        #     (~ requests/s x (window.interval + upload p99));
+        #   - producers need matching timeouts, retries and queue sizes.
+        # Do not place a durable_buffer processor on this path: it acks after its
+        # local WAL write, which would bypass ack-after-land.
+        # See crates/core-nodes/src/exporters/parquet_lake_exporter/README.md#memory.
+        nodes:
+          otlp:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+                  wait_for_result: true
+                  timeout: "200s"
+                  max_concurrent_requests: 20000
+                http:
+                  listening_addr: "127.0.0.1:4318"
+                  wait_for_result: true
+                  timeout: "200s"
+          otap:
+            type: receiver:otap
+            config:
+              listening_addr: "127.0.0.1:4327"
+              wait_for_result: true
+              timeout: "200s"
+              max_concurrent_requests: 20000
+              max_concurrent_requests_per_stream: 256
+              response_stream_channel_size: 256 # Required: channel buffer capacity (number of messages)
+          batch:
+            type: processor:batch
+            config:
+              max_batch_duration: 200ms
+              # Keep batches below the exporter's ingress.max_request_bytes (16 MiB):
+              # a larger batch is refused.
+              otap:
+                min_size: 4096
+                # OTAP batches can only be sized by items: this bounds the number of
+                # records, not the bytes. 8192 records leave 2 KiB of Arrow size per
+                # record (attributes included) within the 16 MiB limit; lower it when
+                # records are larger.
+                max_size: 8192
+                sizer: items
+              otlp:
+                min_size: 1048576
+                # Bounds the bytes of an OTLP batch (one indivisible entry can exceed it).
+                max_size: 8388608
+                sizer: bytes
+          parquet:
+            type: exporter:parquet_lake
+            config:
+              storage:
+                file:
+                  base_uri: "/tmp/otap-parquet-lake"
+              writer_id: writer
+              producer_id_attribute: host.id
+              window:
+                interval: 15s
+                max_block_bytes: 67108864
+                flush_retry_deadline: 60s
+              ingress:
+                max_request_bytes: 16777216
+                max_extracted_bytes: 33554432
+                max_row_bytes: 1048576
+                max_nesting_depth: 32
+              series_cache:
+                max_entries: 200000
+
+        connections:
+          - from: otlp
+            to: batch
+          - from: otap
+            to: batch
+          - from: batch
+            to: parquet

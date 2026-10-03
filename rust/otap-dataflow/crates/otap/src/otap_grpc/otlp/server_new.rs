@@ -24,6 +24,7 @@ use crate::pdata::{Context, OtapPdata};
 use crate::rate_limit_layer::{
     grpc_rate_limit_burst_exceeded_status, grpc_rate_limit_saturated_status, grpc_rate_limit_status,
 };
+use crate::retry_info::grpc_concurrency_limit_status;
 use bytes::{BufMut, Bytes};
 use futures::future::BoxFuture;
 use http::{Request, Response};
@@ -490,10 +491,7 @@ impl UnaryService<OtapPdata> for OtapBatchService {
                                 OtlpProtocol::Grpc,
                                 ReceiverRejectionErrorType::ConcurrencyLimit,
                             );
-                            return Err(processing.refused(
-                                signal,
-                                Status::resource_exhausted("Too many concurrent requests"),
-                            ));
+                            return Err(processing.refused(signal, grpc_concurrency_limit_status()));
                         }
                         Some(pair) => pair,
                     };
@@ -1488,7 +1486,7 @@ mod tests {
     }
 
     /// Scenario: A non-empty gRPC request cannot allocate its acknowledgement slot.
-    /// Guarantees: The request is rejected without incrementing the OTLP accepted counter.
+    /// Guarantees: The request is rejected as RESOURCE_EXHAUSTED with a zero-delay RetryInfo (retryable) and without incrementing the OTLP accepted counter.
     #[tokio::test]
     async fn rejected_grpc_request_is_not_accepted() {
         let metrics = new_test_metrics();
@@ -1498,9 +1496,11 @@ mod tests {
 
         let result = UnaryService::call(&mut service, tonic::Request::new(pdata)).await;
 
+        let status = result.expect_err("request rejected");
+        assert_eq!(status.code(), Code::ResourceExhausted);
         assert_eq!(
-            result.expect_err("request rejected").code(),
-            Code::ResourceExhausted
+            crate::retry_info::retry_delay(&status),
+            Some(std::time::Duration::ZERO)
         );
         assert!(msg_rx.try_recv().is_err());
         let metrics = metrics.lock();

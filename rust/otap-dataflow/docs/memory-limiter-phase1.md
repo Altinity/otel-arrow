@@ -308,12 +308,15 @@ receivers continue accepting requests regardless of pressure level.
 | Receiver | Hard-pressure behavior |
 | --- | --- |
 | OTLP HTTP | `503 Service Unavailable` with `Retry-After: <retry_after_secs>` header |
-| OTLP gRPC | `RESOURCE_EXHAUSTED` with `grpc-retry-pushback-ms: <retry_ms>` metadata |
-| OTAP gRPC stream open / next-read boundary | `RESOURCE_EXHAUSTED` + `grpc-retry-pushback-ms` before stream admission, and for already-open streams at the next read boundary |
-| OTAP gRPC per-batch | `ResourceExhausted` in the OTAP Arrow batch status (ArrowStatus code 8) |
+| OTLP gRPC | `RESOURCE_EXHAUSTED` with a `google.rpc.RetryInfo` detail (`retry_delay` = `retry_after_secs`) and `grpc-retry-pushback-ms: <retry_ms>` metadata |
+| OTAP gRPC stream open / next-read boundary | `RESOURCE_EXHAUSTED` with `RetryInfo` and `grpc-retry-pushback-ms` before stream admission, and for already-open streams at the next read boundary |
+| OTAP gRPC per-batch | `Unavailable` in the OTAP Arrow batch status (ArrowStatus code 14); a batch status cannot carry `RetryInfo` |
 | Syslog / CEF TCP | Accept then immediately drop new connections; close active connections mid-stream |
 | Syslog / CEF UDP | Drop incoming datagrams |
 <!-- markdownlint-enable MD013 -->
+
+OTLP clients retry `RESOURCE_EXHAUSTED` only when the status carries
+`RetryInfo`; without it they treat the refusal as permanent and drop the data.
 
 **Soft pressure:** the memory limiter does not reject requests solely because
 the process is above the soft limit. The engine-level `memory_pressure_state`

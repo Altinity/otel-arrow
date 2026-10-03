@@ -35,6 +35,8 @@ blake3.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+ciborium-io = { workspace = true, optional = true }
+ciborium-ll = { workspace = true, optional = true }
 csv-core.workspace = true
 hashbrown.workspace = true
 otel-arrow-contrib-data-engine-expressions = { workspace = true, optional = true }
@@ -44,8 +46,10 @@ futures-timer.workspace = true
 hex.workspace = true
 humantime-serde.workspace = true
 linkme.workspace = true
+lru = { workspace = true, optional = true }
 object_store = { workspace = true, features = ["fs"], optional = true }
-parquet = { workspace = true, optional = true }
+# `zstd`: the Parquet lake exporter writes ZSTD-compressed column chunks.
+parquet = { workspace = true, optional = true, features = ["zstd"] }
 prost.workspace = true
 prost-types.workspace = true
 rand.workspace = true
@@ -129,6 +133,9 @@ transform = [
 # Exporters.
 file = []
 parquet = [
+    "dep:ciborium-io",
+    "dep:ciborium-ll",
+    "dep:lru",
     "dep:object_store",
     "dep:parquet",
 ]
@@ -137,12 +144,16 @@ parquet = [
 # own; for example, Azure storage implies the Parquet exporter.
 # Azure Blob Storage backend for the Parquet exporter.
 azure = ["parquet", "otel-arrow-dfe-otap/azure"]
+# S3 backend for the Parquet exporters (mirrors `azure`).
+aws = ["parquet", "otel-arrow-dfe-otap/aws"]
 bench = []
 # Enables Weaver-backed semantic-convention assertions in core-node tests.
 # Weaver remains a dev-dependency and is not part of the published crate graph.
 dev-tools = []
 
 [dev-dependencies]
+# The Parquet lake exporter tests build CBOR fixtures with the high-level crate.
+ciborium.workspace = true
 serde_yaml.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true

@@ -268,7 +268,7 @@ pub struct RpcStatus {
     #[prost(string, tag = "2")]
     pub message: String,
     #[prost(message, repeated, tag = "3")]
-    details: Vec<Any>,
+    pub(crate) details: Vec<Any>,
 }
 
 fn rpc_status_response(

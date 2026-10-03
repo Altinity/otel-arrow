@@ -1,0 +1,6 @@
+type: parquet_lake
+status:
+  class: exporter
+  codeowners:
+    active:
+      - gen1us2k

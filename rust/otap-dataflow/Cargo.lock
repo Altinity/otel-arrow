@@ -7517,6 +7517,9 @@ dependencies = [
  "byte-unit",
  "bytes",
  "chrono",
+ "ciborium",
+ "ciborium-io",
+ "ciborium-ll",
  "criterion",
  "csv-core",
  "dhat",
@@ -7534,6 +7537,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "linkme",
+ "lru 0.18.4",
  "nix 0.31.3",
  "object_store",
  "otel-arrow-contrib-data-engine-expressions",
@@ -8224,6 +8228,7 @@ dependencies = [
  "thrift",
  "tokio",
  "twox-hash 2.1.4",
+ "zstd 0.13.3",
 ]
 
 [[package]]
